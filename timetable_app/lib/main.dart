@@ -13,6 +13,7 @@ import 'package:table_calendar/table_calendar.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:crypto/crypto.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -87,10 +88,9 @@ class _TimeTableAppState extends State<TimeTableApp>
         useMaterial3: true,
       ),
       builder: (context, child) {
-        return Listener(
+        return GestureDetector(
           behavior: HitTestBehavior.translucent,
-          onPointerDown: (_) =>
-              FocusManager.instance.primaryFocus?.unfocus(),
+          onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
           child: child,
         );
       },
@@ -102,8 +102,252 @@ class _TimeTableAppState extends State<TimeTableApp>
 class CurrentUserStore {
   static String role = '';
   static String name = '';
+  static String email = '';
+  static String company = '';
   static String team = '';
   static String contractor = '';
+}
+
+class AuthUser {
+  const AuthUser({
+    required this.name,
+    required this.email,
+    required this.company,
+    required this.passwordHash,
+    required this.passwordSalt,
+    this.role = 'Beheerder',
+    this.team,
+  });
+
+  final String name;
+  final String email;
+  final String company;
+  final String passwordHash;
+  final String passwordSalt;
+  final String role;
+  final String? team;
+}
+
+class CompanyProfile {
+  const CompanyProfile({
+    required this.name,
+    required this.businessNumber,
+    required this.address,
+    required this.adminName,
+    required this.adminEmail,
+    required this.createdAt,
+  });
+
+  final String name;
+  final String businessNumber;
+  final String address;
+  final String adminName;
+  final String adminEmail;
+  final DateTime createdAt;
+}
+
+class AuthStore {
+  static final List<AuthUser> users = [];
+  static final Map<String, CompanyProfile> companies = {};
+
+  static String _companyKey(String name) => name.trim().toLowerCase();
+
+  static bool seedIfEmpty() {
+    if (users.isNotEmpty) return false;
+    _RoleManagementStore.seedIfEmpty();
+    final usedEmails = <String>{};
+    for (final account in _testAccounts) {
+      final normalizedCompany = account.company.trim();
+      final baseEmail = _emailFromNameAndCompany(account.name, normalizedCompany);
+      final uniqueEmail = _ensureUniqueEmail(baseEmail, usedEmails);
+      final salt = _generateSalt();
+      users.add(
+        AuthUser(
+          name: account.name,
+          email: uniqueEmail,
+          company: normalizedCompany,
+          passwordHash: _hashPassword('Test1234!', salt),
+          passwordSalt: salt,
+          role: account.role,
+          team: account.team,
+        ),
+      );
+      final key = _companyKey(normalizedCompany);
+      companies.putIfAbsent(
+        key,
+        () => CompanyProfile(
+          name: normalizedCompany,
+          businessNumber: 'BE0000000000',
+          address: 'Onbekend',
+          adminName: 'Nick',
+          adminEmail: 'nick@finestone.be',
+          createdAt: DateTime.now(),
+        ),
+      );
+    }
+    return true;
+  }
+
+  static AuthUser? authenticate(String email, String password) {
+    seedIfEmpty();
+    final normalizedEmail = email.trim().toLowerCase();
+    final user = users.firstWhere(
+      (entry) => entry.email.toLowerCase() == normalizedEmail,
+      orElse: () => const AuthUser(
+        name: '',
+        email: '',
+        company: '',
+        passwordHash: '',
+        passwordSalt: '',
+      ),
+    );
+    if (user.email.isEmpty) return null;
+    final incomingHash = _hashPassword(password, user.passwordSalt);
+    if (incomingHash != user.passwordHash) return null;
+    return user;
+  }
+
+  static String? registerCompany({
+    required String companyName,
+    required String businessNumber,
+    required String address,
+    required String adminName,
+    required String adminEmail,
+    required String password,
+  }) {
+    seedIfEmpty();
+    final normalizedCompany = companyName.trim();
+    final normalizedBusinessNumber = businessNumber.trim();
+    final normalizedAddress = address.trim();
+    final normalizedAdminName = adminName.trim();
+    final normalizedAdminEmail = adminEmail.trim().toLowerCase();
+    final key = _companyKey(normalizedCompany);
+
+    if (normalizedCompany.isEmpty ||
+        normalizedBusinessNumber.isEmpty ||
+        normalizedAddress.isEmpty ||
+        normalizedAdminName.isEmpty ||
+        normalizedAdminEmail.isEmpty ||
+        password.isEmpty) {
+      return 'Vul alle velden in.';
+    }
+    if (!normalizedAdminEmail.contains('@') ||
+        normalizedAdminEmail.startsWith('@') ||
+        normalizedAdminEmail.endsWith('@')) {
+      return 'Vul een geldig e-mailadres in.';
+    }
+    if (password.length < 8) {
+      return 'Wachtwoord moet minstens 8 tekens hebben.';
+    }
+    if (users.any(
+      (entry) => entry.email.toLowerCase() == normalizedAdminEmail,
+    )) {
+      return 'Dit e-mailadres is al in gebruik.';
+    }
+    if (companies.containsKey(key)) {
+      return 'Dit bedrijf bestaat al.';
+    }
+
+    final salt = _generateSalt();
+    users.add(
+      AuthUser(
+        name: normalizedAdminName,
+        email: normalizedAdminEmail,
+        company: normalizedCompany,
+        passwordHash: _hashPassword(password, salt),
+        passwordSalt: salt,
+        role: 'Beheerder',
+      ),
+    );
+    companies[key] = CompanyProfile(
+      name: normalizedCompany,
+      businessNumber: normalizedBusinessNumber,
+      address: normalizedAddress,
+      adminName: normalizedAdminName,
+      adminEmail: normalizedAdminEmail,
+      createdAt: DateTime.now(),
+    );
+
+    _RoleManagementStore.seedIfEmpty();
+    final hasRoleAssignment = _RoleManagementStore.assignments.any(
+      (assignment) =>
+          assignment.email.toLowerCase() == normalizedAdminEmail,
+    );
+    if (!hasRoleAssignment) {
+      _RoleManagementStore.assignments.add(
+        _RoleAssignment(
+          name: normalizedAdminName,
+          email: normalizedAdminEmail,
+          role: 'Beheerder',
+        ),
+      );
+    }
+    AppDataStore.scheduleSave();
+    return null;
+  }
+
+  static TestAccount toAccount(AuthUser user) {
+    _RoleManagementStore.seedIfEmpty();
+    final assignment = _RoleManagementStore.assignments.firstWhere(
+      (entry) =>
+          entry.email.toLowerCase() == user.email.toLowerCase(),
+      orElse: () => _RoleAssignment(
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        team: user.team,
+      ),
+    );
+    return TestAccount(
+      name: assignment.name,
+      email: user.email,
+      role: assignment.role,
+      company: user.company,
+      team: assignment.team ?? user.team,
+    );
+  }
+
+  static String _hashPassword(String password, String salt) {
+    final bytes = utf8.encode('$salt::$password');
+    return sha256.convert(bytes).toString();
+  }
+
+  static String _generateSalt() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+    return base64UrlEncode(bytes);
+  }
+
+  static String _emailFromNameAndCompany(String name, String company) {
+    final local = name
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '.')
+        .replaceAll(RegExp(r'\.+'), '.')
+        .replaceAll(RegExp(r'^\.|\.$'), '');
+    final domain = company
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '')
+        .replaceAll(RegExp(r'^\.|\.$'), '');
+    final safeLocal = local.isEmpty ? 'user' : local;
+    final safeDomain = domain.isEmpty ? 'bedrijf' : domain;
+    return '$safeLocal@$safeDomain.be';
+  }
+
+  static String _ensureUniqueEmail(String email, Set<String> usedEmails) {
+    var candidate = email;
+    var counter = 2;
+    while (usedEmails.contains(candidate)) {
+      final parts = candidate.split('@');
+      final local = parts.first;
+      final domain = parts.length > 1 ? parts[1] : 'bedrijf.be';
+      candidate = '$local$counter@$domain';
+      counter += 1;
+    }
+    usedEmails.add(candidate);
+    return candidate;
+  }
 }
 
 class ScheduleStore {
@@ -255,6 +499,10 @@ class AppDataStore {
     OfferCatalogStore.seedIfEmpty();
     if (!hasStoredData) {
       _RoleManagementStore.seedIfEmpty();
+    }
+    final didSeedAuth = AuthStore.seedIfEmpty();
+    if (didSeedAuth) {
+      scheduleSave();
     }
     final hasAnyProjects = ProjectStore.projectsByGroup.values.any(
       (group) => group.values.any((list) => list.isNotEmpty),
@@ -413,6 +661,9 @@ class AppDataStore {
           .toList(),
       'offerCatalog':
           OfferCatalogStore.categories.map(_offerCategoryToJson).toList(),
+      'authUsers': AuthStore.users.map(_authUserToJson).toList(),
+      'companyProfiles':
+          AuthStore.companies.values.map(_companyProfileToJson).toList(),
       'projectResetVersion': _projectResetVersion,
     };
   }
@@ -504,6 +755,12 @@ class AppDataStore {
         ..addAll(catalog);
       OfferCatalogStore.markSeeded();
     }
+    AuthStore.users
+      ..clear()
+      ..addAll(_authUserList(data['authUsers']));
+    AuthStore.companies
+      ..clear()
+      ..addAll(_companyProfileMap(data['companyProfiles']));
     _projectResetVersion = (data['projectResetVersion'] as num?)?.toInt() ?? 0;
     ProjectStore.markSeeded();
   }
@@ -741,6 +998,24 @@ class AppDataStore {
     return value
         .map((e) => _offerCategoryFromJson(e as Map? ?? {}))
         .toList();
+  }
+
+  static List<AuthUser> _authUserList(dynamic value) {
+    if (value is! List) return <AuthUser>[];
+    return value
+        .map((e) => _authUserFromJson(e as Map? ?? {}))
+        .toList();
+  }
+
+  static Map<String, CompanyProfile> _companyProfileMap(dynamic value) {
+    if (value is! List) return {};
+    final map = <String, CompanyProfile>{};
+    for (final raw in value) {
+      if (raw is! Map) continue;
+      final profile = _companyProfileFromJson(raw);
+      map[profile.name.trim().toLowerCase()] = profile;
+    }
+    return map;
   }
 
   static Map<String, dynamic> _detailsToJson(ProjectDetails details) => {
@@ -1006,6 +1281,45 @@ class AppDataStore {
         hours: (data['hours'] as num?)?.toDouble(),
       );
 
+  static Map<String, dynamic> _authUserToJson(AuthUser user) => {
+        'name': user.name,
+        'email': user.email,
+        'company': user.company,
+        'passwordHash': user.passwordHash,
+        'passwordSalt': user.passwordSalt,
+        'role': user.role,
+        'team': user.team,
+      };
+
+  static AuthUser _authUserFromJson(Map data) => AuthUser(
+        name: data['name']?.toString() ?? '',
+        email: data['email']?.toString() ?? '',
+        company: data['company']?.toString() ?? '',
+        passwordHash: data['passwordHash']?.toString() ?? '',
+        passwordSalt: data['passwordSalt']?.toString() ?? '',
+        role: data['role']?.toString() ?? 'Beheerder',
+        team: data['team']?.toString(),
+      );
+
+  static Map<String, dynamic> _companyProfileToJson(CompanyProfile company) => {
+        'name': company.name,
+        'businessNumber': company.businessNumber,
+        'address': company.address,
+        'adminName': company.adminName,
+        'adminEmail': company.adminEmail,
+        'createdAt': company.createdAt.toIso8601String(),
+      };
+
+  static CompanyProfile _companyProfileFromJson(Map data) => CompanyProfile(
+        name: data['name']?.toString() ?? '',
+        businessNumber: data['businessNumber']?.toString() ?? '',
+        address: data['address']?.toString() ?? '',
+        adminName: data['adminName']?.toString() ?? '',
+        adminEmail: data['adminEmail']?.toString() ?? '',
+        createdAt: DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
+            DateTime.now(),
+      );
+
   static String _dateToString(DateTime date) =>
       DateTime(date.year, date.month, date.day).toIso8601String();
 
@@ -1083,12 +1397,14 @@ class TestAccount {
     required this.name,
     required this.role,
     required this.company,
+    this.email = '',
     this.team,
   });
 
   final String name;
   final String role;
   final String company;
+  final String email;
   final String? team;
 }
 
@@ -2637,45 +2953,51 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  bool _isSubmitting = false;
 
   @override
   void dispose() {
-    _nameController.dispose();
+    _emailController.dispose();
+    _passwordController.dispose();
     super.dispose();
   }
 
-  List<TestAccount> _filteredAccounts(String query) {
-    final trimmed = query.trim().toLowerCase();
-    if (trimmed.isEmpty) {
-      return _syncedAccounts();
-    }
-    return _syncedAccounts()
-        .where((account) => account.name.toLowerCase().contains(trimmed))
-        .toList();
-  }
-
-  List<TestAccount> _syncedAccounts() {
-    _RoleManagementStore.seedIfEmpty();
-    OfferCatalogStore.seedIfEmpty();
-    return _testAccounts.map((account) {
-      final match = _RoleManagementStore.assignments
-          .where((assignment) => assignment.name == account.name)
-          .toList();
-      if (match.isEmpty) return account;
-      final updated = match.first;
-      return TestAccount(
-        name: account.name,
-        role: updated.role,
-        company: account.company,
-        team: updated.team ?? account.team,
+  Future<void> _login() async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    if (email.isEmpty || password.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Vul e-mail en wachtwoord in.'),
+        ),
       );
-    }).toList();
+      return;
+    }
+    setState(() => _isSubmitting = true);
+    final user = AuthStore.authenticate(email, password);
+    setState(() => _isSubmitting = false);
+    if (user == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Ongeldige logingegevens.'),
+        ),
+      );
+      return;
+    }
+    final account = AuthStore.toAccount(user);
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      _appPageRoute(
+        builder: (_) => DashboardScreen(account: account),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final accounts = _filteredAccounts(_nameController.text);
     return Scaffold(
       body: Stack(
         children: [
@@ -2685,48 +3007,57 @@ class _LoginScreenState extends State<LoginScreen> {
               padding: const EdgeInsets.fromLTRB(20, 24, 20, 32),
               children: [
                 Text(
-                  'Welkom bij TimeTable',
+                  'TimeTable',
                   style: Theme.of(context).textTheme.headlineLarge,
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'Voor raam- en deurenbedrijven',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF47625F)),
                 ),
                 const SizedBox(height: 24),
                 _InputCard(
                   title: 'Inloggen',
                   children: [
                     _EditableInputField(
-                      label: 'Naam',
-                      hint: 'Bijv. Nick',
-                      icon: Icons.person_outline,
-                      controller: _nameController,
-                      onChanged: (_) => setState(() {}),
+                      label: 'E-mail',
+                      hint: 'E-mailadres',
+                      icon: Icons.mail_outline,
+                      keyboardType: TextInputType.emailAddress,
+                      controller: _emailController,
                     ),
                     const SizedBox(height: 12),
+                    _EditableInputField(
+                      label: 'Wachtwoord',
+                      hint: 'Wachtwoord',
+                      icon: Icons.lock_outline,
+                      obscure: true,
+                      controller: _passwordController,
+                    ),
+                    const SizedBox(height: 16),
+                    _PrimaryButton(
+                      label: _isSubmitting ? 'Inloggen...' : 'Inloggen',
+                      fullWidth: true,
+                      onTap: _isSubmitting ? null : _login,
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: _SecondaryButton(
+                        label: 'Registreren als bedrijf',
+                        onTap: () {
+                          Navigator.of(context).push(
+                            _appPageRoute(
+                              builder: (_) => const RegisterScreen(),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 10),
                     Text(
-                      'Kies een testaccount (geen wachtwoord nodig).',
+                      'Testusers zijn vooraf aangemaakt. Gebruik hun e-mail en wachtwoord `Test1234!`.',
                       style: Theme.of(context)
                           .textTheme
                           .bodyMedium
                           ?.copyWith(color: const Color(0xFF6A7C78)),
                     ),
                   ],
-                ),
-                const SizedBox(height: 18),
-                _SelectableAccountsCard(
-                  accounts: accounts,
-                  onSelect: (account) {
-                    Navigator.of(context).push(
-                      _appPageRoute(
-                        builder: (_) => DashboardScreen(account: account),
-                      ),
-                    );
-                  },
                 ),
               ],
             ),
@@ -2737,8 +3068,82 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 }
 
-class RegisterScreen extends StatelessWidget {
+class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
+
+  @override
+  State<RegisterScreen> createState() => _RegisterScreenState();
+}
+
+class _RegisterScreenState extends State<RegisterScreen> {
+  final TextEditingController _companyNameController =
+      TextEditingController();
+  final TextEditingController _businessNumberController =
+      TextEditingController();
+  final TextEditingController _addressController = TextEditingController();
+  final TextEditingController _adminNameController = TextEditingController();
+  final TextEditingController _adminEmailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _confirmPasswordController =
+      TextEditingController();
+  bool _isSubmitting = false;
+
+  @override
+  void dispose() {
+    _companyNameController.dispose();
+    _businessNumberController.dispose();
+    _addressController.dispose();
+    _adminNameController.dispose();
+    _adminEmailController.dispose();
+    _passwordController.dispose();
+    _confirmPasswordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _register() async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    final password = _passwordController.text;
+    final confirmPassword = _confirmPasswordController.text;
+    if (password != confirmPassword) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Wachtwoorden komen niet overeen.')),
+      );
+      return;
+    }
+    setState(() => _isSubmitting = true);
+    final error = AuthStore.registerCompany(
+      companyName: _companyNameController.text,
+      businessNumber: _businessNumberController.text,
+      address: _addressController.text,
+      adminName: _adminNameController.text,
+      adminEmail: _adminEmailController.text,
+      password: password,
+    );
+    if (error != null) {
+      setState(() => _isSubmitting = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error)),
+      );
+      return;
+    }
+    final user = AuthStore.authenticate(
+      _adminEmailController.text.trim(),
+      _passwordController.text,
+    );
+    setState(() => _isSubmitting = false);
+    if (user == null || !mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Registratie gelukt, maar login faalde.')),
+      );
+      return;
+    }
+    final account = AuthStore.toAccount(user);
+    Navigator.of(context).pushReplacement(
+      _appPageRoute(
+        builder: (_) => DashboardScreen(account: account),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2766,52 +3171,67 @@ class RegisterScreen extends StatelessWidget {
                 const SizedBox(height: 12),
                 _InputCard(
                   title: 'Bedrijf aanmaken',
-                  children: const [
-                    _InputField(
+                  children: [
+                    _EditableInputField(
                       label: 'Bedrijfsnaam',
-                      hint: 'Finestone',
+                      hint: 'Bedrijfsnaam',
                       icon: Icons.business_outlined,
+                      controller: _companyNameController,
                     ),
-                    SizedBox(height: 12),
-                    _InputField(
+                    const SizedBox(height: 12),
+                    _EditableInputField(
+                      label: 'Bedrijfsnummer',
+                      hint: 'Bedrijfsnummer',
+                      icon: Icons.badge_outlined,
+                      controller: _businessNumberController,
+                    ),
+                    const SizedBox(height: 12),
+                    _EditableInputField(
+                      label: 'Adres bedrijf',
+                      hint: 'Adres bedrijf',
+                      icon: Icons.location_on_outlined,
+                      controller: _addressController,
+                    ),
+                    const SizedBox(height: 12),
+                    _EditableInputField(
                       label: 'Voornaam & achternaam',
-                      hint: 'Nick De Smet',
+                      hint: 'Voornaam & achternaam',
                       icon: Icons.person_outline,
+                      controller: _adminNameController,
                     ),
-                    SizedBox(height: 12),
-                    _InputField(
+                    const SizedBox(height: 12),
+                    _EditableInputField(
                       label: 'E-mail',
-                      hint: 'nick@finestone.be',
+                      hint: 'E-mailadres',
                       icon: Icons.mail_outline,
+                      keyboardType: TextInputType.emailAddress,
+                      controller: _adminEmailController,
                     ),
-                    SizedBox(height: 12),
-                    _InputField(
+                    const SizedBox(height: 12),
+                    _EditableInputField(
                       label: 'Wachtwoord',
-                      hint: '••••••••',
+                      hint: 'Wachtwoord',
                       icon: Icons.lock_outline,
                       obscure: true,
+                      controller: _passwordController,
                     ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                _InputCard(
-                  title: 'Uitnodigingen sturen',
-                  children: const [
-                    _InviteRow(role: 'Planner', name: 'Julie'),
-                    _InviteRow(role: 'Teamleader', name: 'Thomas'),
-                    _InviteRow(role: 'Onderaannemer', name: 'Igor'),
+                    const SizedBox(height: 12),
+                    _EditableInputField(
+                      label: 'Bevestig wachtwoord',
+                      hint: 'Bevestig wachtwoord',
+                      icon: Icons.lock_outline,
+                      obscure: true,
+                      controller: _confirmPasswordController,
+                    ),
                   ],
                 ),
                 const SizedBox(height: 16),
                 _PrimaryButton(
-                  label: 'Account aanmaken',
-                  onTap: () => Navigator.of(context).pushReplacement(
-                    _appPageRoute(
-                      builder: (_) => DashboardScreen(
-                        account: _testAccounts.first,
-                      ),
-                    ),
-                  ),
+                  label: _isSubmitting
+                      ? 'Account aanmaken...'
+                      : 'Account aanmaken',
+                  fullWidth: true,
+                  onTap: _isSubmitting ? null : _register,
                 ),
               ],
             ),
@@ -2840,18 +3260,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
     super.initState();
     _RoleManagementStore.seedIfEmpty();
     ProjectStore.seedIfEmpty();
-    CurrentUserStore.role = widget.account.role;
-    CurrentUserStore.name = widget.account.name;
-    final match = _RoleManagementStore.assignments.firstWhere(
+    final accountEmail = widget.account.email.trim().toLowerCase();
+    _RoleAssignment? match;
+    if (accountEmail.isNotEmpty) {
+      for (final assignment in _RoleManagementStore.assignments) {
+        if (assignment.email.trim().toLowerCase() == accountEmail) {
+          match = assignment;
+          break;
+        }
+      }
+    }
+    match ??= _RoleManagementStore.assignments.firstWhere(
       (assignment) => assignment.name == widget.account.name,
       orElse: () => _RoleAssignment(
         name: widget.account.name,
-        email: '',
+        email: widget.account.email,
         role: widget.account.role,
         contractor: '',
         team: widget.account.team,
       ),
     );
+    CurrentUserStore.role = match.role;
+    CurrentUserStore.name = match.name;
+    CurrentUserStore.email = widget.account.email;
+    CurrentUserStore.company = widget.account.company;
     CurrentUserStore.team = match.team ?? widget.account.team ?? '';
     CurrentUserStore.contractor =
         match.contractor ?? (match.role == 'Onderaannemer' ? match.name : '');
@@ -9591,8 +10023,10 @@ class _RoleManagementStore {
           .map(
             (account) => _RoleAssignment(
               name: account.name,
-              email:
-                  '${account.name.toLowerCase()}@${account.company.toLowerCase()}.be',
+              email: AuthStore._emailFromNameAndCompany(
+                account.name,
+                account.company,
+              ),
               role: account.role,
               contractor: account.role == 'Onderaannemer beheerder'
                   ? (account.name == 'Maksim' ? 'MS Construct' : 'Schijnpoort')
@@ -11918,14 +12352,16 @@ class _EditableInputField extends StatelessWidget {
     required this.hint,
     required this.icon,
     required this.controller,
-    this.onChanged,
+    this.obscure = false,
+    this.keyboardType,
   });
 
   final String label;
   final String hint;
   final IconData icon;
   final TextEditingController controller;
-  final ValueChanged<String>? onChanged;
+  final bool obscure;
+  final TextInputType? keyboardType;
 
   @override
   Widget build(BuildContext context) {
@@ -11942,7 +12378,10 @@ class _EditableInputField extends StatelessWidget {
         const SizedBox(height: 6),
         TextField(
           controller: controller,
-          onChanged: onChanged,
+          obscureText: obscure,
+          keyboardType: keyboardType,
+          autocorrect: !obscure,
+          enableSuggestions: !obscure,
           decoration: InputDecoration(
             prefixIcon: Icon(icon, color: const Color(0xFF6A7C78)),
             hintText: hint,
@@ -12124,14 +12563,12 @@ class _InputField extends StatelessWidget {
     required this.hint,
     required this.icon,
     this.controller,
-    this.obscure = false,
   });
 
   final String label;
   final String hint;
   final IconData icon;
   final TextEditingController? controller;
-  final bool obscure;
 
   @override
   Widget build(BuildContext context) {
@@ -12148,12 +12585,8 @@ class _InputField extends StatelessWidget {
         const SizedBox(height: 6),
         TextField(
           controller: controller,
-          obscureText: obscure,
           decoration: InputDecoration(
             prefixIcon: Icon(icon, color: const Color(0xFF6A7C78)),
-            suffixIcon: obscure
-                ? const Icon(Icons.visibility_off, color: Color(0xFF6A7C78))
-                : null,
             hintText: hint,
             filled: true,
             fillColor: const Color(0xFFF4F1EA),
@@ -12168,177 +12601,6 @@ class _InputField extends StatelessWidget {
           ),
         ),
       ],
-    );
-  }
-}
-
-class _InviteRow extends StatelessWidget {
-  const _InviteRow({required this.role, required this.name});
-
-  final String role;
-  final String name;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFFFCE6CC),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFFFFC78B)),
-      ),
-      child: Row(
-        children: [
-          Container(
-            height: 36,
-            width: 36,
-            decoration: BoxDecoration(
-              color: const Color(0xFF0B2E2B),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: const Icon(Icons.person_add, color: Color(0xFFFFE9CC)),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  role,
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        fontWeight: FontWeight.w600,
-                      ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  name,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
-                ),
-              ],
-            ),
-          ),
-          const Icon(Icons.chevron_right, color: Color(0xFF6A7C78)),
-        ],
-      ),
-    );
-  }
-}
-
-class _SelectableAccountsCard extends StatelessWidget {
-  const _SelectableAccountsCard({
-    required this.accounts,
-    required this.onSelect,
-  });
-
-  final List<TestAccount> accounts;
-  final ValueChanged<TestAccount> onSelect;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: const Color(0xFF0B2E2B),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Testaccounts Finestone',
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                  color: const Color(0xFFFFE9CC),
-                ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            'Gebruik deze accounts voor demo.',
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFFD9C3A0)),
-          ),
-          const SizedBox(height: 12),
-          ...accounts.map(
-            (account) => _TestAccountRow(
-              account: account,
-              onTap: () => onSelect(account),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _TestAccountRow extends StatelessWidget {
-  const _TestAccountRow({required this.account, required this.onTap});
-
-  final TestAccount account;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      decoration: BoxDecoration(
-        color: const Color(0xFF163C38),
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(14),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(14),
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Row(
-              children: [
-                Container(
-                  height: 36,
-                  width: 36,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFFFA64D),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: const Icon(Icons.badge, color: Color(0xFF0B2E2B)),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        account.name,
-                        style:
-                            Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                  fontWeight: FontWeight.w600,
-                                  color: const Color(0xFFFFE9CC),
-                                ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        '${account.role} · ${account.company}'
-                        '${account.team == null ? '' : ' · ${account.team}'}',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(color: const Color(0xFFD9C3A0)),
-                      ),
-                    ],
-                  ),
-                ),
-                const Icon(Icons.login, color: Color(0xFFD9C3A0)),
-              ],
-            ),
-          ),
-        ),
-      ),
     );
   }
 }
