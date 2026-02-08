@@ -3,7 +3,11 @@
   node_bundler = "esbuild"
 
 [build]
+  command = "cd timetable_app && flutter build web --release"
   publish = "timetable_app/build/web"
+
+[[plugins]]
+  package = "netlify-plugin-flutter"
 
 [[redirects]]
   from = "/*"
