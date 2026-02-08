@@ -2956,13 +2956,6 @@ class _RegisterScreenState extends State<RegisterScreen> {
               error.toLowerCase().contains('in use'))) {
         error = 'E-mailadres is al in gebruik. Gebruik wachtwoord resetten.';
       }
-      if (error == null) {
-        await NetlifyIdentityService.sendWelcomeEmail(
-          email: _adminEmailController.text,
-          name: _adminNameController.text,
-          company: _companyNameController.text,
-        );
-      }
     }
     error ??= AuthStore.registerCompany(
       companyName: _companyNameController.text,
@@ -2983,43 +2976,14 @@ class _RegisterScreenState extends State<RegisterScreen> {
     setState(() => _isSubmitting = false);
     if (!mounted) return;
     if (NetlifyIdentityService.isConfigured) {
-      try {
-        final session = await NetlifyIdentityService.login(
-          email: _adminEmailController.text.trim(),
-          password: _passwordController.text,
-        );
-        final user = (session?['user'] as Map?) ?? {};
-        final metadata = (user['user_metadata'] as Map?) ?? {};
-        final identityName = metadata['name']?.toString() ??
-            _adminNameController.text.trim();
-        final identityCompany = metadata['company']?.toString() ??
-            _companyNameController.text.trim();
-        final account = AuthStore.accountForEmail(
-          _adminEmailController.text.trim(),
-          fallbackName: identityName,
-          fallbackCompany: identityCompany,
-        );
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Account aangemaakt. Bevestigingsmail is verzonden.'),
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Account aangemaakt. Controleer je e-mail en activeer je account.',
           ),
-        );
-        Navigator.of(context).pushReplacement(
-          _appPageRoute(
-            builder: (_) => DashboardScreen(account: account),
-          ),
-        );
-      } catch (_) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Account aangemaakt. Bevestigingsmail is verzonden.',
-            ),
-          ),
-        );
-        Navigator.of(context).pop();
-      }
+        ),
+      );
+      Navigator.of(context).pop();
       return;
     }
     final user = AuthStore.authenticate(

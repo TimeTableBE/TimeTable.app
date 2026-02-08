@@ -4,7 +4,7 @@
 - Open je Netlify site.
 - Ga naar `Identity` en activeer Netlify Identity.
 - Zet `Registration` op `Open`.
-- Zet `Email confirmations` uit (account mag direct bruikbaar zijn).
+- Zet `Email confirmations` aan (account moet eerst geactiveerd worden).
 
 ## 2) Service-role token
 - In Netlify Identity: kopieer de admin/service token.
@@ -25,7 +25,7 @@ flutter run \
 ```
 
 ## 4) Wat er nu automatisch werkt
-- Registratie: bevestigingsmail wordt verstuurd, account is direct bruikbaar.
+- Registratie: activatiemail wordt verstuurd, account is pas bruikbaar na activatie.
 - Login: alleen na correcte credentials.
 - Wachtwoord vergeten: resetmail via Netlify Identity.
 - Uitnodigen (rollenbeheer): Netlify Function `send-invite` stuurt uitnodiging.
