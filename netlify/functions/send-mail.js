@@ -103,11 +103,13 @@ exports.handler = async (event) => {
       const company = String(input.company || '').trim();
       await sendResendEmail({
         to,
-        subject: 'Je TimeTable account is geverifieerd',
+        subject: 'Verificatie geslaagd - Welkom bij TimeTable',
         html: `
           <p>Hallo ${name || 'gebruiker'},</p>
-          <p>Je account voor <strong>${company || 'TimeTable'}</strong> is geverifieerd.</p>
-          <p>Je kan nu inloggen in de app.</p>
+          <p>Je account voor <strong>${company || 'TimeTable'}</strong> is succesvol geverifieerd.</p>
+          <p>Welkom bij <strong>TimeTable</strong>.</p>
+          <p>Met TimeTable beheer je projecten, planning, rollen, documenten en werfopvolging op een overzichtelijke manier voor je volledige team.</p>
+          <p>Je kan nu inloggen in de app en meteen starten.</p>
           <p>Groeten,<br/>TimeTable</p>
         `,
       });

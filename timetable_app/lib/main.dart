@@ -586,10 +586,17 @@ class NetlifyIdentityService {
       final decoded = jsonDecode(raw);
       if (decoded is Map) {
         final direct = decoded['error_description'] ??
+            decoded['msg'] ??
             decoded['error'] ??
             decoded['message'];
         if (direct != null && direct.toString().trim().isNotEmpty) {
           return direct.toString();
+        }
+      }
+      if (decoded is List && decoded.isNotEmpty) {
+        final first = decoded.first;
+        if (first != null && first.toString().trim().isNotEmpty) {
+          return first.toString();
         }
       }
       if (decoded is String && decoded.trim().isNotEmpty) return decoded;
