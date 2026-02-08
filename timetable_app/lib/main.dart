@@ -3,7 +3,6 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -154,38 +153,6 @@ class AuthStore {
   static String _companyKey(String name) => name.trim().toLowerCase();
 
   static bool seedIfEmpty() {
-    if (users.isNotEmpty) return false;
-    _RoleManagementStore.seedIfEmpty();
-    final usedEmails = <String>{};
-    for (final account in _testAccounts) {
-      final normalizedCompany = account.company.trim();
-      final baseEmail = _emailFromNameAndCompany(account.name, normalizedCompany);
-      final uniqueEmail = _ensureUniqueEmail(baseEmail, usedEmails);
-      final salt = _generateSalt();
-      users.add(
-        AuthUser(
-          name: account.name,
-          email: uniqueEmail,
-          company: normalizedCompany,
-          passwordHash: _hashPassword('Test1234!', salt),
-          passwordSalt: salt,
-          role: account.role,
-          team: account.team,
-        ),
-      );
-      final key = _companyKey(normalizedCompany);
-      companies.putIfAbsent(
-        key,
-        () => CompanyProfile(
-          name: normalizedCompany,
-          businessNumber: 'BE0000000000',
-          address: 'Onbekend',
-          adminName: 'Nick',
-          adminEmail: 'nick@finestone.be',
-          createdAt: DateTime.now(),
-        ),
-      );
-    }
     return true;
   }
 
@@ -396,6 +363,7 @@ class AuthStore {
     return base64UrlEncode(bytes);
   }
 
+  // ignore: unused_element
   static String _emailFromNameAndCompany(String name, String company) {
     final local = name
         .trim()
@@ -413,6 +381,7 @@ class AuthStore {
     return '$safeLocal@$safeDomain.be';
   }
 
+  // ignore: unused_element
   static String _ensureUniqueEmail(String email, Set<String> usedEmails) {
     var candidate = email;
     var counter = 2;
@@ -436,6 +405,10 @@ class NetlifyIdentityService {
   static final String _inviteFunctionPath = const String.fromEnvironment(
     'NETLIFY_INVITE_FUNCTION_PATH',
     defaultValue: '/.netlify/functions/send-invite',
+  ).trim();
+  static final String _mailFunctionPath = const String.fromEnvironment(
+    'NETLIFY_MAIL_FUNCTION_PATH',
+    defaultValue: '/.netlify/functions/send-mail',
   ).trim();
 
   static bool get isConfigured => _siteUrl.isNotEmpty;
@@ -558,6 +531,53 @@ class NetlifyIdentityService {
     return _extractErrorMessage(
       response.body,
       'Uitnodiging versturen mislukt.',
+    );
+  }
+
+  static Future<String?> sendWelcomeEmail({
+    required String email,
+    required String name,
+    required String company,
+  }) async {
+    if (!isConfigured) return null;
+    final response = await http.post(
+      _functionUri(_mailFunctionPath),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'type': 'welcome',
+        'email': email.trim().toLowerCase(),
+        'name': name.trim(),
+        'company': company.trim(),
+      }),
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) return null;
+    return _extractErrorMessage(response.body, 'Welkomstmail versturen mislukt.');
+  }
+
+  static Future<String?> sendInvitationNoticeEmail({
+    required String email,
+    required String name,
+    required String role,
+    required String invitedBy,
+    required String company,
+  }) async {
+    if (!isConfigured) return null;
+    final response = await http.post(
+      _functionUri(_mailFunctionPath),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'type': 'invite_notice',
+        'email': email.trim().toLowerCase(),
+        'name': name.trim(),
+        'role': role,
+        'invitedBy': invitedBy,
+        'company': company.trim(),
+      }),
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) return null;
+    return _extractErrorMessage(
+      response.body,
+      'Uitnodigingsmail versturen mislukt.',
     );
   }
 
@@ -695,7 +715,10 @@ class HiveRepository implements DataRepository {
 class AppDataStore {
   static const String _fileName = 'timetable_data.json';
   static bool hasStoredData = false;
+  static int _dataWipeVersion = 0;
+  static const int _targetDataWipeVersion = 2;
   static int _projectResetVersion = 0;
+  // ignore: unused_field
   static const int _targetProjectResetVersion = 3;
   static Timer? _saveTimer;
   static bool _isSaving = false;
@@ -725,27 +748,13 @@ class AppDataStore {
       hasStoredData = true;
     }
     OfferCatalogStore.seedIfEmpty();
-    if (!hasStoredData) {
-      _RoleManagementStore.seedIfEmpty();
-    }
-    final didSeedAuth = AuthStore.seedIfEmpty();
-    if (didSeedAuth) {
+    if (_dataWipeVersion < _targetDataWipeVersion) {
+      _wipeAllBusinessData();
+      _dataWipeVersion = _targetDataWipeVersion;
       scheduleSave();
+      return;
     }
-    final hasAnyProjects = ProjectStore.projectsByGroup.values.any(
-      (group) => group.values.any((list) => list.isNotEmpty),
-    );
-    if (_projectResetVersion < _targetProjectResetVersion) {
-      ProjectStore.clearAllProjects();
-      ProjectStore.seedIfEmpty();
-      _projectResetVersion = _targetProjectResetVersion;
-      scheduleSave();
-    } else if (!hasStoredData || !hasAnyProjects) {
-      ProjectStore.seedIfEmpty();
-      scheduleSave();
-    } else {
-      _normalizeScheduledDurations();
-    }
+    _normalizeScheduledDurations();
   }
 
   static void scheduleSave() {
@@ -892,6 +901,7 @@ class AppDataStore {
       'authUsers': AuthStore.users.map(_authUserToJson).toList(),
       'companyProfiles':
           AuthStore.companies.values.map(_companyProfileToJson).toList(),
+      'dataWipeVersion': _dataWipeVersion,
       'projectResetVersion': _projectResetVersion,
     };
   }
@@ -989,8 +999,28 @@ class AppDataStore {
     AuthStore.companies
       ..clear()
       ..addAll(_companyProfileMap(data['companyProfiles']));
+    _dataWipeVersion = (data['dataWipeVersion'] as num?)?.toInt() ?? 0;
     _projectResetVersion = (data['projectResetVersion'] as num?)?.toInt() ?? 0;
     ProjectStore.markSeeded();
+  }
+
+  static void _wipeAllBusinessData() {
+    ProjectStore.clearAllProjects();
+    AuthStore.users.clear();
+    AuthStore.companies.clear();
+    _RoleManagementStore.assignments.clear();
+    _RoleManagementStore.teams.clear();
+    ProfileDocumentStore.documentsByUser.clear();
+    LeaveRequestStore.requests.clear();
+    PlanningCalendarStore.holidays.clear();
+    PlanningCalendarStore.vacations.clear();
+    PlanningOrderStore.orderByDay.clear();
+    CurrentUserStore.role = '';
+    CurrentUserStore.name = '';
+    CurrentUserStore.email = '';
+    CurrentUserStore.company = '';
+    CurrentUserStore.team = '';
+    CurrentUserStore.contractor = '';
   }
 
   static Map<String, Map<String, List<String>>> _mapGroups(dynamic value) {
@@ -2039,6 +2069,7 @@ class OfferCatalogStore {
 }
 
 class ProjectStore {
+  // ignore: unused_field
   static bool _seeded = false;
   static final Map<String, Map<String, List<String>>> projectsByGroup = {
     'Klanten': {
@@ -2103,527 +2134,9 @@ class ProjectStore {
   }
 
   static void seedIfEmpty() {
-    final hasProjects = projectsByGroup.values.any(
-      (group) => group.values.any((list) => list.isNotEmpty),
-    );
-    if (_seeded && hasProjects) return;
-    if (hasProjects) {
-      _seeded = true;
-      return;
-    }
-    OfferCatalogStore.seedIfEmpty();
-    ScheduleStore.scheduled.clear();
-    final random = Random(42);
-    final firstNames = [
-      'Emma',
-      'Liam',
-      'Noah',
-      'Olivia',
-      'Mila',
-      'Lucas',
-      'Fleur',
-      'Bram',
-      'Lotte',
-      'Jules',
-      'Sarah',
-      'Nora',
-      'Kobe',
-      'Elise',
-      'Ruben',
-      'Lea',
-      'Arne',
-      'Anouk',
-      'Tibo',
-      'Hanne',
-      'Julie',
-      'Aline',
-      'Lore',
-      'Senna',
-      'Maud',
-      'Xander',
-      'Niels',
-      'Sander',
-      'Jasper',
-      'Kaat',
-    ];
-    final lastNames = [
-      'De Smet',
-      'Peeters',
-      'Maes',
-      'Jacobs',
-      'Mertens',
-      'Claeys',
-      'Willems',
-      'Goossens',
-      'Vandermeulen',
-      'Lefebvre',
-      'Dumont',
-      'Vandenberghe',
-      'Desmet',
-      'Vermeulen',
-      'De Bruyne',
-      'Van den Broeck',
-      'Pieters',
-      'De Cock',
-      'Van Damme',
-      'Vermote',
-      'De Clercq',
-      'Van Acker',
-      'Buyse',
-      'Vandamme',
-      'Huybrechts',
-      'Lemaire',
-      'Van den Abeele',
-      'Van Hove',
-      'Declercq',
-      'Van Hulle',
-    ];
-    final streets = [
-      'Kerkstraat',
-      'Stationsstraat',
-      'Nieuwstraat',
-      'Molenstraat',
-      'Schoolstraat',
-      'Dorpstraat',
-      'Zandstraat',
-      'Hofstraat',
-      'Bloemenlaan',
-      'Parklaan',
-      'Lindelaan',
-      'Kouter',
-      'Leopoldlaan',
-      'Koningin Astridlaan',
-      'Warandestraat',
-      'Veldstraat',
-      'Keizerslaan',
-      'Bruggestraat',
-      'Kapelstraat',
-      'Hoogstraat',
-      'Sint-Jansstraat',
-      'Stationsplein',
-      'Kasteelstraat',
-      'Kruisstraat',
-      'Boterstraat',
-      'Meersstraat',
-      'Ooststraat',
-      'Westlaan',
-    ];
-    final cities = [
-      'Gent',
-      'Brugge',
-      'Kortrijk',
-      'Aalst',
-      'Roeselare',
-      'Oostende',
-      'Sint-Niklaas',
-      'Waregem',
-      'Dendermonde',
-      'Tielt',
-      'Deinze',
-      'Eeklo',
-      'Izegem',
-      'Harelbeke',
-      'Ronse',
-      'Geraardsbergen',
-      'Zottegem',
-      'Lokeren',
-      'Wetteren',
-      'Zelzate',
-    ];
-    final postalCodes = [
-      '9000',
-      '8000',
-      '8500',
-      '9300',
-      '8800',
-      '8400',
-      '9100',
-      '8790',
-      '9200',
-      '8700',
-      '9800',
-      '9900',
-      '8870',
-      '8530',
-      '9600',
-      '9500',
-      '9620',
-      '9160',
-      '9230',
-      '9060',
-    ];
-    final finishes = [
-      'Afwerking PVC',
-      'Afwerking in MDF',
-      'Afwerking pleister',
-      'Afwerking in MDF + tablet',
-      'Afwerking PVC + dorpels',
-      'Zonder afwerking',
-    ];
-    final plannerNotes = [
-      'Let op: parkeerplaats beperkt.',
-      'Klant vraagt extra bescherming vloer.',
-      'Opletten met gordijnbakken.',
-      'Klant wil afwerking dezelfde dag.',
-      'Levering via zij-ingang.',
-    ];
-    final leaderNotes = [
-      'Werf klaarzetten voor montage.',
-      'Afwerking controleren met klant.',
-      'Extra profielen voorzien.',
-      'Schuifraam afstellen na montage.',
-      'Nazicht siliconen na plaatsing.',
-    ];
-    final backorderPool = [
-      'Extra profiel plaatsen',
-      'Kader bijregelen',
-      'Dorpel vervangen',
-      'Afkitten raam',
-      'Ventilatierooster plaatsen',
-      'Rolluikbak afwerken',
-      'Scharnieren bijstellen',
-      'Extra glaslat toevoegen',
-    ];
-    final extraWorkPool = [
-      'Extra dichtingsrubber geplaatst',
-      'Afwerking binnenmuur aangepast',
-      'Extra raamkader uitgelijnd',
-      'Herstelling beschadigde dorpel',
-      'Kleine bijwerking siliconen',
-    ];
-    final teams = ['Team 1', 'Team 2', 'Team 3', 'Team 4', 'Team 5'];
-    final teamWorkers = {
-      'Team 1': ['Ihor', 'Vova', 'Kiryl'],
-      'Team 2': ['Vitaly', 'Bohdan', 'Vitaly Y'],
-      'Team 3': ['Pavlo', 'Ruslan', 'Vadim'],
-      'Team 4': ['Sergei', 'Dmitri', 'Oleg'],
-      'Team 5': ['Anton', 'Nikita', 'Yuri'],
-    };
-    final teamNextDate = <String, DateTime>{
-      for (final team in teams) team: _nextWorkingDayForTeam(DateTime.now(), team),
-    };
-    final teamLastEnd = <String, DateTime?>{
-      for (final team in teams) team: null,
-    };
-    final regularDaysByTeam = <String, Set<DateTime>>{
-      for (final team in teams) team: <DateTime>{},
-    };
-    final backorderDayCounts = <String, Map<DateTime, int>>{
-      for (final team in teams) team: <DateTime, int>{},
-    };
-
-    PlatformFile dummyFile(String name) =>
-        PlatformFile(name: name, size: 0, bytes: Uint8List(0));
-
-    List<OfferLine> buildOfferLines(int seed) {
-      final lines = <OfferLine>[];
-      final count = 2 + (seed % 3);
-      for (int i = 0; i < count; i++) {
-        final category = OfferCatalogStore
-            .categories[(seed + i) % OfferCatalogStore.categories.length];
-        final item = category.items[(seed + i) % category.items.length];
-        lines.add(
-          OfferLine(
-            category: category.name,
-            item: item.name,
-            quantity: 1 + ((seed + i) % 3),
-          ),
-        );
-      }
-      return lines;
-    }
-
-    String phoneFor(int seed) {
-      final a = 470 + (seed % 20);
-      final b = 10 + (seed % 80);
-      final c = 20 + (seed % 70);
-      final d = 30 + (seed % 60);
-      return '0$a $b $c $d';
-    }
-
-    String customerName(int seed, {String suffix = ''}) {
-      final first = firstNames[seed % firstNames.length];
-      final last = lastNames[(seed ~/ firstNames.length) % lastNames.length];
-      return suffix.isEmpty ? '$first $last' : '$first $last $suffix';
-    }
-
-    void addWorkLogs(String name, String team, int days) {
-      final workers = teamWorkers[team] ?? [team];
-      final startBase = _normalizeDateOnly(
-        DateTime.now().subtract(Duration(days: 30 + (random.nextInt(150)))),
-      );
-      final entries = <WorkDayEntry>[];
-      var current = startBase;
-      var logged = 0;
-      while (logged < days) {
-        if (_isWorkingDayForTeam(current, team)) {
-          entries.add(
-            WorkDayEntry(
-              date: _normalizeDateOnly(current),
-              startMinutes: 7 * 60 + (logged % 2 == 0 ? 30 : 0),
-              endMinutes: 16 * 60,
-              breakMinutes: 30,
-              workers: workers,
-            ),
-          );
-          logged += 1;
-        }
-        current = current.add(const Duration(days: 1));
-      }
-      workLogs[name] = entries;
-    }
-
-    void addRegularSchedule(
-      String name,
-      String team,
-      int plannedDays,
-    ) {
-      final lastEnd = teamLastEnd[team];
-      DateTime baseStart = teamNextDate[team]!;
-      if (lastEnd != null &&
-          random.nextDouble() < 0.2 &&
-          _isWorkingDayForTeam(lastEnd, team)) {
-        baseStart = lastEnd;
-      }
-      final start = _nextWorkingDayForTeam(baseStart, team);
-      final end = _endDateFromWorkingDays(start, plannedDays, team);
-      ScheduleStore.scheduled.add(
-        TeamAssignment(
-          project: name,
-          team: team,
-          startDate: start,
-          endDate: end,
-          estimatedDays: plannedDays,
-          isBackorder: false,
-          group: 'Klanten',
-        ),
-      );
-      var day = start;
-      while (!day.isAfter(end)) {
-        if (_isWorkingDayForTeam(day, team)) {
-          regularDaysByTeam[team]!.add(_normalizeDateOnly(day));
-        }
-        day = day.add(const Duration(days: 1));
-      }
-      teamLastEnd[team] = end;
-      teamNextDate[team] = end.add(const Duration(days: 1));
-    }
-
-    DateTime pickBackorderDay(String team) {
-      for (int i = 0; i < 80; i++) {
-        var candidate =
-            DateTime.now().add(Duration(days: random.nextInt(90)));
-        candidate = _nextWorkingDayForTeam(candidate, team);
-        final normalized = _normalizeDateOnly(candidate);
-        final regularBusy = regularDaysByTeam[team]!.contains(normalized);
-        final max = regularBusy ? 2 : 4;
-        final current = backorderDayCounts[team]![normalized] ?? 0;
-        if (current < max) {
-          backorderDayCounts[team]![normalized] = current + 1;
-          return normalized;
-        }
-      }
-      final fallback = _nextWorkingDayForTeam(DateTime.now(), team);
-      backorderDayCounts[team]![fallback] =
-          (backorderDayCounts[team]![fallback] ?? 0) + 1;
-      return fallback;
-    }
-
-    DateTime pickClusterDay(String team) {
-      for (int i = 0; i < 40; i++) {
-        var candidate =
-            DateTime.now().add(Duration(days: 15 + random.nextInt(60)));
-        candidate = _nextWorkingDayForTeam(candidate, team);
-        final normalized = _normalizeDateOnly(candidate);
-        if (!regularDaysByTeam[team]!.contains(normalized)) {
-          return normalized;
-        }
-      }
-      return _nextWorkingDayForTeam(DateTime.now(), team);
-    }
-
-    final regularStatuses = <String>[
-      ...List.filled(110, 'Ingepland'),
-      ...List.filled(60, 'Afgewerkt'),
-      ...List.filled(15, 'Geleverd'),
-      ...List.filled(10, 'In bestelling'),
-      ...List.filled(5, 'In opmaak'),
-    ]..shuffle(random);
-    final backorderStatuses = <String>[
-      ...List.filled(40, 'Ingepland'),
-      ...List.filled(40, 'Afgewerkt'),
-      ...List.filled(10, 'Geleverd'),
-      ...List.filled(5, 'In bestelling'),
-      ...List.filled(5, 'In opmaak'),
-    ]..shuffle(random);
-
-    final completedRegular = <String>[];
-
-    for (int i = 0; i < 200; i++) {
-      final name = customerName(i + 1, suffix: '${i + 1}');
-      final city = cities[i % cities.length];
-      final postal = postalCodes[i % postalCodes.length];
-      final street = streets[i % streets.length];
-      final number = 5 + (i * 3) % 95;
-      final status = regularStatuses[i];
-      final offerLines = buildOfferLines(i);
-      final estimatedDays = 3 + random.nextInt(5);
-      final detailDays =
-          status == 'Ingepland' ? _clampScheduledDays(estimatedDays) : estimatedDays;
-      addProject(
-        name: name,
-        group: 'Klanten',
-        status: status,
-        creator: 'Julie',
-        details: ProjectDetails(
-          address: '$street $number, $postal $city',
-          phone: phoneFor(i),
-          delivery: 'Werf $city',
-          finish: finishes[i % finishes.length],
-          extraNotes: random.nextDouble() < 0.4
-              ? plannerNotes[i % plannerNotes.length]
-              : '',
-          estimatedDays: detailDays,
-        ),
-        offerLines: offerLines,
-      );
-
-      if (random.nextDouble() < 0.25) {
-        comments[name] = [
-          'Planner: ${plannerNotes[(i + 1) % plannerNotes.length]}',
-          if (random.nextDouble() < 0.5)
-            'Werfleider: ${leaderNotes[(i + 2) % leaderNotes.length]}',
-        ];
-      }
-
-      if (status == 'Ingepland') {
-        final team = teams[i % teams.length];
-        addRegularSchedule(name, team, _clampScheduledDays(estimatedDays));
-      } else if (status == 'Afgewerkt') {
-        final team = teams[(i + 1) % teams.length];
-        completionTeams[name] = team;
-        completedRegular.add(name);
-        addWorkLogs(name, team, _clampScheduledDays(estimatedDays));
-        if (random.nextDouble() < 0.6) {
-          beforePhotos[name] = [dummyFile('before_${name.hashCode}.jpg')];
-          afterPhotos[name] = [dummyFile('after_${name.hashCode}.jpg')];
-        }
-        if (random.nextDouble() < 0.35) {
-          extraWorks[name] = [
-            ExtraWorkEntry(
-              description: extraWorkPool[i % extraWorkPool.length],
-              photos: [dummyFile('extra_${name.hashCode}.jpg')],
-              hours: 0.5 + random.nextInt(3),
-              chargeType: random.nextDouble() < 0.7 ? 'Klant' : 'Interne fout',
-            ),
-          ];
-        }
-      }
-
-      if (random.nextDouble() < 0.2) {
-        documents[name] = [
-          ProjectDocument(
-            description: 'Bestek / order ${i + 1}',
-            file: dummyFile('order_${name.hashCode}.pdf'),
-          ),
-        ];
-      }
-    }
-
-    final clusterDays = <String, DateTime>{
-      for (final team in teams) team: pickClusterDay(team),
-    };
-    final clusterCounts = <String, int>{
-      for (final team in teams) team: 0,
-    };
-    var forcedClusterUsed = 0;
-
-    for (int i = 0; i < 100; i++) {
-      final seed = 300 + i;
-      final name = customerName(seed, suffix: 'N');
-      final city = cities[seed % cities.length];
-      final postal = postalCodes[seed % postalCodes.length];
-      final street = streets[seed % streets.length];
-      final number = 3 + (seed * 2) % 90;
-      final status = backorderStatuses[i];
-      final offerLines = buildOfferLines(seed);
-      addProject(
-        name: name,
-        group: 'Nabestellingen',
-        status: status,
-        creator: 'Julie',
-        details: ProjectDetails(
-          address: '$street $number, $postal $city',
-          phone: phoneFor(seed),
-          delivery: 'Werf $city',
-          finish: 'Nabestelling',
-          extraNotes: random.nextDouble() < 0.35
-              ? leaderNotes[seed % leaderNotes.length]
-              : '',
-          estimatedDays: 1,
-        ),
-        offerLines: offerLines,
-      );
-
-      isBackorder[name] = true;
-      backorderItems[name] = [
-        backorderPool[(seed + 1) % backorderPool.length],
-        if (random.nextDouble() < 0.4)
-          backorderPool[(seed + 3) % backorderPool.length],
-      ];
-      backorderHours[name] = 1 + random.nextInt(7) + (random.nextBool() ? 0.5 : 0);
-      if (completedRegular.isNotEmpty && random.nextDouble() < 0.25) {
-        backorderNotes[name] =
-            'Nabestelling na ${completedRegular[random.nextInt(completedRegular.length)]}';
-      }
-
-      if (status == 'Ingepland') {
-        String team = teams[random.nextInt(teams.length)];
-        DateTime start;
-        if (forcedClusterUsed < 4) {
-          team = 'Team 1';
-          start = clusterDays[team]!;
-          forcedClusterUsed += 1;
-          backorderDayCounts[team]![start] =
-              (backorderDayCounts[team]![start] ?? 0) + 1;
-        } else if (clusterCounts[team]! < 4 && random.nextDouble() < 0.35) {
-          start = clusterDays[team]!;
-          clusterCounts[team] = clusterCounts[team]! + 1;
-          backorderDayCounts[team]![start] =
-              (backorderDayCounts[team]![start] ?? 0) + 1;
-        } else {
-          start = pickBackorderDay(team);
-        }
-        ScheduleStore.scheduled.add(
-          TeamAssignment(
-            project: name,
-            team: team,
-            startDate: start,
-            endDate: start,
-            estimatedDays: 1,
-            isBackorder: true,
-            group: 'Nabestellingen',
-          ),
-        );
-      } else if (status == 'Afgewerkt') {
-        final team = teams[(i + 2) % teams.length];
-        completionTeams[name] = team;
-        addWorkLogs(name, team, 1);
-        if (random.nextDouble() < 0.4) {
-          extraWorks[name] = [
-            ExtraWorkEntry(
-              description: extraWorkPool[(seed + 2) % extraWorkPool.length],
-              photos: [dummyFile('extra_bo_${name.hashCode}.jpg')],
-              hours: 0.5 + random.nextInt(2),
-              chargeType: random.nextDouble() < 0.7 ? 'Klant' : 'Interne fout',
-            ),
-          ];
-        }
-      }
-    }
-
     _seeded = true;
   }
+
 
   static void markSeeded() {
     _seeded = true;
@@ -3048,6 +2561,7 @@ class TeamAssignment {
   final String group;
 }
 
+// ignore: unused_element
 const _testAccounts = [
   TestAccount(
     name: 'Nick',
@@ -3358,7 +2872,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     Text(
                       NetlifyIdentityService.isConfigured
                           ? 'Na registratie ontvang je een bevestigingsmail.'
-                          : 'Testusers zijn vooraf aangemaakt. Gebruik hun e-mail en wachtwoord `Test1234!`.',
+                          : 'Registreer een nieuw bedrijf om te starten.',
                       style: Theme.of(context)
                           .textTheme
                           .bodyMedium
@@ -3433,6 +2947,13 @@ class _RegisterScreenState extends State<RegisterScreen> {
               error.toLowerCase().contains('exists') ||
               error.toLowerCase().contains('in use'))) {
         error = 'E-mailadres is al in gebruik. Gebruik wachtwoord resetten.';
+      }
+      if (error == null) {
+        await NetlifyIdentityService.sendWelcomeEmail(
+          email: _adminEmailController.text,
+          name: _adminNameController.text,
+          company: _companyNameController.text,
+        );
       }
     }
     error ??= AuthStore.registerCompany(
@@ -10369,6 +9890,7 @@ class _RoleManagementStore {
     DateTime.thursday,
     DateTime.friday,
   };
+  // ignore: unused_field
   static const Set<int> _saturdayWorkingDays = {
     DateTime.monday,
     DateTime.tuesday,
@@ -10379,80 +9901,7 @@ class _RoleManagementStore {
   };
 
   static void seedIfEmpty() {
-    if (assignments.isEmpty) {
-      assignments = _testAccounts
-          .map(
-            (account) => _RoleAssignment(
-              name: account.name,
-              email: AuthStore._emailFromNameAndCompany(
-                account.name,
-                account.company,
-              ),
-              role: account.role,
-              contractor: account.role == 'Onderaannemer beheerder'
-                  ? (account.name == 'Maksim' ? 'MS Construct' : 'Schijnpoort')
-                  : account.role == 'Onderaannemer'
-                      ? account.name
-                      : account.team != null
-                          ? 'Schijnpoort'
-                          : 'Schijnpoort',
-              team: account.team,
-            ),
-          )
-          .toList();
-      if (!assignments.any(
-        (assignment) =>
-            assignment.role == 'Onderaannemer' &&
-            assignment.name == 'Schijnpoort',
-      )) {
-        assignments.add(
-          _RoleAssignment(
-            name: 'Schijnpoort',
-            email: '',
-            role: 'Onderaannemer',
-          ),
-        );
-      }
-      teams = [
-        _TeamAssignment(
-          name: 'Team 1',
-          contractor: 'Schijnpoort',
-          workingDays: _saturdayWorkingDays,
-        ),
-        _TeamAssignment(
-          name: 'Team 2',
-          contractor: 'Schijnpoort',
-          workingDays: _defaultWorkingDays,
-        ),
-        _TeamAssignment(
-          name: 'Team 3',
-          contractor: 'Schijnpoort',
-          workingDays: _saturdayWorkingDays,
-        ),
-        _TeamAssignment(
-          name: 'Team 4',
-          contractor: 'MS Construct',
-          workingDays: _defaultWorkingDays,
-        ),
-        _TeamAssignment(
-          name: 'Team 5',
-          contractor: 'MS Construct',
-          workingDays: _defaultWorkingDays,
-        ),
-      ];
-    }
-    _normalizeDemoTeams();
-  }
-
-  static void _normalizeDemoTeams() {
-    const allowedTeams = {'Team 1', 'Team 2', 'Team 3', 'Team 4', 'Team 5'};
-    teams.removeWhere((team) => !allowedTeams.contains(team.name));
-    assignments.removeWhere(
-      (assignment) =>
-          assignment.role == 'Werknemer' &&
-          (assignment.team == null ||
-              !allowedTeams.contains(assignment.team)),
-    );
+    return;
   }
 
   static Set<int> workingDaysForTeam(String teamName, {String? contractor}) {
@@ -10637,6 +10086,13 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
         );
         return;
       }
+      await NetlifyIdentityService.sendInvitationNoticeEmail(
+        email: email,
+        name: name,
+        role: _selectedRole,
+        invitedBy: widget.currentAccount.name,
+        company: widget.currentAccount.company,
+      );
     }
     setState(() {
       if (_selectedRole == 'Team') {

@@ -31,8 +31,141 @@
 
   <title>timetable_app</title>
   <link rel="manifest" href="manifest.json">
+  <style>
+    #verify-status {
+      display: none;
+      min-height: 100vh;
+      box-sizing: border-box;
+      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f6f7fb;
+      color: #111827;
+    }
+    #verify-card {
+      max-width: 540px;
+      margin: 64px auto 0;
+      padding: 20px;
+      background: #ffffff;
+      border-radius: 14px;
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
+    }
+    #verify-title {
+      margin: 0 0 8px;
+      font-size: 20px;
+      font-weight: 700;
+    }
+    #verify-text {
+      margin: 0;
+      line-height: 1.45;
+      color: #374151;
+    }
+    #verify-open-app {
+      margin-top: 16px;
+      display: none;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      background: #111827;
+      color: #fff;
+      cursor: pointer;
+    }
+  </style>
 </head>
 <body>
+  <div id="verify-status">
+    <div id="verify-card">
+      <h1 id="verify-title">Bevestiging verwerken...</h1>
+      <p id="verify-text">Even geduld, je account wordt geactiveerd.</p>
+      <button id="verify-open-app" type="button">Open app</button>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const hash = window.location.hash || "";
+      const tokenMatch = hash.match(/(?:^#|&)confirmation_token=([^&]+)/);
+      if (!tokenMatch) return;
+
+      const verifyStatus = document.getElementById("verify-status");
+      const verifyTitle = document.getElementById("verify-title");
+      const verifyText = document.getElementById("verify-text");
+      const openAppButton = document.getElementById("verify-open-app");
+      const deepLink = "timetableapp://login?verified=1";
+
+      const setStatus = (title, text, showOpenApp) => {
+        verifyStatus.style.display = "block";
+        verifyTitle.textContent = title;
+        verifyText.textContent = text;
+        openAppButton.style.display = showOpenApp ? "inline-block" : "none";
+      };
+
+      const openApp = () => {
+        window.location.href = deepLink;
+      };
+
+      openAppButton.addEventListener("click", openApp);
+
+      const sendVerifiedMail = async (payload) => {
+        try {
+          await fetch("/.netlify/functions/send-mail", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              type: "verified",
+              email: payload.email || "",
+              name: payload.user_metadata && payload.user_metadata.full_name
+                ? payload.user_metadata.full_name
+                : "",
+              company: payload.user_metadata && payload.user_metadata.company_name
+                ? payload.user_metadata.company_name
+                : "",
+            }),
+          });
+        } catch (_) {
+          // Niet blokkeren op mailfout; account is al bevestigd.
+        }
+      };
+
+      const run = async () => {
+        const token = decodeURIComponent(tokenMatch[1]);
+        setStatus("Bevestiging verwerken...", "Even geduld, je account wordt geactiveerd.", false);
+        try {
+          const response = await fetch("/.netlify/identity/verify", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ token: token, type: "signup" }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const message = data.msg || data.message || "De bevestigingslink is ongeldig of verlopen.";
+            throw new Error(message);
+          }
+
+          await sendVerifiedMail(data || {});
+          setStatus(
+            "Account geverifieerd",
+            "Je account is geactiveerd. De app wordt nu geopend.",
+            true
+          );
+          openApp();
+        } catch (error) {
+          setStatus(
+            "Bevestiging mislukt",
+            (error && error.message) || "De bevestiging is niet gelukt. Vraag een nieuwe link aan.",
+            false
+          );
+        } finally {
+          if (window.history && window.history.replaceState) {
+            window.history.replaceState({}, document.title, "/");
+          }
+        }
+      };
+
+      run();
+    })();
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
