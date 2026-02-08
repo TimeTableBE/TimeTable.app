@@ -715,6 +715,8 @@ class HiveRepository implements DataRepository {
 class AppDataStore {
   static const String _fileName = 'timetable_data.json';
   static bool hasStoredData = false;
+  // Tijdelijke testmodus: wis alle data bij elke app-start.
+  static const bool _wipeOnEveryInitForTesting = true;
   static int _dataWipeVersion = 0;
   static const int _targetDataWipeVersion = 2;
   static int _projectResetVersion = 0;
@@ -748,6 +750,12 @@ class AppDataStore {
       hasStoredData = true;
     }
     OfferCatalogStore.seedIfEmpty();
+    if (_wipeOnEveryInitForTesting) {
+      _wipeAllBusinessData();
+      _dataWipeVersion = _targetDataWipeVersion;
+      await save();
+      return;
+    }
     if (_dataWipeVersion < _targetDataWipeVersion) {
       _wipeAllBusinessData();
       _dataWipeVersion = _targetDataWipeVersion;

@@ -4,3 +4,8 @@
 
 [build]
   publish = "timetable_app/build/web"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

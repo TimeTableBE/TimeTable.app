@@ -11,6 +11,8 @@
 - In Netlify Site Settings -> Environment variables voeg toe:
   - `NETLIFY_SITE_URL` = `https://jouw-site.netlify.app`
   - `NETLIFY_IDENTITY_ADMIN_TOKEN` = jouw service token
+  - `RESEND_API_KEY` = API key van Resend (voor custom mails)
+  - `RESEND_FROM_EMAIL` = verified afzender in Resend (bv. `noreply@jouwdomein.be`)
 
 ## 3) Flutter app configureren
 Start met dart-defines:
@@ -18,7 +20,8 @@ Start met dart-defines:
 ```bash
 flutter run \
   --dart-define=NETLIFY_SITE_URL=https://jouw-site.netlify.app \
-  --dart-define=NETLIFY_INVITE_FUNCTION_PATH=/.netlify/functions/send-invite
+  --dart-define=NETLIFY_INVITE_FUNCTION_PATH=/.netlify/functions/send-invite \
+  --dart-define=NETLIFY_MAIL_FUNCTION_PATH=/.netlify/functions/send-mail
 ```
 
 ## 4) Wat er nu automatisch werkt
@@ -26,6 +29,9 @@ flutter run \
 - Login: alleen na correcte credentials.
 - Wachtwoord vergeten: resetmail via Netlify Identity.
 - Uitnodigen (rollenbeheer): Netlify Function `send-invite` stuurt uitnodiging.
+- Custom mails via Resend:
+  - `send-mail` verstuurt `welcome` na registratie.
+  - `send-mail` verstuurt `invite_notice` na uitnodigen.
 
 ## 5) GitHub + Netlify
 - Connect je GitHub repo in Netlify.

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TimeTable - Verificatie</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f4f1ea;
+      color: #0b2e2b;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .card {
+      width: min(560px, calc(100vw - 32px));
+      background: #fff;
+      border-radius: 14px;
+      padding: 20px;
+      box-sizing: border-box;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+    p {
+      margin: 0;
+      color: #334155;
+      line-height: 1.45;
+    }
+    button {
+      margin-top: 16px;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      background: #0b2e2b;
+      color: #fff;
+      font-size: 14px;
+      cursor: pointer;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="title">Bevestiging verwerken...</h1>
+    <p id="text">Even geduld, je account wordt geactiveerd.</p>
+    <button id="openApp">Open de app</button>
+  </div>
+
+  <script>
+    (function () {
+      const title = document.getElementById("title");
+      const text = document.getElementById("text");
+      const openAppButton = document.getElementById("openApp");
+      const deepLink = "timetableapp://login?verified=1";
+
+      function setState(newTitle, newText, showButton) {
+        title.textContent = newTitle;
+        text.textContent = newText;
+        openAppButton.style.display = showButton ? "inline-block" : "none";
+      }
+
+      function parseToken() {
+        const hash = window.location.hash || "";
+        const fromHash = hash.match(/(?:^#|&)confirmation_token=([^&]+)/);
+        if (fromHash && fromHash[1]) return decodeURIComponent(fromHash[1]);
+        const params = new URLSearchParams(window.location.search);
+        const fromQuery = params.get("confirmation_token");
+        return fromQuery ? decodeURIComponent(fromQuery) : "";
+      }
+
+      async function sendVerifiedEmail(payload) {
+        try {
+          await fetch("/.netlify/functions/send-mail", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              type: "verified",
+              email: payload.email || "",
+              name: payload.user_metadata && payload.user_metadata.full_name
+                ? payload.user_metadata.full_name
+                : "",
+              company: payload.user_metadata && payload.user_metadata.company_name
+                ? payload.user_metadata.company_name
+                : "",
+            }),
+          });
+        } catch (_) {
+          // Mailfout blokkeert verificatie niet.
+        }
+      }
+
+      async function verify() {
+        const token = parseToken();
+        if (!token) {
+          setState("Geen token gevonden", "Deze link bevat geen geldige verificatietoken.", false);
+          return;
+        }
+
+        try {
+          const response = await fetch("/.netlify/identity/verify", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ token: token, type: "signup" }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const message = data.msg || data.message || "De verificatielink is ongeldig of verlopen.";
+            throw new Error(message);
+          }
+
+          await sendVerifiedEmail(data || {});
+          setState("Account geverifieerd", "Je account is actief. Je kan nu inloggen in de app.", true);
+          window.location.href = deepLink;
+        } catch (error) {
+          setState(
+            "Verificatie mislukt",
+            (error && error.message) || "Er ging iets mis tijdens de verificatie.",
+            false
+          );
+        } finally {
+          if (window.history && window.history.replaceState) {
+            window.history.replaceState({}, document.title, "/confirm.html");
+          }
+        }
+      }
+
+      openAppButton.addEventListener("click", function () {
+        window.location.href = deepLink;
+      });
+
+      verify();
+    })();
+  </script>
+</body>
+</html>
