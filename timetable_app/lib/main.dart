@@ -14,6 +14,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:crypto/crypto.dart';
+import 'package:http/http.dart' as http;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -307,6 +308,83 @@ class AuthStore {
     );
   }
 
+  static AuthUser? findByEmail(String email) {
+    seedIfEmpty();
+    final normalizedEmail = email.trim().toLowerCase();
+    for (final user in users) {
+      if (user.email.toLowerCase() == normalizedEmail) {
+        return user;
+      }
+    }
+    return null;
+  }
+
+  static void upsertUserFromIdentity({
+    required String email,
+    required String name,
+    required String company,
+    String role = 'Werknemer',
+    String? team,
+  }) {
+    seedIfEmpty();
+    final normalizedEmail = email.trim().toLowerCase();
+    final index = users.indexWhere(
+      (entry) => entry.email.toLowerCase() == normalizedEmail,
+    );
+    final existing = index == -1 ? null : users[index];
+    final safeName = name.trim().isEmpty ? normalizedEmail : name.trim();
+    final safeCompany = company.trim().isEmpty ? 'Finestone' : company.trim();
+    final replacement = AuthUser(
+      name: safeName,
+      email: normalizedEmail,
+      company: safeCompany,
+      passwordHash: existing?.passwordHash ?? '',
+      passwordSalt: existing?.passwordSalt ?? '',
+      role: role,
+      team: team,
+    );
+    if (index == -1) {
+      users.add(replacement);
+    } else {
+      users[index] = replacement;
+    }
+    AppDataStore.scheduleSave();
+  }
+
+  static TestAccount accountForEmail(
+    String email, {
+    String fallbackName = '',
+    String fallbackCompany = '',
+  }) {
+    _RoleManagementStore.seedIfEmpty();
+    final normalizedEmail = email.trim().toLowerCase();
+    final assignment = _RoleManagementStore.assignments.firstWhere(
+      (entry) => entry.email.trim().toLowerCase() == normalizedEmail,
+      orElse: () => _RoleAssignment(
+        name: fallbackName.isEmpty ? normalizedEmail : fallbackName,
+        email: normalizedEmail,
+        role: 'Werknemer',
+      ),
+    );
+    final knownUser = findByEmail(normalizedEmail);
+    final company =
+        fallbackCompany.isNotEmpty ? fallbackCompany : (knownUser?.company ?? 'Finestone');
+    upsertUserFromIdentity(
+      email: normalizedEmail,
+      name: assignment.name,
+      company: company,
+      role: assignment.role,
+      team: assignment.team,
+    );
+    return TestAccount(
+      name: assignment.name,
+      email: normalizedEmail,
+      role: assignment.role,
+      company: company,
+      team: assignment.team,
+    );
+  }
+
   static String _hashPassword(String password, String salt) {
     final bytes = utf8.encode('$salt::$password');
     return sha256.convert(bytes).toString();
@@ -347,6 +425,156 @@ class AuthStore {
     }
     usedEmails.add(candidate);
     return candidate;
+  }
+}
+
+class NetlifyIdentityService {
+  static final String _siteUrl = const String.fromEnvironment(
+    'NETLIFY_SITE_URL',
+    defaultValue: '',
+  ).trim();
+  static final String _inviteFunctionPath = const String.fromEnvironment(
+    'NETLIFY_INVITE_FUNCTION_PATH',
+    defaultValue: '/.netlify/functions/send-invite',
+  ).trim();
+
+  static bool get isConfigured => _siteUrl.isNotEmpty;
+
+  static Uri _identityUri(String path) {
+    final normalizedBase = _siteUrl.endsWith('/')
+        ? _siteUrl.substring(0, _siteUrl.length - 1)
+        : _siteUrl;
+    return Uri.parse('$normalizedBase/.netlify/identity$path');
+  }
+
+  static Uri _functionUri(String path) {
+    final normalizedBase = _siteUrl.endsWith('/')
+        ? _siteUrl.substring(0, _siteUrl.length - 1)
+        : _siteUrl;
+    final normalizedPath = path.startsWith('/') ? path : '/$path';
+    return Uri.parse('$normalizedBase$normalizedPath');
+  }
+
+  static Future<String?> signup({
+    required String email,
+    required String password,
+    required String name,
+    required String company,
+    required String businessNumber,
+    required String address,
+  }) async {
+    if (!isConfigured) return null;
+    final response = await http.post(
+      _identityUri('/signup'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'email': email.trim().toLowerCase(),
+        'password': password,
+        'data': {
+          'name': name.trim(),
+          'company': company.trim(),
+          'businessNumber': businessNumber.trim(),
+          'address': address.trim(),
+        },
+      }),
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return null;
+    }
+    return _extractErrorMessage(response.body, 'Registratie mislukt.');
+  }
+
+  static Future<Map<String, dynamic>?> login({
+    required String email,
+    required String password,
+  }) async {
+    if (!isConfigured) return null;
+    final response = await http.post(
+      _identityUri('/token'),
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: {
+        'grant_type': 'password',
+        'username': email.trim().toLowerCase(),
+        'password': password,
+      },
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map<String, dynamic>) return decoded;
+      if (decoded is Map) {
+        return decoded.map((key, value) => MapEntry(key.toString(), value));
+      }
+      return <String, dynamic>{};
+    }
+    throw Exception(_extractErrorMessage(response.body, 'Inloggen mislukt.'));
+  }
+
+  static Future<String?> sendPasswordReset(String email) async {
+    if (!isConfigured) {
+      return 'NETLIFY_SITE_URL is niet ingesteld.';
+    }
+    final response = await http.post(
+      _identityUri('/recover'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'email': email.trim().toLowerCase()}),
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return null;
+    }
+    return _extractErrorMessage(
+      response.body,
+      'Reset-mail versturen mislukt.',
+    );
+  }
+
+  static Future<String?> inviteUser({
+    required String email,
+    required String name,
+    required String role,
+    required String invitedBy,
+    String? company,
+    String? contractor,
+    String? team,
+  }) async {
+    if (!isConfigured) {
+      return 'NETLIFY_SITE_URL is niet ingesteld.';
+    }
+    final response = await http.post(
+      _functionUri(_inviteFunctionPath),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'email': email.trim().toLowerCase(),
+        'name': name.trim(),
+        'role': role,
+        'invitedBy': invitedBy,
+        'company': (company ?? '').trim(),
+        'contractor': (contractor ?? '').trim(),
+        'team': (team ?? '').trim(),
+      }),
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return null;
+    }
+    return _extractErrorMessage(
+      response.body,
+      'Uitnodiging versturen mislukt.',
+    );
+  }
+
+  static String _extractErrorMessage(String raw, String fallback) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        final direct = decoded['error_description'] ??
+            decoded['error'] ??
+            decoded['message'];
+        if (direct != null && direct.toString().trim().isNotEmpty) {
+          return direct.toString();
+        }
+      }
+      if (decoded is String && decoded.trim().isNotEmpty) return decoded;
+    } catch (_) {}
+    return fallback;
   }
 }
 
@@ -2977,21 +3205,90 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
     setState(() => _isSubmitting = true);
-    final user = AuthStore.authenticate(email, password);
+    TestAccount? account;
+    if (NetlifyIdentityService.isConfigured) {
+      try {
+        final session = await NetlifyIdentityService.login(
+          email: email,
+          password: password,
+        );
+        final user = (session?['user'] as Map?) ?? {};
+        final metadata = (user['user_metadata'] as Map?) ?? {};
+        final identityName =
+            metadata['name']?.toString() ?? user['email']?.toString() ?? email;
+        final identityCompany =
+            metadata['company']?.toString() ?? 'Finestone';
+        account = AuthStore.accountForEmail(
+          email,
+          fallbackName: identityName,
+          fallbackCompany: identityCompany,
+        );
+      } catch (error) {
+        if (!mounted) return;
+        setState(() => _isSubmitting = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.toString().replaceFirst('Exception: ', ''))),
+        );
+        return;
+      }
+    } else {
+      final user = AuthStore.authenticate(email, password);
+      if (user != null) {
+        account = AuthStore.toAccount(user);
+      }
+    }
     setState(() => _isSubmitting = false);
-    if (user == null) {
+    if (account == null) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Ongeldige logingegevens.'),
-        ),
+        const SnackBar(content: Text('Ongeldige logingegevens.')),
       );
       return;
     }
-    final account = AuthStore.toAccount(user);
+    final resolvedAccount = account;
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       _appPageRoute(
-        builder: (_) => DashboardScreen(account: account),
+        builder: (_) => DashboardScreen(account: resolvedAccount),
+      ),
+    );
+  }
+
+  Future<void> _resetPassword() async {
+    final controller = TextEditingController(text: _emailController.text.trim());
+    final email = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Wachtwoord resetten'),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.emailAddress,
+          decoration: const InputDecoration(hintText: 'E-mailadres'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Annuleer'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(controller.text.trim()),
+            child: const Text('Versturen'),
+          ),
+        ],
+      ),
+    );
+    if (email == null || email.isEmpty) return;
+    final error = await NetlifyIdentityService.sendPasswordReset(email);
+    if (!mounted) return;
+    if (error != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error)),
+      );
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Reset-link verzonden. Controleer je e-mail.'),
       ),
     );
   }
@@ -3050,8 +3347,18 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                     ),
                     const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: _SecondaryButton(
+                        label: 'Wachtwoord vergeten',
+                        onTap: _resetPassword,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
                     Text(
-                      'Testusers zijn vooraf aangemaakt. Gebruik hun e-mail en wachtwoord `Test1234!`.',
+                      NetlifyIdentityService.isConfigured
+                          ? 'Na registratie ontvang je een bevestigingsmail.'
+                          : 'Testusers zijn vooraf aangemaakt. Gebruik hun e-mail en wachtwoord `Test1234!`.',
                       style: Theme.of(context)
                           .textTheme
                           .bodyMedium
@@ -3111,7 +3418,24 @@ class _RegisterScreenState extends State<RegisterScreen> {
       return;
     }
     setState(() => _isSubmitting = true);
-    final error = AuthStore.registerCompany(
+    String? error;
+    if (NetlifyIdentityService.isConfigured) {
+      error = await NetlifyIdentityService.signup(
+        email: _adminEmailController.text,
+        password: password,
+        name: _adminNameController.text,
+        company: _companyNameController.text,
+        businessNumber: _businessNumberController.text,
+        address: _addressController.text,
+      );
+      if (error != null &&
+          (error.toLowerCase().contains('already') ||
+              error.toLowerCase().contains('exists') ||
+              error.toLowerCase().contains('in use'))) {
+        error = 'E-mailadres is al in gebruik. Gebruik wachtwoord resetten.';
+      }
+    }
+    error ??= AuthStore.registerCompany(
       companyName: _companyNameController.text,
       businessNumber: _businessNumberController.text,
       address: _addressController.text,
@@ -3120,23 +3444,60 @@ class _RegisterScreenState extends State<RegisterScreen> {
       password: password,
     );
     if (error != null) {
+      if (!mounted) return;
       setState(() => _isSubmitting = false);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(error)),
       );
       return;
     }
+    setState(() => _isSubmitting = false);
+    if (!mounted) return;
+    if (NetlifyIdentityService.isConfigured) {
+      try {
+        final session = await NetlifyIdentityService.login(
+          email: _adminEmailController.text.trim(),
+          password: _passwordController.text,
+        );
+        final user = (session?['user'] as Map?) ?? {};
+        final metadata = (user['user_metadata'] as Map?) ?? {};
+        final identityName = metadata['name']?.toString() ??
+            _adminNameController.text.trim();
+        final identityCompany = metadata['company']?.toString() ??
+            _companyNameController.text.trim();
+        final account = AuthStore.accountForEmail(
+          _adminEmailController.text.trim(),
+          fallbackName: identityName,
+          fallbackCompany: identityCompany,
+        );
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Account aangemaakt. Bevestigingsmail is verzonden.'),
+          ),
+        );
+        Navigator.of(context).pushReplacement(
+          _appPageRoute(
+            builder: (_) => DashboardScreen(account: account),
+          ),
+        );
+      } catch (_) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Account aangemaakt. Bevestigingsmail is verzonden.',
+            ),
+          ),
+        );
+        Navigator.of(context).pop();
+      }
+      return;
+    }
     final user = AuthStore.authenticate(
       _adminEmailController.text.trim(),
       _passwordController.text,
     );
-    setState(() => _isSubmitting = false);
-    if (user == null || !mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Registratie gelukt, maar login faalde.')),
-      );
-      return;
-    }
+    if (user == null) return;
     final account = AuthStore.toAccount(user);
     Navigator.of(context).pushReplacement(
       _appPageRoute(
@@ -10185,7 +10546,7 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
     super.dispose();
   }
 
-  void _invite() {
+  Future<void> _invite() async {
     final name = _nameController.text.trim();
     final email = _emailController.text.trim();
     if (_selectedRole != 'Team') {
@@ -10255,6 +10616,26 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
           );
           return;
         }
+      }
+    }
+    if (_selectedRole != 'Team' &&
+        _selectedRole != 'Onderaannemer' &&
+        NetlifyIdentityService.isConfigured) {
+      final inviteError = await NetlifyIdentityService.inviteUser(
+        email: email,
+        name: name,
+        role: _selectedRole,
+        invitedBy: widget.currentAccount.name,
+        company: widget.currentAccount.company,
+        contractor: contractor,
+        team: team,
+      );
+      if (inviteError != null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(inviteError)),
+        );
+        return;
       }
     }
     setState(() {
@@ -10962,7 +11343,9 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
                                   _selectedRole == 'Team'
                               ? 'Aanmaken'
                               : 'Uitnodigen',
-                          onTap: _invite,
+                          onTap: () {
+                            _invite();
+                          },
                         ),
                       ],
                     ),
