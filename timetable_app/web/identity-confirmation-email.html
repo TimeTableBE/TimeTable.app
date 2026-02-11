@@ -3,29 +3,33 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Verify your email - TimeTable</title>
+  <title>TimeTable verificatie</title>
 </head>
 <body style="margin:0;padding:0;background:#f4f1ea;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#0b2e2b;">
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 12px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="560" cellspacing="0" cellpadding="0" style="max-width:560px;width:100%;background:#ffffff;border-radius:12px;padding:24px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#ffffff;border-radius:14px;padding:24px;">
           <tr>
-            <td>
-              <h1 style="margin:0 0 10px 0;font-size:22px;line-height:1.2;">Welkom bij TimeTable</h1>
-              <p style="margin:0 0 14px 0;font-size:15px;line-height:1.5;color:#334155;">
-                Je account is aangemaakt. Klik hieronder om je e-mailadres te bevestigen en je account te activeren.
-              </p>
-              <p style="margin:0 0 16px 0;">
-                <a href="{{ .ConfirmationURL }}" style="display:inline-block;background:#0b2e2b;color:#ffffff;text-decoration:none;padding:10px 14px;border-radius:8px;font-size:14px;">
-                  Activeer account
-                </a>
-              </p>
-              <p style="margin:0;font-size:13px;line-height:1.5;color:#64748b;">
-                Werkt de knop niet? Open deze link:
-                <br />
-                <a href="{{ .ConfirmationURL }}" style="color:#0b2e2b;word-break:break-all;">{{ .ConfirmationURL }}</a>
-              </p>
+            <td style="font-size:24px;font-weight:700;padding-bottom:8px;">TimeTable</td>
+          </tr>
+          <tr>
+            <td style="font-size:16px;line-height:1.5;color:#334155;padding-bottom:12px;">
+              Welkom! Klik op de knop hieronder om je account te activeren.
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0 16px;">
+              <a href="{{ .ConfirmationURL }}" style="display:inline-block;background:#0b2e2b;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:600;">
+                Account activeren
+              </a>
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:13px;line-height:1.5;color:#64748b;">
+              Werkt de knop niet? Open deze link:
+              <br />
+              <a href="{{ .ConfirmationURL }}" style="color:#0b2e2b;word-break:break-all;">{{ .ConfirmationURL }}</a>
             </td>
           </tr>
         </table>
@@ -34,3 +38,4 @@
   </table>
 </body>
 </html>
+
