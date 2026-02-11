@@ -16,6 +16,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:timetable_app/services/netlify_identity_service.dart';
+import 'package:app_links/app_links.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -39,14 +40,40 @@ class TimeTableApp extends StatefulWidget {
 
 class _TimeTableAppState extends State<TimeTableApp>
     with WidgetsBindingObserver {
+  late final AppLinks _appLinks;
+  StreamSubscription<Uri>? _linkSubscription;
+
+  Future<void> _initDeepLinks() async {
+    try {
+      final initialUri = await _appLinks.getInitialLink();
+      _handleIncomingUri(initialUri);
+    } catch (_) {}
+    _linkSubscription = _appLinks.uriLinkStream.listen(_handleIncomingUri);
+  }
+
+  void _handleIncomingUri(Uri? uri) {
+    if (uri == null) return;
+    final scheme = uri.scheme.toLowerCase();
+    final host = uri.host.toLowerCase();
+    if (scheme == 'timetableapp' && host == 'reset-password') {
+      final token = (uri.queryParameters['token'] ?? '').trim();
+      if (token.isNotEmpty) {
+        DeepLinkStore.recoveryToken.value = token;
+      }
+    }
+  }
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _appLinks = AppLinks();
+    _initDeepLinks();
   }
 
   @override
   void dispose() {
+    _linkSubscription?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -108,6 +135,12 @@ class CurrentUserStore {
   static String company = '';
   static String team = '';
   static String contractor = '';
+}
+
+class DeepLinkStore {
+  static final ValueNotifier<String?> recoveryToken = ValueNotifier<String?>(
+    null,
+  );
 }
 
 class AuthUser {
@@ -548,6 +581,7 @@ class LocalSecretsStore {
   static const String _sessionAccessTokenKey = 'netlify_session_access_token';
   static const String _sessionRefreshTokenKey = 'netlify_session_refresh_token';
   static const String _sessionExpiresAtKey = 'netlify_session_expires_at_ms';
+  static const String _verifiedMailPrefix = 'verified_mail_sent_';
 
   static Future<List<int>> hiveEncryptionKey() async {
     final existing = await _storage.read(key: _hiveKeyName);
@@ -610,6 +644,20 @@ class LocalSecretsStore {
     await _storage.delete(key: _sessionAccessTokenKey);
     await _storage.delete(key: _sessionRefreshTokenKey);
     await _storage.delete(key: _sessionExpiresAtKey);
+  }
+
+  static String _verifiedMailKey(String email) =>
+      '$_verifiedMailPrefix${email.trim().toLowerCase()}';
+
+  static Future<bool> hasVerifiedMailBeenSent(String email) async {
+    final key = _verifiedMailKey(email);
+    final value = await _storage.read(key: key);
+    return value == '1';
+  }
+
+  static Future<void> markVerifiedMailSent(String email) async {
+    final key = _verifiedMailKey(email);
+    await _storage.write(key: key, value: '1');
   }
 }
 
@@ -2586,6 +2634,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   bool _isSubmitting = false;
+  bool _isShowingRecoveryDialog = false;
 
   bool _isIdentityDeletedError(NetlifyAuthException error) {
     final message = error.message.toLowerCase();
@@ -2609,10 +2658,143 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   @override
+  void initState() {
+    super.initState();
+    DeepLinkStore.recoveryToken.addListener(_onRecoveryTokenChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _onRecoveryTokenChanged();
+    });
+  }
+
+  @override
   void dispose() {
+    DeepLinkStore.recoveryToken.removeListener(_onRecoveryTokenChanged);
     _emailController.dispose();
     _passwordController.dispose();
     super.dispose();
+  }
+
+  Future<void> _onRecoveryTokenChanged() async {
+    if (!mounted || _isShowingRecoveryDialog) return;
+    final token = DeepLinkStore.recoveryToken.value;
+    if (token == null || token.isEmpty) return;
+    _isShowingRecoveryDialog = true;
+    final passwordController = TextEditingController();
+    final confirmController = TextEditingController();
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        bool isSubmitting = false;
+        String errorText = '';
+        return StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            title: const Text('Nieuw wachtwoord instellen'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: passwordController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    hintText: 'Nieuw wachtwoord',
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: confirmController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    hintText: 'Bevestig wachtwoord',
+                  ),
+                ),
+                if (errorText.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text(errorText, style: const TextStyle(color: Colors.red)),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: isSubmitting
+                    ? null
+                    : () => Navigator.of(dialogContext).pop(false),
+                child: const Text('Annuleer'),
+              ),
+              TextButton(
+                onPressed: isSubmitting
+                    ? null
+                    : () async {
+                        final navigator = Navigator.of(dialogContext);
+                        final newPassword = passwordController.text;
+                        final confirmPassword = confirmController.text;
+                        if (newPassword.length < 8) {
+                          setDialogState(() {
+                            errorText =
+                                'Gebruik minstens 8 tekens voor je wachtwoord.';
+                          });
+                          return;
+                        }
+                        if (newPassword != confirmPassword) {
+                          setDialogState(() {
+                            errorText = 'Wachtwoorden komen niet overeen.';
+                          });
+                          return;
+                        }
+                        setDialogState(() {
+                          isSubmitting = true;
+                          errorText = '';
+                        });
+                        final error =
+                            await NetlifyIdentityService.completePasswordRecovery(
+                              token: token,
+                              password: newPassword,
+                            );
+                        if (error != null) {
+                          setDialogState(() {
+                            isSubmitting = false;
+                            errorText = error;
+                          });
+                          return;
+                        }
+                        if (navigator.canPop()) {
+                          navigator.pop(true);
+                        }
+                      },
+                child: const Text('Opslaan'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    passwordController.dispose();
+    confirmController.dispose();
+    DeepLinkStore.recoveryToken.value = null;
+    _isShowingRecoveryDialog = false;
+    if (result == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Wachtwoord gewijzigd. Je kan nu inloggen.'),
+        ),
+      );
+    }
+  }
+
+  Future<void> _maybeSendVerifiedEmail(TestAccount account) async {
+    if (!NetlifyIdentityService.isConfigured) return;
+    final email = account.email.trim().toLowerCase();
+    if (email.isEmpty) return;
+    final alreadySent = await LocalSecretsStore.hasVerifiedMailBeenSent(email);
+    if (alreadySent) return;
+    final error = await NetlifyIdentityService.sendVerifiedEmail(
+      email: email,
+      name: account.name,
+      company: account.company,
+    );
+    if (error == null) {
+      await LocalSecretsStore.markVerifiedMailSent(email);
+    }
   }
 
   Future<void> _login() async {
@@ -2756,6 +2938,7 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
     final resolvedAccount = account;
+    await _maybeSendVerifiedEmail(resolvedAccount);
     TextInput.finishAutofillContext(shouldSave: true);
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
