@@ -212,6 +212,24 @@ class NetlifyIdentityService {
     return _extractErrorMessage(response.body, 'Reset-mail versturen mislukt.');
   }
 
+  static Future<String?> completePasswordRecovery({
+    required String token,
+    required String password,
+  }) async {
+    if (!isConfigured) {
+      return 'NETLIFY_SITE_URL is niet ingesteld.';
+    }
+    final response = await http.post(
+      _identityUri('/recover'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'token': token.trim(), 'password': password}),
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return null;
+    }
+    return _extractErrorMessage(response.body, 'Wachtwoord wijzigen mislukt.');
+  }
+
   static Future<String?> inviteUser({
     required String email,
     required String name,
@@ -305,6 +323,29 @@ class NetlifyIdentityService {
     return _extractErrorMessage(
       response.body,
       'Uitnodigingscode-mail versturen mislukt.',
+    );
+  }
+
+  static Future<String?> sendVerifiedEmail({
+    required String email,
+    required String name,
+    required String company,
+  }) async {
+    if (!isConfigured) return null;
+    final response = await http.post(
+      _functionUri(_mailFunctionPath),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'type': 'verified',
+        'email': email.trim().toLowerCase(),
+        'name': name.trim(),
+        'company': company.trim(),
+      }),
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) return null;
+    return _extractErrorMessage(
+      response.body,
+      'Verificatiemail versturen mislukt.',
     );
   }
 
