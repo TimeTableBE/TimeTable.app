@@ -23,6 +23,28 @@ const makeCode = (length = 8) => {
 
 const makeKey = (email, code) => `invite:${email}:${code}`;
 
+const getInvitesStore = () => {
+  const siteID =
+    process.env.NETLIFY_SITE_ID || process.env.SITE_ID || '';
+  const token =
+    process.env.NETLIFY_BLOBS_TOKEN ||
+    process.env.NETLIFY_AUTH_TOKEN ||
+    process.env.NETLIFY_ACCESS_TOKEN ||
+    '';
+
+  // Preferred path when Blobs context is auto-injected by Netlify.
+  if (!siteID || !token) {
+    return getStore('invites');
+  }
+
+  // Fallback path for environments where Blobs context is not auto-configured.
+  return getStore({
+    name: 'invites',
+    siteID,
+    token,
+  });
+};
+
 const sanitizeRecord = (record) => ({
   code: String(record.code || ''),
   email: normalizeEmail(record.email),
@@ -61,7 +83,17 @@ exports.handler = async (event) => {
     return json(400, { error: 'Geldig e-mailadres is verplicht.' });
   }
 
-  const store = getStore('invites');
+  let store;
+  try {
+    store = getInvitesStore();
+  } catch (error) {
+    return json(500, {
+      error:
+        error && error.message
+          ? error.message
+          : 'Blobs store niet beschikbaar.',
+    });
+  }
 
   if (action === 'create') {
     const name = String(payload.name || '').trim();
