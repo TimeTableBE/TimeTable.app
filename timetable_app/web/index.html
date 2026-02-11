@@ -107,20 +107,28 @@
 
       openAppButton.addEventListener("click", openApp);
 
+      const pickUserFromPayload = (payload) => {
+        const user = payload && payload.user ? payload.user : payload || {};
+        const metadata = user.user_metadata || payload.user_metadata || {};
+        return {
+          email: user.email || payload.email || "",
+          name: metadata.name || metadata.full_name || user.name || "",
+          company: metadata.company || metadata.company_name || "",
+        };
+      };
+
       const sendVerifiedMail = async (payload) => {
+        const user = pickUserFromPayload(payload || {});
+        if (!user.email) return;
         try {
           await fetch("/.netlify/functions/send-mail", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
               type: "verified",
-              email: payload.email || "",
-              name: payload.user_metadata && payload.user_metadata.full_name
-                ? payload.user_metadata.full_name
-                : "",
-              company: payload.user_metadata && payload.user_metadata.company_name
-                ? payload.user_metadata.company_name
-                : "",
+              email: user.email,
+              name: user.name,
+              company: user.company,
             }),
           });
         } catch (_) {
