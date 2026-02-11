@@ -2858,7 +2858,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     SizedBox(
                       width: double.infinity,
                       child: _SecondaryButton(
-                        label: 'Registreren als bedrijf',
+                        label: 'Registratie',
                         onTap: () {
                           Navigator.of(context).push(
                             _appPageRoute(
@@ -2899,8 +2899,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
   final TextEditingController _companyNameController = TextEditingController();
   final TextEditingController _businessNumberController =
       TextEditingController();
-  final TextEditingController _streetController = TextEditingController();
-  final TextEditingController _houseNumberController = TextEditingController();
+  final TextEditingController _streetAndNumberController =
+      TextEditingController();
   final TextEditingController _boxController = TextEditingController();
   final TextEditingController _postalCodeController = TextEditingController();
   final TextEditingController _cityController = TextEditingController();
@@ -2918,8 +2918,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
   void dispose() {
     _companyNameController.dispose();
     _businessNumberController.dispose();
-    _streetController.dispose();
-    _houseNumberController.dispose();
+    _streetAndNumberController.dispose();
     _boxController.dispose();
     _postalCodeController.dispose();
     _cityController.dispose();
@@ -2931,6 +2930,39 @@ class _RegisterScreenState extends State<RegisterScreen> {
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     super.dispose();
+  }
+
+  ({String street, String houseNumber})? _splitStreetAndNumber(String value) {
+    final input = value.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (input.isEmpty) return null;
+    final match = RegExp(
+      r'^(.+?)\s+([0-9]+[A-Za-z0-9/\-]*)$',
+    ).firstMatch(input);
+    if (match == null) return null;
+    final street = (match.group(1) ?? '').trim();
+    final houseNumber = (match.group(2) ?? '').trim();
+    if (street.isEmpty || houseNumber.isEmpty) return null;
+    return (street: street, houseNumber: houseNumber);
+  }
+
+  Future<Map<String, dynamic>?> _validateInviteWithRetry({
+    required String email,
+    required String code,
+    int maxAttempts = 6,
+  }) async {
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await NetlifyIdentityService.validateInvitationCode(
+          email: email,
+          code: code,
+        );
+      } on NetlifyAuthException catch (e) {
+        final isNotFound = e.statusCode == 404;
+        if (!isNotFound || attempt == maxAttempts) rethrow;
+        await Future<void>.delayed(const Duration(seconds: 1));
+      }
+    }
+    return null;
   }
 
   Future<void> _register() async {
@@ -2946,38 +2978,47 @@ class _RegisterScreenState extends State<RegisterScreen> {
     setState(() => _isSubmitting = true);
     String? error;
     if (_registerMode == 0) {
+      final split = _splitStreetAndNumber(_streetAndNumberController.text);
+      if (split == null) {
+        error = 'Vul adres in als "Straat + huisnummer".';
+      }
       if (NetlifyIdentityService.isConfigured) {
-        error = await NetlifyIdentityService.signup(
-          email: _adminEmailController.text,
-          password: password,
-          name: _adminNameController.text,
-          company: _companyNameController.text,
+        if (error == null && split != null) {
+          error = await NetlifyIdentityService.signup(
+            email: _adminEmailController.text,
+            password: password,
+            name: _adminNameController.text,
+            company: _companyNameController.text,
+            businessNumber: _businessNumberController.text,
+            street: split.street,
+            houseNumber: split.houseNumber,
+            box: _boxController.text,
+            postalCode: _postalCodeController.text,
+            city: _cityController.text,
+          );
+          if (error != null &&
+              (error.toLowerCase().contains('already') ||
+                  error.toLowerCase().contains('exists') ||
+                  error.toLowerCase().contains('in use'))) {
+            error =
+                'E-mailadres is al in gebruik. Gebruik wachtwoord resetten.';
+          }
+        }
+      }
+      if (error == null && split != null) {
+        error ??= AuthStore.registerCompany(
+          companyName: _companyNameController.text,
           businessNumber: _businessNumberController.text,
-          street: _streetController.text,
-          houseNumber: _houseNumberController.text,
+          street: split.street,
+          houseNumber: split.houseNumber,
           box: _boxController.text,
           postalCode: _postalCodeController.text,
           city: _cityController.text,
+          adminName: _adminNameController.text,
+          adminEmail: _adminEmailController.text,
+          password: password,
         );
-        if (error != null &&
-            (error.toLowerCase().contains('already') ||
-                error.toLowerCase().contains('exists') ||
-                error.toLowerCase().contains('in use'))) {
-          error = 'E-mailadres is al in gebruik. Gebruik wachtwoord resetten.';
-        }
       }
-      error ??= AuthStore.registerCompany(
-        companyName: _companyNameController.text,
-        businessNumber: _businessNumberController.text,
-        street: _streetController.text,
-        houseNumber: _houseNumberController.text,
-        box: _boxController.text,
-        postalCode: _postalCodeController.text,
-        city: _cityController.text,
-        adminName: _adminNameController.text,
-        adminEmail: _adminEmailController.text,
-        password: password,
-      );
     } else {
       if (_inviteCodeController.text.trim().isEmpty ||
           _inviteNameController.text.trim().isEmpty ||
@@ -3003,7 +3044,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
       if (NetlifyIdentityService.isConfigured) {
         try {
-          final validated = await NetlifyIdentityService.validateInvitationCode(
+          final validated = await _validateInviteWithRetry(
             email: inviteEmail,
             code: inviteCode,
           );
@@ -3176,21 +3217,13 @@ class _RegisterScreenState extends State<RegisterScreen> {
                             ),
                             const SizedBox(height: 12),
                             _EditableInputField(
-                              label: 'Straat',
-                              hint: 'Straat',
+                              label: 'Straat + huisnummer',
+                              hint: 'Straat + huisnummer',
                               icon: Icons.location_on_outlined,
                               autofillHints: const [
                                 AutofillHints.streetAddressLine1,
                               ],
-                              controller: _streetController,
-                            ),
-                            const SizedBox(height: 12),
-                            _EditableInputField(
-                              label: 'Huisnummer',
-                              hint: 'Huisnummer',
-                              keyboardType: TextInputType.streetAddress,
-                              icon: Icons.home_outlined,
-                              controller: _houseNumberController,
+                              controller: _streetAndNumberController,
                             ),
                             const SizedBox(height: 12),
                             _EditableInputField(

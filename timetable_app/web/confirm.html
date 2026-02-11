@@ -74,11 +74,21 @@
         return fromQuery ? decodeURIComponent(fromQuery) : "";
       }
 
+      function parseEmail() {
+        const hash = window.location.hash || "";
+        const fromHash = hash.match(/(?:^#|&)email=([^&]+)/);
+        if (fromHash && fromHash[1]) return decodeURIComponent(fromHash[1]);
+        const params = new URLSearchParams(window.location.search);
+        const fromQuery = params.get("email");
+        return fromQuery ? decodeURIComponent(fromQuery) : "";
+      }
+
       function pickUserFromPayload(payload) {
         const user = payload && payload.user ? payload.user : payload || {};
         const metadata = user.user_metadata || payload.user_metadata || {};
+        const parsedEmail = parseEmail();
         return {
-          email: user.email || payload.email || "",
+          email: user.email || payload.email || parsedEmail || "",
           name: metadata.name || metadata.full_name || user.name || "",
           company: metadata.company || metadata.company_name || "",
         };
@@ -123,7 +133,7 @@
           }
 
           await sendVerifiedEmail(data || {});
-          setState("Account geverifieerd", "Je account is actief. Je kan nu inloggen in de app.", true);
+          setState("Registratie voltooid", "Je account is geactiveerd en klaar voor gebruik. Je kan nu inloggen in de app.", true);
           window.location.href = deepLink;
         } catch (error) {
           setState(

@@ -33,6 +33,25 @@
       line-height: 1.45;
       color: #334155;
     }
+    .field {
+      margin-top: 14px;
+      display: grid;
+      gap: 6px;
+    }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #d6d9e0;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
     button {
       margin-top: 16px;
       border: 0;
@@ -48,22 +67,81 @@
 <body>
   <div class="card">
     <h1>Wachtwoord reset</h1>
-    <p id="info">
-      Deze link is ontvangen. Open nu de TimeTable app om je wachtwoord te wijzigen.
-    </p>
-    <button id="openApp">Open de app</button>
+    <p id="info">Kies hieronder een nieuw wachtwoord.</p>
+    <div class="field">
+      <label for="newPassword">Nieuw wachtwoord</label>
+      <input id="newPassword" type="password" autocomplete="new-password" />
+    </div>
+    <div class="field">
+      <label for="confirmPassword">Bevestig wachtwoord</label>
+      <input id="confirmPassword" type="password" autocomplete="new-password" />
+    </div>
+    <div class="row">
+      <button id="savePassword">Wachtwoord opslaan</button>
+      <button id="openApp" type="button" style="display:none;">Open de app</button>
+    </div>
   </div>
   <script>
     (function () {
       const hash = window.location.hash || "";
-      const tokenMatch = hash.match(/(?:^#|&)recovery_token=([^&]+)/);
+      const tokenMatch =
+        hash.match(/(?:^#|&)recovery_token=([^&]+)/) ||
+        hash.match(/(?:^#|&)token=([^&]+)/);
       const token = tokenMatch ? decodeURIComponent(tokenMatch[1]) : "";
-      const deepLink = token
-        ? `timetableapp://reset-password?token=${encodeURIComponent(token)}`
-        : "timetableapp://login";
-      document.getElementById("openApp").addEventListener("click", function () {
+      const info = document.getElementById("info");
+      const newPasswordInput = document.getElementById("newPassword");
+      const confirmPasswordInput = document.getElementById("confirmPassword");
+      const saveButton = document.getElementById("savePassword");
+      const openAppButton = document.getElementById("openApp");
+      const deepLink = "timetableapp://login";
+
+      if (!token) {
+        info.textContent = "Deze resetlink is ongeldig of verlopen.";
+        saveButton.disabled = true;
+      }
+
+      openAppButton.addEventListener("click", function () {
         window.location.href = deepLink;
       });
+
+      saveButton.addEventListener("click", async function () {
+        const pwd = String(newPasswordInput.value || "");
+        const confirm = String(confirmPasswordInput.value || "");
+        if (!pwd || pwd.length < 8) {
+          info.textContent = "Gebruik een wachtwoord van minstens 8 tekens.";
+          return;
+        }
+        if (pwd !== confirm) {
+          info.textContent = "Wachtwoorden komen niet overeen.";
+          return;
+        }
+        saveButton.disabled = true;
+        info.textContent = "Bevestiging wordt verwerkt...";
+        try {
+          const response = await fetch("/.netlify/identity/recover", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              token: token,
+              password: pwd,
+            }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const message =
+              data.msg || data.message || "Wachtwoord resetten mislukt.";
+            throw new Error(message);
+          }
+          info.textContent =
+            "Wachtwoord aangepast. Je kan nu inloggen in de app.";
+          openAppButton.style.display = "inline-block";
+        } catch (error) {
+          info.textContent =
+            (error && error.message) || "Wachtwoord resetten mislukt.";
+          saveButton.disabled = false;
+        }
+      });
+
       if (window.history && window.history.replaceState) {
         window.history.replaceState({}, document.title, "/recover.html");
       }
@@ -71,4 +149,3 @@
   </script>
 </body>
 </html>
-

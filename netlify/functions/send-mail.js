@@ -120,6 +120,7 @@ exports.handler = async (event) => {
           <p>Gebruik deze registratiecode in de app:</p>
           <p style="font-size:22px; letter-spacing:2px;"><strong>${code}</strong></p>
           <p>Geldig tot: <strong>${expiresAt || '24 uur'}</strong></p>
+          <p>Opgelet: na registratie kan activatie maximaal <strong>5 minuten</strong> duren.</p>
           <p>Na registratie moet je nog je account verifiëren via e-mail.</p>
           <p>Groeten,<br/>TimeTable</p>
         `,

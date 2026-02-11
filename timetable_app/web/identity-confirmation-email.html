@@ -20,7 +20,7 @@
           </tr>
           <tr>
             <td style="padding:8px 0 16px;">
-              <a href="{{ .ConfirmationURL }}" style="display:inline-block;background:#0b2e2b;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:600;">
+              <a href="{{ .ConfirmationURL }}&email={{ .Email }}" style="display:inline-block;background:#0b2e2b;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:600;">
                 Account activeren
               </a>
             </td>
@@ -29,7 +29,7 @@
             <td style="font-size:13px;line-height:1.5;color:#64748b;">
               Werkt de knop niet? Open deze link:
               <br />
-              <a href="{{ .ConfirmationURL }}" style="color:#0b2e2b;word-break:break-all;">{{ .ConfirmationURL }}</a>
+              <a href="{{ .ConfirmationURL }}&email={{ .Email }}" style="color:#0b2e2b;word-break:break-all;">{{ .ConfirmationURL }}&email={{ .Email }}</a>
             </td>
           </tr>
         </table>
@@ -38,4 +38,3 @@
   </table>
 </body>
 </html>
-

@@ -87,6 +87,8 @@
       const hash = window.location.hash || "";
       const tokenMatch = hash.match(/(?:^#|&)confirmation_token=([^&]+)/);
       if (!tokenMatch) return;
+      const emailMatch = hash.match(/(?:^#|&)email=([^&]+)/);
+      const emailFromHash = emailMatch ? decodeURIComponent(emailMatch[1]) : "";
 
       const verifyStatus = document.getElementById("verify-status");
       const verifyTitle = document.getElementById("verify-title");
@@ -111,7 +113,7 @@
         const user = payload && payload.user ? payload.user : payload || {};
         const metadata = user.user_metadata || payload.user_metadata || {};
         return {
-          email: user.email || payload.email || "",
+          email: user.email || payload.email || emailFromHash || "",
           name: metadata.name || metadata.full_name || user.name || "",
           company: metadata.company || metadata.company_name || "",
         };
@@ -153,8 +155,8 @@
 
           await sendVerifiedMail(data || {});
           setStatus(
-            "Account geverifieerd",
-            "Je account is geactiveerd. De app wordt nu geopend.",
+            "Registratie voltooid",
+            "Je account is geactiveerd en klaar voor gebruik. De app wordt nu geopend.",
             true
           );
           openApp();
