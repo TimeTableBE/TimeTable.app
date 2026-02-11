@@ -3,7 +3,18 @@
   node_bundler = "esbuild"
 
 [build]
+  command = "cd timetable_app && flutter build web --release"
   publish = "timetable_app/build/web"
+
+[[redirects]]
+  from = "/.netlify/functions/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/.netlify/identity/*"
+  to = "/.netlify/identity/:splat"
+  status = 200
 
 [[redirects]]
   from = "/*"
