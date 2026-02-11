@@ -99,6 +99,34 @@ exports.handler = async (event) => {
       return json(200, { ok: true, message: 'Uitnodigingsmail verzonden.' });
     }
 
+    if (type === 'invite_code') {
+      const role = String(input.role || '').trim();
+      const invitedBy = String(input.invitedBy || '').trim();
+      const company = String(input.company || '').trim();
+      const code = String(input.code || '').trim().toUpperCase();
+      const expiresAt = String(input.expiresAt || '').trim();
+      const contractor = String(input.contractor || '').trim();
+      const team = String(input.team || '').trim();
+      await sendResendEmail({
+        to,
+        subject: 'TimeTable uitnodiging - registratiecode',
+        html: `
+          <p>Hallo ${name || 'gebruiker'},</p>
+          <p>Je bent uitgenodigd voor <strong>${company || 'TimeTable'}</strong>.</p>
+          <p>Rol: <strong>${role || 'Werknemer'}</strong></p>
+          ${contractor ? `<p>Onderaannemer: <strong>${contractor}</strong></p>` : ''}
+          ${team ? `<p>Team: <strong>${team}</strong></p>` : ''}
+          <p>Uitgenodigd door: <strong>${invitedBy || 'beheerder'}</strong></p>
+          <p>Gebruik deze registratiecode in de app:</p>
+          <p style="font-size:22px; letter-spacing:2px;"><strong>${code}</strong></p>
+          <p>Geldig tot: <strong>${expiresAt || '24 uur'}</strong></p>
+          <p>Na registratie moet je nog je account verifiëren via e-mail.</p>
+          <p>Groeten,<br/>TimeTable</p>
+        `,
+      });
+      return json(200, { ok: true, message: 'Uitnodigingscode verzonden.' });
+    }
+
     if (type === 'verified') {
       const company = String(input.company || '').trim();
       await sendResendEmail({
@@ -114,7 +142,7 @@ exports.handler = async (event) => {
       return json(200, { ok: true, message: 'Verificatiemail verzonden.' });
     }
 
-    return json(400, { error: 'Ongeldig type. Gebruik welcome, invite_notice of verified.' });
+    return json(400, { error: 'Ongeldig type. Gebruik welcome, invite_notice, invite_code of verified.' });
   } catch (error) {
     return json(500, { error: error.message || 'Mail versturen mislukt.' });
   }

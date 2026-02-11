@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:math';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:hive/hive.dart';
@@ -13,7 +14,8 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:crypto/crypto.dart';
-import 'package:http/http.dart' as http;
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:timetable_app/services/netlify_identity_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -132,7 +134,11 @@ class CompanyProfile {
   const CompanyProfile({
     required this.name,
     required this.businessNumber,
-    required this.address,
+    required this.street,
+    required this.houseNumber,
+    this.box,
+    required this.postalCode,
+    required this.city,
     required this.adminName,
     required this.adminEmail,
     required this.createdAt,
@@ -140,10 +146,23 @@ class CompanyProfile {
 
   final String name;
   final String businessNumber;
-  final String address;
+  final String street;
+  final String houseNumber;
+  final String? box;
+  final String postalCode;
+  final String city;
   final String adminName;
   final String adminEmail;
   final DateTime createdAt;
+
+  String get formattedAddress {
+    final parts = <String>[
+      '$street $houseNumber'.trim(),
+      if ((box ?? '').trim().isNotEmpty) 'bus ${box!.trim()}',
+      '${postalCode.trim()} ${city.trim()}'.trim(),
+    ];
+    return parts.where((part) => part.isNotEmpty).join(', ');
+  }
 }
 
 class AuthStore {
@@ -151,9 +170,18 @@ class AuthStore {
   static final Map<String, CompanyProfile> companies = {};
 
   static String _companyKey(String name) => name.trim().toLowerCase();
+  static final RegExp _beBusinessNumberDigits = RegExp(r'^\d{9,10}$');
 
   static bool seedIfEmpty() {
     return true;
+  }
+
+  static String _normalizeBusinessNumber(String raw) {
+    final compact = raw.toUpperCase().replaceAll(RegExp(r'[\s.\-]'), '');
+    if (!compact.startsWith('BE')) return '';
+    final digits = compact.substring(2);
+    if (!_beBusinessNumberDigits.hasMatch(digits)) return '';
+    return 'BE$digits';
   }
 
   static AuthUser? authenticate(String email, String password) {
@@ -178,26 +206,39 @@ class AuthStore {
   static String? registerCompany({
     required String companyName,
     required String businessNumber,
-    required String address,
+    required String street,
+    required String houseNumber,
+    String? box,
+    required String postalCode,
+    required String city,
     required String adminName,
     required String adminEmail,
     required String password,
   }) {
     seedIfEmpty();
     final normalizedCompany = companyName.trim();
-    final normalizedBusinessNumber = businessNumber.trim();
-    final normalizedAddress = address.trim();
+    final normalizedBusinessNumber = _normalizeBusinessNumber(businessNumber);
+    final normalizedStreet = street.trim();
+    final normalizedHouseNumber = houseNumber.trim();
+    final normalizedBox = box?.trim() ?? '';
+    final normalizedPostalCode = postalCode.trim();
+    final normalizedCity = city.trim();
     final normalizedAdminName = adminName.trim();
     final normalizedAdminEmail = adminEmail.trim().toLowerCase();
     final key = _companyKey(normalizedCompany);
 
     if (normalizedCompany.isEmpty ||
-        normalizedBusinessNumber.isEmpty ||
-        normalizedAddress.isEmpty ||
+        normalizedStreet.isEmpty ||
+        normalizedHouseNumber.isEmpty ||
+        normalizedPostalCode.isEmpty ||
+        normalizedCity.isEmpty ||
         normalizedAdminName.isEmpty ||
         normalizedAdminEmail.isEmpty ||
         password.isEmpty) {
       return 'Vul alle velden in.';
+    }
+    if (normalizedBusinessNumber.isEmpty) {
+      return 'Bedrijfsnummer moet BE gevolgd door 9 of 10 cijfers zijn.';
     }
     if (!normalizedAdminEmail.contains('@') ||
         normalizedAdminEmail.startsWith('@') ||
@@ -230,7 +271,11 @@ class AuthStore {
     companies[key] = CompanyProfile(
       name: normalizedCompany,
       businessNumber: normalizedBusinessNumber,
-      address: normalizedAddress,
+      street: normalizedStreet,
+      houseNumber: normalizedHouseNumber,
+      box: normalizedBox.isEmpty ? null : normalizedBox,
+      postalCode: normalizedPostalCode,
+      city: normalizedCity,
       adminName: normalizedAdminName,
       adminEmail: normalizedAdminEmail,
       createdAt: DateTime.now(),
@@ -238,8 +283,7 @@ class AuthStore {
 
     _RoleManagementStore.seedIfEmpty();
     final hasRoleAssignment = _RoleManagementStore.assignments.any(
-      (assignment) =>
-          assignment.email.toLowerCase() == normalizedAdminEmail,
+      (assignment) => assignment.email.toLowerCase() == normalizedAdminEmail,
     );
     if (!hasRoleAssignment) {
       _RoleManagementStore.assignments.add(
@@ -257,8 +301,7 @@ class AuthStore {
   static TestAccount toAccount(AuthUser user) {
     _RoleManagementStore.seedIfEmpty();
     final assignment = _RoleManagementStore.assignments.firstWhere(
-      (entry) =>
-          entry.email.toLowerCase() == user.email.toLowerCase(),
+      (entry) => entry.email.toLowerCase() == user.email.toLowerCase(),
       orElse: () => _RoleAssignment(
         name: user.name,
         email: user.email,
@@ -322,20 +365,29 @@ class AuthStore {
     String email, {
     String fallbackName = '',
     String fallbackCompany = '',
+    String fallbackRole = 'Werknemer',
   }) {
     _RoleManagementStore.seedIfEmpty();
     final normalizedEmail = email.trim().toLowerCase();
+    final knownUser = findByEmail(normalizedEmail);
     final assignment = _RoleManagementStore.assignments.firstWhere(
       (entry) => entry.email.trim().toLowerCase() == normalizedEmail,
       orElse: () => _RoleAssignment(
         name: fallbackName.isEmpty ? normalizedEmail : fallbackName,
         email: normalizedEmail,
-        role: 'Werknemer',
+        role: (knownUser?.role ?? fallbackRole).trim().isEmpty
+            ? 'Werknemer'
+            : (knownUser?.role ?? fallbackRole).trim(),
       ),
     );
-    final knownUser = findByEmail(normalizedEmail);
-    final company =
-        fallbackCompany.isNotEmpty ? fallbackCompany : (knownUser?.company ?? 'Finestone');
+    if (knownUser != null &&
+        knownUser.role == 'Beheerder' &&
+        assignment.role != 'Beheerder') {
+      assignment.role = 'Beheerder';
+    }
+    final company = knownUser?.company.trim().isNotEmpty == true
+        ? knownUser!.company
+        : (fallbackCompany.isNotEmpty ? fallbackCompany : 'Finestone');
     upsertUserFromIdentity(
       email: normalizedEmail,
       name: assignment.name,
@@ -352,6 +404,91 @@ class AuthStore {
     );
   }
 
+  static void syncIdentityUser({
+    required String email,
+    required String name,
+    required String role,
+    required String company,
+    String? contractor,
+    String? team,
+    String? businessNumber,
+    String? street,
+    String? houseNumber,
+    String? box,
+    String? postalCode,
+    String? city,
+  }) {
+    seedIfEmpty();
+    final normalizedEmail = email.trim().toLowerCase();
+    final normalizedName = name.trim().isEmpty ? normalizedEmail : name.trim();
+    final normalizedRole = role.trim().isEmpty ? 'Werknemer' : role.trim();
+    final normalizedCompany = company.trim().isEmpty
+        ? 'Finestone'
+        : company.trim();
+
+    upsertUserFromIdentity(
+      email: normalizedEmail,
+      name: normalizedName,
+      company: normalizedCompany,
+      role: normalizedRole,
+      team: team,
+    );
+
+    final assignmentIndex = _RoleManagementStore.assignments.indexWhere(
+      (entry) => entry.email.toLowerCase() == normalizedEmail,
+    );
+    if (assignmentIndex == -1) {
+      _RoleManagementStore.assignments.add(
+        _RoleAssignment(
+          name: normalizedName,
+          email: normalizedEmail,
+          role: normalizedRole,
+          contractor: contractor,
+          team: team,
+        ),
+      );
+    } else {
+      final existing = _RoleManagementStore.assignments[assignmentIndex];
+      existing.name = normalizedName;
+      existing.role = normalizedRole;
+      if ((contractor ?? '').trim().isNotEmpty) {
+        existing.contractor = contractor!.trim();
+      }
+      if ((team ?? '').trim().isNotEmpty) {
+        existing.team = team!.trim();
+      }
+    }
+
+    final isAdmin = normalizedRole == 'Beheerder';
+    final normalizedBusiness = _normalizeBusinessNumber(businessNumber ?? '');
+    final normalizedStreet = (street ?? '').trim();
+    final normalizedHouseNumber = (houseNumber ?? '').trim();
+    final normalizedBox = (box ?? '').trim();
+    final normalizedPostalCode = (postalCode ?? '').trim();
+    final normalizedCity = (city ?? '').trim();
+    if (isAdmin &&
+        normalizedBusiness.isNotEmpty &&
+        normalizedStreet.isNotEmpty &&
+        normalizedHouseNumber.isNotEmpty &&
+        normalizedPostalCode.isNotEmpty &&
+        normalizedCity.isNotEmpty) {
+      final key = _companyKey(normalizedCompany);
+      companies[key] = CompanyProfile(
+        name: normalizedCompany,
+        businessNumber: normalizedBusiness,
+        street: normalizedStreet,
+        houseNumber: normalizedHouseNumber,
+        box: normalizedBox.isEmpty ? null : normalizedBox,
+        postalCode: normalizedPostalCode,
+        city: normalizedCity,
+        adminName: normalizedName,
+        adminEmail: normalizedEmail,
+        createdAt: companies[key]?.createdAt ?? DateTime.now(),
+      );
+    }
+    AppDataStore.scheduleSave();
+  }
+
   static String _hashPassword(String password, String salt) {
     final bytes = utf8.encode('$salt::$password');
     return sha256.convert(bytes).toString();
@@ -363,238 +500,116 @@ class AuthStore {
     return base64UrlEncode(bytes);
   }
 
-  // ignore: unused_element
-  static String _emailFromNameAndCompany(String name, String company) {
-    final local = name
-        .trim()
-        .toLowerCase()
-        .replaceAll(RegExp(r'[^a-z0-9]+'), '.')
-        .replaceAll(RegExp(r'\.+'), '.')
-        .replaceAll(RegExp(r'^\.|\.$'), '');
-    final domain = company
-        .trim()
-        .toLowerCase()
-        .replaceAll(RegExp(r'[^a-z0-9]+'), '')
-        .replaceAll(RegExp(r'^\.|\.$'), '');
-    final safeLocal = local.isEmpty ? 'user' : local;
-    final safeDomain = domain.isEmpty ? 'bedrijf' : domain;
-    return '$safeLocal@$safeDomain.be';
-  }
+  static void purgeIdentityUser(String email) {
+    seedIfEmpty();
+    final normalizedEmail = email.trim().toLowerCase();
+    final removedUsers = users
+        .where((entry) => entry.email.toLowerCase() == normalizedEmail)
+        .toList();
+    if (removedUsers.isEmpty) return;
 
-  // ignore: unused_element
-  static String _ensureUniqueEmail(String email, Set<String> usedEmails) {
-    var candidate = email;
-    var counter = 2;
-    while (usedEmails.contains(candidate)) {
-      final parts = candidate.split('@');
-      final local = parts.first;
-      final domain = parts.length > 1 ? parts[1] : 'bedrijf.be';
-      candidate = '$local$counter@$domain';
-      counter += 1;
+    users.removeWhere((entry) => entry.email.toLowerCase() == normalizedEmail);
+    _RoleManagementStore.assignments.removeWhere(
+      (assignment) => assignment.email.toLowerCase() == normalizedEmail,
+    );
+    for (final removed in removedUsers) {
+      final key = _companyKey(removed.company);
+      final company = companies[key];
+      if (company != null &&
+          company.adminEmail.toLowerCase() == normalizedEmail) {
+        companies.remove(key);
+      }
+      ProfileDocumentStore.documentsByUser.remove(removed.name);
+      LeaveRequestStore.requests.removeWhere(
+        (request) => request.requester == removed.name,
+      );
     }
-    usedEmails.add(candidate);
-    return candidate;
+    if (CurrentUserStore.email.toLowerCase() == normalizedEmail) {
+      CurrentUserStore.role = '';
+      CurrentUserStore.name = '';
+      CurrentUserStore.email = '';
+      CurrentUserStore.company = '';
+      CurrentUserStore.team = '';
+      CurrentUserStore.contractor = '';
+    }
+    AppDataStore.scheduleSave();
   }
 }
 
-class NetlifyIdentityService {
-  static final String _siteUrl = const String.fromEnvironment(
-    'NETLIFY_SITE_URL',
-    defaultValue: '',
-  ).trim();
-  static final String _inviteFunctionPath = const String.fromEnvironment(
-    'NETLIFY_INVITE_FUNCTION_PATH',
-    defaultValue: '/.netlify/functions/send-invite',
-  ).trim();
-  static final String _mailFunctionPath = const String.fromEnvironment(
-    'NETLIFY_MAIL_FUNCTION_PATH',
-    defaultValue: '/.netlify/functions/send-mail',
-  ).trim();
+class LocalSecretsStore {
+  static const FlutterSecureStorage _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(
+      accessibility: KeychainAccessibility.first_unlock_this_device,
+    ),
+  );
+  static const String _hiveKeyName = 'timetable_hive_key_v1';
+  static const String _sessionEmailKey = 'netlify_session_email';
+  static const String _sessionAccessTokenKey = 'netlify_session_access_token';
+  static const String _sessionRefreshTokenKey = 'netlify_session_refresh_token';
+  static const String _sessionExpiresAtKey = 'netlify_session_expires_at_ms';
 
-  static bool get isConfigured => _siteUrl.isNotEmpty;
-
-  static Uri _identityUri(String path) {
-    final normalizedBase = _siteUrl.endsWith('/')
-        ? _siteUrl.substring(0, _siteUrl.length - 1)
-        : _siteUrl;
-    return Uri.parse('$normalizedBase/.netlify/identity$path');
-  }
-
-  static Uri _functionUri(String path) {
-    final normalizedBase = _siteUrl.endsWith('/')
-        ? _siteUrl.substring(0, _siteUrl.length - 1)
-        : _siteUrl;
-    final normalizedPath = path.startsWith('/') ? path : '/$path';
-    return Uri.parse('$normalizedBase$normalizedPath');
-  }
-
-  static Future<String?> signup({
-    required String email,
-    required String password,
-    required String name,
-    required String company,
-    required String businessNumber,
-    required String address,
-  }) async {
-    if (!isConfigured) return null;
-    final response = await http.post(
-      _identityUri('/signup'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'email': email.trim().toLowerCase(),
-        'password': password,
-        'data': {
-          'name': name.trim(),
-          'company': company.trim(),
-          'businessNumber': businessNumber.trim(),
-          'address': address.trim(),
-        },
-      }),
-    );
-    if (response.statusCode >= 200 && response.statusCode < 300) {
-      return null;
+  static Future<List<int>> hiveEncryptionKey() async {
+    final existing = await _storage.read(key: _hiveKeyName);
+    if (existing != null && existing.isNotEmpty) {
+      return base64Decode(existing);
     }
-    return _extractErrorMessage(response.body, 'Registratie mislukt.');
+    final random = Random.secure();
+    final key = List<int>.generate(32, (_) => random.nextInt(256));
+    await _storage.write(key: _hiveKeyName, value: base64Encode(key));
+    return key;
   }
 
-  static Future<Map<String, dynamic>?> login({
-    required String email,
-    required String password,
-  }) async {
-    if (!isConfigured) return null;
-    final response = await http.post(
-      _identityUri('/token'),
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: {
-        'grant_type': 'password',
-        'username': email.trim().toLowerCase(),
-        'password': password,
-      },
+  static Future<void> saveNetlifySession(Map<String, dynamic> session) async {
+    final email = ((session['user'] as Map?)?['email']?.toString() ?? '')
+        .trim()
+        .toLowerCase();
+    final accessToken = (session['access_token']?.toString() ?? '').trim();
+    final refreshToken = (session['refresh_token']?.toString() ?? '').trim();
+    final expiresIn = (session['expires_in'] as num?)?.toInt() ?? 3600;
+    final expiresAt = DateTime.now()
+        .add(Duration(seconds: expiresIn))
+        .millisecondsSinceEpoch
+        .toString();
+    if (email.isEmpty || accessToken.isEmpty) return;
+    await _storage.write(key: _sessionEmailKey, value: email);
+    await _storage.write(key: _sessionAccessTokenKey, value: accessToken);
+    await _storage.write(
+      key: _sessionRefreshTokenKey,
+      value: refreshToken.isEmpty ? null : refreshToken,
     );
-    if (response.statusCode >= 200 && response.statusCode < 300) {
-      final decoded = jsonDecode(response.body);
-      if (decoded is Map<String, dynamic>) return decoded;
-      if (decoded is Map) {
-        return decoded.map((key, value) => MapEntry(key.toString(), value));
+    await _storage.write(key: _sessionExpiresAtKey, value: expiresAt);
+  }
+
+  static Future<bool> canUseOfflineSessionFor(String email) async {
+    final normalized = email.trim().toLowerCase();
+    final storedEmail = (await _storage.read(key: _sessionEmailKey) ?? '')
+        .trim()
+        .toLowerCase();
+    if (storedEmail.isEmpty || storedEmail != normalized) return false;
+    final token = (await _storage.read(key: _sessionAccessTokenKey) ?? '')
+        .trim();
+    if (token.isEmpty) return false;
+    final expiresRaw = await _storage.read(key: _sessionExpiresAtKey);
+    final expiresAt = int.tryParse(expiresRaw ?? '');
+    if (expiresAt == null) return false;
+    return DateTime.now().millisecondsSinceEpoch < expiresAt;
+  }
+
+  static Future<void> clearNetlifySession({String? email}) async {
+    if (email != null) {
+      final normalized = email.trim().toLowerCase();
+      final storedEmail = (await _storage.read(key: _sessionEmailKey) ?? '')
+          .trim()
+          .toLowerCase();
+      if (storedEmail.isNotEmpty && storedEmail != normalized) {
+        return;
       }
-      return <String, dynamic>{};
     }
-    throw Exception(_extractErrorMessage(response.body, 'Inloggen mislukt.'));
-  }
-
-  static Future<String?> sendPasswordReset(String email) async {
-    if (!isConfigured) {
-      return 'NETLIFY_SITE_URL is niet ingesteld.';
-    }
-    final response = await http.post(
-      _identityUri('/recover'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'email': email.trim().toLowerCase()}),
-    );
-    if (response.statusCode >= 200 && response.statusCode < 300) {
-      return null;
-    }
-    return _extractErrorMessage(
-      response.body,
-      'Reset-mail versturen mislukt.',
-    );
-  }
-
-  static Future<String?> inviteUser({
-    required String email,
-    required String name,
-    required String role,
-    required String invitedBy,
-    String? company,
-    String? contractor,
-    String? team,
-  }) async {
-    if (!isConfigured) {
-      return 'NETLIFY_SITE_URL is niet ingesteld.';
-    }
-    final response = await http.post(
-      _functionUri(_inviteFunctionPath),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'email': email.trim().toLowerCase(),
-        'name': name.trim(),
-        'role': role,
-        'invitedBy': invitedBy,
-        'company': (company ?? '').trim(),
-        'contractor': (contractor ?? '').trim(),
-        'team': (team ?? '').trim(),
-      }),
-    );
-    if (response.statusCode >= 200 && response.statusCode < 300) {
-      return null;
-    }
-    return _extractErrorMessage(
-      response.body,
-      'Uitnodiging versturen mislukt.',
-    );
-  }
-
-  static Future<String?> sendWelcomeEmail({
-    required String email,
-    required String name,
-    required String company,
-  }) async {
-    if (!isConfigured) return null;
-    final response = await http.post(
-      _functionUri(_mailFunctionPath),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'type': 'welcome',
-        'email': email.trim().toLowerCase(),
-        'name': name.trim(),
-        'company': company.trim(),
-      }),
-    );
-    if (response.statusCode >= 200 && response.statusCode < 300) return null;
-    return _extractErrorMessage(response.body, 'Welkomstmail versturen mislukt.');
-  }
-
-  static Future<String?> sendInvitationNoticeEmail({
-    required String email,
-    required String name,
-    required String role,
-    required String invitedBy,
-    required String company,
-  }) async {
-    if (!isConfigured) return null;
-    final response = await http.post(
-      _functionUri(_mailFunctionPath),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'type': 'invite_notice',
-        'email': email.trim().toLowerCase(),
-        'name': name.trim(),
-        'role': role,
-        'invitedBy': invitedBy,
-        'company': company.trim(),
-      }),
-    );
-    if (response.statusCode >= 200 && response.statusCode < 300) return null;
-    return _extractErrorMessage(
-      response.body,
-      'Uitnodigingsmail versturen mislukt.',
-    );
-  }
-
-  static String _extractErrorMessage(String raw, String fallback) {
-    try {
-      final decoded = jsonDecode(raw);
-      if (decoded is Map) {
-        final direct = decoded['error_description'] ??
-            decoded['error'] ??
-            decoded['message'];
-        if (direct != null && direct.toString().trim().isNotEmpty) {
-          return direct.toString();
-        }
-      }
-      if (decoded is String && decoded.trim().isNotEmpty) return decoded;
-    } catch (_) {}
-    return fallback;
+    await _storage.delete(key: _sessionEmailKey);
+    await _storage.delete(key: _sessionAccessTokenKey);
+    await _storage.delete(key: _sessionRefreshTokenKey);
+    await _storage.delete(key: _sessionExpiresAtKey);
   }
 }
 
@@ -650,9 +665,7 @@ class JsonFileRepository implements DataRepository {
       final decoded = jsonDecode(raw);
       if (decoded is Map<String, dynamic>) return decoded;
       if (decoded is Map) {
-        return decoded.map(
-          (key, value) => MapEntry(key.toString(), value),
-        );
+        return decoded.map((key, value) => MapEntry(key.toString(), value));
       }
     } catch (_) {
       return null;
@@ -678,26 +691,29 @@ class HiveRepository implements DataRepository {
   final String boxName;
   Box<String>? _box;
 
+  Future<Box<String>> _openEncryptedBox() async {
+    final key = await LocalSecretsStore.hiveEncryptionKey();
+    return Hive.openBox<String>(boxName, encryptionCipher: HiveAesCipher(key));
+  }
+
   @override
   Future<void> init() async {
     if (_box != null) return;
     final dir = await getApplicationDocumentsDirectory();
     Hive.init(dir.path);
-    _box = await Hive.openBox<String>(boxName);
+    _box = await _openEncryptedBox();
   }
 
   @override
   Future<Map<String, dynamic>?> read() async {
-    final box = _box ?? await Hive.openBox<String>(boxName);
+    final box = _box ?? await _openEncryptedBox();
     final raw = box.get('data');
     if (raw == null || raw.trim().isEmpty) return null;
     try {
       final decoded = jsonDecode(raw);
       if (decoded is Map<String, dynamic>) return decoded;
       if (decoded is Map) {
-        return decoded.map(
-          (key, value) => MapEntry(key.toString(), value),
-        );
+        return decoded.map((key, value) => MapEntry(key.toString(), value));
       }
     } catch (_) {
       return null;
@@ -707,7 +723,7 @@ class HiveRepository implements DataRepository {
 
   @override
   Future<void> write(Map<String, dynamic> data) async {
-    final box = _box ?? await Hive.openBox<String>(boxName);
+    final box = _box ?? await _openEncryptedBox();
     await box.put('data', jsonEncode(data));
   }
 }
@@ -715,19 +731,23 @@ class HiveRepository implements DataRepository {
 class AppDataStore {
   static const String _fileName = 'timetable_data.json';
   static bool hasStoredData = false;
-  // Tijdelijke testmodus: wis alle data bij elke app-start.
-  static const bool _wipeOnEveryInitForTesting = true;
+  // Alleen activeren met:
+  // --dart-define=WIPE_ON_INIT_FOR_TESTING=true
+  static const bool _wipeOnEveryInitForTesting = bool.fromEnvironment(
+    'WIPE_ON_INIT_FOR_TESTING',
+    defaultValue: false,
+  );
   static int _dataWipeVersion = 0;
   static const int _targetDataWipeVersion = 2;
   static int _projectResetVersion = 0;
-  // ignore: unused_field
-  static const int _targetProjectResetVersion = 3;
   static Timer? _saveTimer;
   static bool _isSaving = false;
-  static final DataRepository _primaryRepository =
-      HiveRepository('timetable_db');
-  static final DataRepository _fallbackRepository =
-      JsonFileRepository(_fileName);
+  static final DataRepository _primaryRepository = HiveRepository(
+    'timetable_db',
+  );
+  static final DataRepository _fallbackRepository = JsonFileRepository(
+    _fileName,
+  );
 
   static Future<void> init() async {
     await _primaryRepository.init();
@@ -841,12 +861,10 @@ class AppDataStore {
         (name, list) => MapEntry(name, List<String>.from(list)),
       ),
       'beforePhotos': ProjectStore.beforePhotos.map(
-        (name, files) =>
-            MapEntry(name, files.map(_fileToJson).toList()),
+        (name, files) => MapEntry(name, files.map(_fileToJson).toList()),
       ),
       'afterPhotos': ProjectStore.afterPhotos.map(
-        (name, files) =>
-            MapEntry(name, files.map(_fileToJson).toList()),
+        (name, files) => MapEntry(name, files.map(_fileToJson).toList()),
       ),
       'extraWorks': ProjectStore.extraWorks.map(
         (name, entries) =>
@@ -859,25 +877,23 @@ class AppDataStore {
       'backorderNotes': Map<String, String>.from(ProjectStore.backorderNotes),
       'isBackorder': Map<String, bool>.from(ProjectStore.isBackorder),
       'offers': ProjectStore.offers.map(
-        (name, lines) =>
-            MapEntry(name, lines.map(_offerLineToJson).toList()),
+        (name, lines) => MapEntry(name, lines.map(_offerLineToJson).toList()),
       ),
       'documents': ProjectStore.documents.map(
         (name, docs) =>
             MapEntry(name, docs.map(_projectDocumentToJson).toList()),
       ),
-      'completionTeams':
-          Map<String, String>.from(ProjectStore.completionTeams),
+      'completionTeams': Map<String, String>.from(ProjectStore.completionTeams),
       'workLogs': ProjectStore.workLogs.map(
-        (name, entries) =>
-            MapEntry(name, entries.map(_workDayToJson).toList()),
+        (name, entries) => MapEntry(name, entries.map(_workDayToJson).toList()),
       ),
       'projectLogs': ProjectLogStore.logs.map(
         (name, entries) =>
             MapEntry(name, entries.map(_projectLogEntryToJson).toList()),
       ),
-      'offerRequests':
-          OfferRequestStore.requests.map(_offerRequestToJson).toList(),
+      'offerRequests': OfferRequestStore.requests
+          .map(_offerRequestToJson)
+          .toList(),
       'estimatedDayRequests': EstimatedDaysChangeStore.requests
           .map(_estimatedDaysRequestToJson)
           .toList(),
@@ -889,26 +905,28 @@ class AppDataStore {
         (name, docs) =>
             MapEntry(name, docs.map(_profileDocumentToJson).toList()),
       ),
-      'leaveRequests':
-          LeaveRequestStore.requests.map(_leaveRequestToJson).toList(),
-      'holidays':
-          PlanningCalendarStore.holidays.map(_dateToString).toList(),
-      'vacations':
-          PlanningCalendarStore.vacations.map(_dateToString).toList(),
+      'invitationCodes': InvitationCodeStore.entries
+          .map(_invitationCodeToJson)
+          .toList(),
+      'leaveRequests': LeaveRequestStore.requests
+          .map(_leaveRequestToJson)
+          .toList(),
+      'holidays': PlanningCalendarStore.holidays.map(_dateToString).toList(),
+      'vacations': PlanningCalendarStore.vacations.map(_dateToString).toList(),
       'dayOrders': PlanningOrderStore.orderByDay.map(
         (key, value) => MapEntry(key, List<String>.from(value)),
       ),
       'roles': _RoleManagementStore.assignments
           .map(_roleAssignmentToJson)
           .toList(),
-      'teams': _RoleManagementStore.teams
-          .map(_teamAssignmentToJson)
+      'teams': _RoleManagementStore.teams.map(_teamAssignmentToJson).toList(),
+      'offerCatalog': OfferCatalogStore.categories
+          .map(_offerCategoryToJson)
           .toList(),
-      'offerCatalog':
-          OfferCatalogStore.categories.map(_offerCategoryToJson).toList(),
       'authUsers': AuthStore.users.map(_authUserToJson).toList(),
-      'companyProfiles':
-          AuthStore.companies.values.map(_companyProfileToJson).toList(),
+      'companyProfiles': AuthStore.companies.values
+          .map(_companyProfileToJson)
+          .toList(),
       'dataWipeVersion': _dataWipeVersion,
       'projectResetVersion': _projectResetVersion,
     };
@@ -978,6 +996,9 @@ class AppDataStore {
     ProfileDocumentStore.documentsByUser
       ..clear()
       ..addAll(_profileDocumentMap(data['profileDocs']));
+    InvitationCodeStore.entries
+      ..clear()
+      ..addAll(_invitationCodeList(data['invitationCodes']));
     LeaveRequestStore.requests
       ..clear()
       ..addAll(_leaveRequestsList(data['leaveRequests']));
@@ -990,10 +1011,8 @@ class AppDataStore {
     PlanningOrderStore.orderByDay
       ..clear()
       ..addAll(_stringListMap(data['dayOrders']));
-    _RoleManagementStore.assignments =
-        _roleAssignmentsList(data['roles']);
-    _RoleManagementStore.teams =
-        _teamAssignmentsList(data['teams']);
+    _RoleManagementStore.assignments = _roleAssignmentsList(data['roles']);
+    _RoleManagementStore.teams = _teamAssignmentsList(data['teams']);
     final catalog = _offerCatalogList(data['offerCatalog']);
     if (catalog.isNotEmpty) {
       OfferCatalogStore.categories
@@ -1019,6 +1038,7 @@ class AppDataStore {
     _RoleManagementStore.assignments.clear();
     _RoleManagementStore.teams.clear();
     ProfileDocumentStore.documentsByUser.clear();
+    InvitationCodeStore.entries.clear();
     LeaveRequestStore.requests.clear();
     PlanningCalendarStore.holidays.clear();
     PlanningCalendarStore.vacations.clear();
@@ -1040,7 +1060,7 @@ class AppDataStore {
       statusValue.forEach((statusKey, listValue) {
         statuses[statusKey.toString()] =
             (listValue as List?)?.map((e) => e.toString()).toList() ??
-                <String>[];
+            <String>[];
       });
       output[groupKey.toString()] = statuses;
     });
@@ -1056,9 +1076,7 @@ class AppDataStore {
 
   static Map<String, bool> _boolMap(dynamic value) {
     if (value is! Map) return {};
-    return value.map(
-      (key, val) => MapEntry(key.toString(), val == true),
-    );
+    return value.map((key, val) => MapEntry(key.toString(), val == true));
   }
 
   static Map<String, double> _doubleMap(dynamic value) {
@@ -1081,10 +1099,8 @@ class AppDataStore {
   static Map<String, ProjectDetails> _detailsMap(dynamic value) {
     if (value is! Map) return {};
     return value.map(
-      (key, val) => MapEntry(
-        key.toString(),
-        _detailsFromJson(val as Map? ?? {}),
-      ),
+      (key, val) =>
+          MapEntry(key.toString(), _detailsFromJson(val as Map? ?? {})),
     );
   }
 
@@ -1093,9 +1109,7 @@ class AppDataStore {
     return value.map(
       (key, val) => MapEntry(
         key.toString(),
-        (val as List?)
-                ?.map((e) => _fileFromJson(e as Map? ?? {}))
-                .toList() ??
+        (val as List?)?.map((e) => _fileFromJson(e as Map? ?? {})).toList() ??
             <PlatformFile>[],
       ),
     );
@@ -1127,9 +1141,7 @@ class AppDataStore {
     );
   }
 
-  static Map<String, List<ProjectDocument>> _projectDocumentMap(
-    dynamic value,
-  ) {
+  static Map<String, List<ProjectDocument>> _projectDocumentMap(dynamic value) {
     if (value is! Map) return {};
     return value.map(
       (key, val) => MapEntry(
@@ -1170,14 +1182,10 @@ class AppDataStore {
 
   static List<TeamAssignment> _scheduleList(dynamic value) {
     if (value is! List) return <TeamAssignment>[];
-    return value
-        .map((e) => _assignmentFromJson(e as Map? ?? {}))
-        .toList();
+    return value.map((e) => _assignmentFromJson(e as Map? ?? {})).toList();
   }
 
-  static Map<String, List<DocumentEntry>> _profileDocumentMap(
-    dynamic value,
-  ) {
+  static Map<String, List<DocumentEntry>> _profileDocumentMap(dynamic value) {
     if (value is! Map) return {};
     return value.map(
       (key, val) => MapEntry(
@@ -1192,17 +1200,12 @@ class AppDataStore {
 
   static List<LeaveRequest> _leaveRequestsList(dynamic value) {
     if (value is! List) return <LeaveRequest>[];
-    return value
-        .map((e) => _leaveRequestFromJson(e as Map? ?? {}))
-        .toList();
+    return value.map((e) => _leaveRequestFromJson(e as Map? ?? {})).toList();
   }
 
   static LinkedHashSet<DateTime> _dateSet(dynamic value) {
     if (value is! List) {
-      return LinkedHashSet<DateTime>(
-        equals: isSameDay,
-        hashCode: _dayHashCode,
-      );
+      return LinkedHashSet<DateTime>(equals: isSameDay, hashCode: _dayHashCode);
     }
     final set = LinkedHashSet<DateTime>(
       equals: isSameDay,
@@ -1221,23 +1224,17 @@ class AppDataStore {
 
   static List<_RoleAssignment> _roleAssignmentsList(dynamic value) {
     if (value is! List) return <_RoleAssignment>[];
-    return value
-        .map((e) => _roleAssignmentFromJson(e as Map? ?? {}))
-        .toList();
+    return value.map((e) => _roleAssignmentFromJson(e as Map? ?? {})).toList();
   }
 
   static List<_TeamAssignment> _teamAssignmentsList(dynamic value) {
     if (value is! List) return <_TeamAssignment>[];
-    return value
-        .map((e) => _teamAssignmentFromJson(e as Map? ?? {}))
-        .toList();
+    return value.map((e) => _teamAssignmentFromJson(e as Map? ?? {})).toList();
   }
 
   static List<OfferRequest> _offerRequestList(dynamic value) {
     if (value is! List) return <OfferRequest>[];
-    return value
-        .map((e) => _offerRequestFromJson(e as Map? ?? {}))
-        .toList();
+    return value.map((e) => _offerRequestFromJson(e as Map? ?? {})).toList();
   }
 
   static List<EstimatedDaysChangeRequest> _estimatedDaysRequestList(
@@ -1252,25 +1249,19 @@ class AppDataStore {
   static Map<String, InvoiceRecord> _invoiceRecordMap(dynamic value) {
     if (value is! Map) return {};
     return value.map(
-      (key, val) => MapEntry(
-        key.toString(),
-        _invoiceRecordFromJson(val as Map? ?? {}),
-      ),
+      (key, val) =>
+          MapEntry(key.toString(), _invoiceRecordFromJson(val as Map? ?? {})),
     );
   }
 
   static List<OfferCategory> _offerCatalogList(dynamic value) {
     if (value is! List) return <OfferCategory>[];
-    return value
-        .map((e) => _offerCategoryFromJson(e as Map? ?? {}))
-        .toList();
+    return value.map((e) => _offerCategoryFromJson(e as Map? ?? {})).toList();
   }
 
   static List<AuthUser> _authUserList(dynamic value) {
     if (value is! List) return <AuthUser>[];
-    return value
-        .map((e) => _authUserFromJson(e as Map? ?? {}))
-        .toList();
+    return value.map((e) => _authUserFromJson(e as Map? ?? {})).toList();
   }
 
   static Map<String, CompanyProfile> _companyProfileMap(dynamic value) {
@@ -1285,22 +1276,22 @@ class AppDataStore {
   }
 
   static Map<String, dynamic> _detailsToJson(ProjectDetails details) => {
-        'address': details.address,
-        'phone': details.phone,
-        'delivery': details.delivery,
-        'finish': details.finish,
-        'extraNotes': details.extraNotes,
-        'estimatedDays': details.estimatedDays,
-      };
+    'address': details.address,
+    'phone': details.phone,
+    'delivery': details.delivery,
+    'finish': details.finish,
+    'extraNotes': details.extraNotes,
+    'estimatedDays': details.estimatedDays,
+  };
 
   static ProjectDetails _detailsFromJson(Map data) => ProjectDetails(
-        address: data['address']?.toString() ?? '',
-        phone: data['phone']?.toString() ?? '',
-        delivery: data['delivery']?.toString() ?? '',
-        finish: data['finish']?.toString() ?? '',
-        extraNotes: data['extraNotes']?.toString() ?? '',
-        estimatedDays: (data['estimatedDays'] as num?)?.toInt() ?? 1,
-      );
+    address: data['address']?.toString() ?? '',
+    phone: data['phone']?.toString() ?? '',
+    delivery: data['delivery']?.toString() ?? '',
+    finish: data['finish']?.toString() ?? '',
+    extraNotes: data['extraNotes']?.toString() ?? '',
+    estimatedDays: (data['estimatedDays'] as num?)?.toInt() ?? 1,
+  );
 
   static Map<String, dynamic> _fileToJson(PlatformFile file) {
     final rawBytes = file.bytes ?? _readFileBytes(file.path);
@@ -1336,148 +1327,145 @@ class AppDataStore {
   }
 
   static Map<String, dynamic> _offerLineToJson(OfferLine line) => {
-        'category': line.category,
-        'item': line.item,
-        'quantity': line.quantity,
-      };
+    'category': line.category,
+    'item': line.item,
+    'quantity': line.quantity,
+  };
 
   static OfferLine _offerLineFromJson(Map data) => OfferLine(
-        category: data['category']?.toString() ?? '',
-        item: data['item']?.toString() ?? '',
-        quantity: (data['quantity'] as num?)?.toInt() ?? 0,
-      );
+    category: data['category']?.toString() ?? '',
+    item: data['item']?.toString() ?? '',
+    quantity: (data['quantity'] as num?)?.toInt() ?? 0,
+  );
 
   static Map<String, dynamic> _projectDocumentToJson(ProjectDocument doc) => {
-        'description': doc.description,
-        'file': _fileToJson(doc.file),
-      };
+    'description': doc.description,
+    'file': _fileToJson(doc.file),
+  };
 
-  static ProjectDocument _projectDocumentFromJson(Map data) =>
-      ProjectDocument(
-        description: data['description']?.toString() ?? '',
-        file: _fileFromJson(data['file'] as Map? ?? {}),
-      );
+  static ProjectDocument _projectDocumentFromJson(Map data) => ProjectDocument(
+    description: data['description']?.toString() ?? '',
+    file: _fileFromJson(data['file'] as Map? ?? {}),
+  );
 
   static Map<String, dynamic> _profileDocumentToJson(DocumentEntry doc) => {
-        'description': doc.description,
-        'expiry': doc.expiry.toIso8601String(),
-        'file': _fileToJson(doc.file),
-      };
+    'description': doc.description,
+    'expiry': doc.expiry.toIso8601String(),
+    'file': _fileToJson(doc.file),
+  };
 
   static DocumentEntry _profileDocumentFromJson(Map data) => DocumentEntry(
-        description: data['description']?.toString() ?? '',
-        expiry: DateTime.tryParse(data['expiry']?.toString() ?? '') ??
-            DateTime.now(),
-        file: _fileFromJson(data['file'] as Map? ?? {}),
-      );
+    description: data['description']?.toString() ?? '',
+    expiry:
+        DateTime.tryParse(data['expiry']?.toString() ?? '') ?? DateTime.now(),
+    file: _fileFromJson(data['file'] as Map? ?? {}),
+  );
 
   static Map<String, dynamic> _extraWorkToJson(ExtraWorkEntry entry) => {
-        'description': entry.description,
-        'hours': entry.hours,
-        'chargeType': entry.chargeType,
-        'photos': entry.photos.map(_fileToJson).toList(),
-      };
+    'description': entry.description,
+    'hours': entry.hours,
+    'chargeType': entry.chargeType,
+    'photos': entry.photos.map(_fileToJson).toList(),
+  };
 
   static ExtraWorkEntry _extraWorkFromJson(Map data) => ExtraWorkEntry(
-        description: data['description']?.toString() ?? '',
-        hours: (data['hours'] as num?)?.toDouble() ?? 0,
-        chargeType: data['chargeType']?.toString() ?? 'Klant',
-        photos: (data['photos'] as List?)
-                ?.map((e) => _fileFromJson(e as Map? ?? {}))
-                .toList() ??
-            <PlatformFile>[],
-      );
+    description: data['description']?.toString() ?? '',
+    hours: (data['hours'] as num?)?.toDouble() ?? 0,
+    chargeType: data['chargeType']?.toString() ?? 'Klant',
+    photos:
+        (data['photos'] as List?)
+            ?.map((e) => _fileFromJson(e as Map? ?? {}))
+            .toList() ??
+        <PlatformFile>[],
+  );
 
   static Map<String, dynamic> _workDayToJson(WorkDayEntry entry) => {
-        'date': entry.date.toIso8601String(),
-        'startMinutes': entry.startMinutes,
-        'endMinutes': entry.endMinutes,
-        'breakMinutes': entry.breakMinutes,
-        'workers': entry.workers,
-      };
+    'date': entry.date.toIso8601String(),
+    'startMinutes': entry.startMinutes,
+    'endMinutes': entry.endMinutes,
+    'breakMinutes': entry.breakMinutes,
+    'workers': entry.workers,
+  };
 
   static WorkDayEntry _workDayFromJson(Map data) => WorkDayEntry(
-        date: DateTime.tryParse(data['date']?.toString() ?? '') ??
-            DateTime.now(),
-        startMinutes: (data['startMinutes'] as num?)?.toInt() ?? 0,
-        endMinutes: (data['endMinutes'] as num?)?.toInt() ?? 0,
-        breakMinutes: (data['breakMinutes'] as num?)?.toInt() ?? 0,
-        workers: (data['workers'] as List?)
-                ?.map((e) => e.toString())
-                .toList() ??
-            <String>[],
-      );
+    date: DateTime.tryParse(data['date']?.toString() ?? '') ?? DateTime.now(),
+    startMinutes: (data['startMinutes'] as num?)?.toInt() ?? 0,
+    endMinutes: (data['endMinutes'] as num?)?.toInt() ?? 0,
+    breakMinutes: (data['breakMinutes'] as num?)?.toInt() ?? 0,
+    workers:
+        (data['workers'] as List?)?.map((e) => e.toString()).toList() ??
+        <String>[],
+  );
 
   static Map<String, dynamic> _assignmentToJson(TeamAssignment assignment) => {
-        'project': assignment.project,
-        'team': assignment.team,
-        'startDate': assignment.startDate.toIso8601String(),
-        'endDate': assignment.endDate.toIso8601String(),
-        'estimatedDays': assignment.estimatedDays,
-        'isBackorder': assignment.isBackorder,
-        'group': assignment.group,
-      };
+    'project': assignment.project,
+    'team': assignment.team,
+    'startDate': assignment.startDate.toIso8601String(),
+    'endDate': assignment.endDate.toIso8601String(),
+    'estimatedDays': assignment.estimatedDays,
+    'isBackorder': assignment.isBackorder,
+    'group': assignment.group,
+  };
 
   static TeamAssignment _assignmentFromJson(Map data) => TeamAssignment(
-        project: data['project']?.toString() ?? '',
-        team: data['team']?.toString() ?? '',
-        startDate: DateTime.tryParse(data['startDate']?.toString() ?? '') ??
-            DateTime.now(),
-        endDate: DateTime.tryParse(data['endDate']?.toString() ?? '') ??
-            DateTime.now(),
-        estimatedDays: (data['estimatedDays'] as num?)?.toInt() ?? 1,
-        isBackorder: data['isBackorder'] == true,
-        group: data['group']?.toString() ?? 'Klanten',
-      );
+    project: data['project']?.toString() ?? '',
+    team: data['team']?.toString() ?? '',
+    startDate:
+        DateTime.tryParse(data['startDate']?.toString() ?? '') ??
+        DateTime.now(),
+    endDate:
+        DateTime.tryParse(data['endDate']?.toString() ?? '') ?? DateTime.now(),
+    estimatedDays: (data['estimatedDays'] as num?)?.toInt() ?? 1,
+    isBackorder: data['isBackorder'] == true,
+    group: data['group']?.toString() ?? 'Klanten',
+  );
 
   static Map<String, dynamic> _leaveRequestToJson(LeaveRequest request) => {
-        'requester': request.requester,
-        'role': request.role,
-        'from': request.from.toIso8601String(),
-        'to': request.to.toIso8601String(),
-        'reason': request.reason,
-        'status': request.status,
-      };
+    'requester': request.requester,
+    'role': request.role,
+    'from': request.from.toIso8601String(),
+    'to': request.to.toIso8601String(),
+    'reason': request.reason,
+    'status': request.status,
+  };
 
   static LeaveRequest _leaveRequestFromJson(Map data) => LeaveRequest(
-        requester: data['requester']?.toString() ?? '',
-        role: data['role']?.toString() ?? '',
-        from: DateTime.tryParse(data['from']?.toString() ?? '') ??
-            DateTime.now(),
-        to: DateTime.tryParse(data['to']?.toString() ?? '') ??
-            DateTime.now(),
-        reason: data['reason']?.toString() ?? '',
-        status: data['status']?.toString() ?? 'In afwachting',
-      );
+    requester: data['requester']?.toString() ?? '',
+    role: data['role']?.toString() ?? '',
+    from: DateTime.tryParse(data['from']?.toString() ?? '') ?? DateTime.now(),
+    to: DateTime.tryParse(data['to']?.toString() ?? '') ?? DateTime.now(),
+    reason: data['reason']?.toString() ?? '',
+    status: data['status']?.toString() ?? 'In afwachting',
+  );
 
   static Map<String, dynamic> _offerRequestToJson(OfferRequest request) => {
-        'project': request.project,
-        'requester': request.requester,
-        'createdAt': request.createdAt.toIso8601String(),
-        'note': request.note,
-      };
+    'project': request.project,
+    'requester': request.requester,
+    'createdAt': request.createdAt.toIso8601String(),
+    'note': request.note,
+  };
 
   static OfferRequest _offerRequestFromJson(Map data) => OfferRequest(
-        project: data['project']?.toString() ?? '',
-        requester: data['requester']?.toString() ?? '',
-        createdAt: DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
-            DateTime.now(),
-        note: data['note']?.toString() ?? '',
-      );
+    project: data['project']?.toString() ?? '',
+    requester: data['requester']?.toString() ?? '',
+    createdAt:
+        DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
+        DateTime.now(),
+    note: data['note']?.toString() ?? '',
+  );
 
   static Map<String, dynamic> _estimatedDaysRequestToJson(
     EstimatedDaysChangeRequest request,
-  ) =>
-      {
-        'project': request.project,
-        'team': request.team,
-        'oldDays': request.oldDays,
-        'newDays': request.newDays,
-        'requester': request.requester,
-        'requesterRole': request.requesterRole,
-        'createdAt': request.createdAt.toIso8601String(),
-        'status': request.status,
-      };
+  ) => {
+    'project': request.project,
+    'team': request.team,
+    'oldDays': request.oldDays,
+    'newDays': request.newDays,
+    'requester': request.requester,
+    'requesterRole': request.requesterRole,
+    'createdAt': request.createdAt.toIso8601String(),
+    'status': request.status,
+  };
 
   static EstimatedDaysChangeRequest _estimatedDaysRequestFromJson(Map data) =>
       EstimatedDaysChangeRequest(
@@ -1487,141 +1475,194 @@ class AppDataStore {
         newDays: (data['newDays'] as num?)?.toInt() ?? 1,
         requester: data['requester']?.toString() ?? '',
         requesterRole: data['requesterRole']?.toString() ?? '',
-        createdAt: DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
+        createdAt:
+            DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
             DateTime.now(),
         status: data['status']?.toString() ?? 'In afwachting',
       );
 
   static Map<String, dynamic> _invoiceRecordToJson(InvoiceRecord record) => {
-        'offerBilled': record.offerBilled,
-        'extraHoursBilled': record.extraHoursBilled,
-      };
+    'offerBilled': record.offerBilled,
+    'extraHoursBilled': record.extraHoursBilled,
+  };
 
   static InvoiceRecord _invoiceRecordFromJson(Map data) => InvoiceRecord(
-        offerBilled: data['offerBilled'] == true,
-        extraHoursBilled: (data['extraHoursBilled'] as num?)?.toDouble() ?? 0,
-      );
+    offerBilled: data['offerBilled'] == true,
+    extraHoursBilled: (data['extraHoursBilled'] as num?)?.toDouble() ?? 0,
+  );
 
-  static Map<String, dynamic> _projectLogEntryToJson(
-    ProjectLogEntry entry,
-  ) =>
-      {
-        'timestamp': entry.timestamp.toIso8601String(),
-        'user': entry.user,
-        'role': entry.role,
-        'message': entry.message,
-      };
+  static Map<String, dynamic> _projectLogEntryToJson(ProjectLogEntry entry) => {
+    'timestamp': entry.timestamp.toIso8601String(),
+    'user': entry.user,
+    'role': entry.role,
+    'message': entry.message,
+  };
 
   static ProjectLogEntry _projectLogEntryFromJson(Map data) => ProjectLogEntry(
-        timestamp: DateTime.tryParse(data['timestamp']?.toString() ?? '') ??
-            DateTime.now(),
-        user: data['user']?.toString() ?? '',
-        role: data['role']?.toString() ?? '',
-        message: data['message']?.toString() ?? '',
-      );
+    timestamp:
+        DateTime.tryParse(data['timestamp']?.toString() ?? '') ??
+        DateTime.now(),
+    user: data['user']?.toString() ?? '',
+    role: data['role']?.toString() ?? '',
+    message: data['message']?.toString() ?? '',
+  );
 
   static Map<String, dynamic> _offerCategoryToJson(OfferCategory category) => {
-        'name': category.name,
-        'items': category.items.map(_offerItemToJson).toList(),
-      };
+    'name': category.name,
+    'items': category.items.map(_offerItemToJson).toList(),
+  };
 
   static OfferCategory _offerCategoryFromJson(Map data) => OfferCategory(
-        name: data['name']?.toString() ?? '',
-        items: (data['items'] as List?)
-                ?.map((e) => _offerItemFromJson(e as Map? ?? {}))
-                .toList() ??
-            <OfferItem>[],
-      );
+    name: data['name']?.toString() ?? '',
+    items:
+        (data['items'] as List?)
+            ?.map((e) => _offerItemFromJson(e as Map? ?? {}))
+            .toList() ??
+        <OfferItem>[],
+  );
 
   static Map<String, dynamic> _offerItemToJson(OfferItem item) => {
-        'name': item.name,
-        'price': item.price,
-        'unit': item.unit,
-        'hours': item.hours,
-      };
+    'name': item.name,
+    'price': item.price,
+    'unit': item.unit,
+    'hours': item.hours,
+  };
 
   static OfferItem _offerItemFromJson(Map data) => OfferItem(
-        name: data['name']?.toString() ?? '',
-        price: (data['price'] as num?)?.toDouble() ?? 0,
-        unit: data['unit']?.toString() ?? '',
-        hours: (data['hours'] as num?)?.toDouble(),
-      );
+    name: data['name']?.toString() ?? '',
+    price: (data['price'] as num?)?.toDouble() ?? 0,
+    unit: data['unit']?.toString() ?? '',
+    hours: (data['hours'] as num?)?.toDouble(),
+  );
 
   static Map<String, dynamic> _authUserToJson(AuthUser user) => {
-        'name': user.name,
-        'email': user.email,
-        'company': user.company,
-        'passwordHash': user.passwordHash,
-        'passwordSalt': user.passwordSalt,
-        'role': user.role,
-        'team': user.team,
-      };
+    'name': user.name,
+    'email': user.email,
+    'company': user.company,
+    'passwordHash': user.passwordHash,
+    'passwordSalt': user.passwordSalt,
+    'role': user.role,
+    'team': user.team,
+  };
 
   static AuthUser _authUserFromJson(Map data) => AuthUser(
-        name: data['name']?.toString() ?? '',
-        email: data['email']?.toString() ?? '',
-        company: data['company']?.toString() ?? '',
-        passwordHash: data['passwordHash']?.toString() ?? '',
-        passwordSalt: data['passwordSalt']?.toString() ?? '',
-        role: data['role']?.toString() ?? 'Beheerder',
-        team: data['team']?.toString(),
-      );
+    name: data['name']?.toString() ?? '',
+    email: data['email']?.toString() ?? '',
+    company: data['company']?.toString() ?? '',
+    passwordHash: data['passwordHash']?.toString() ?? '',
+    passwordSalt: data['passwordSalt']?.toString() ?? '',
+    role: data['role']?.toString() ?? 'Beheerder',
+    team: data['team']?.toString(),
+  );
 
   static Map<String, dynamic> _companyProfileToJson(CompanyProfile company) => {
-        'name': company.name,
-        'businessNumber': company.businessNumber,
-        'address': company.address,
-        'adminName': company.adminName,
-        'adminEmail': company.adminEmail,
-        'createdAt': company.createdAt.toIso8601String(),
-      };
+    'name': company.name,
+    'businessNumber': company.businessNumber,
+    'street': company.street,
+    'houseNumber': company.houseNumber,
+    'box': company.box,
+    'postalCode': company.postalCode,
+    'city': company.city,
+    'adminName': company.adminName,
+    'adminEmail': company.adminEmail,
+    'createdAt': company.createdAt.toIso8601String(),
+  };
 
-  static CompanyProfile _companyProfileFromJson(Map data) => CompanyProfile(
-        name: data['name']?.toString() ?? '',
-        businessNumber: data['businessNumber']?.toString() ?? '',
-        address: data['address']?.toString() ?? '',
-        adminName: data['adminName']?.toString() ?? '',
-        adminEmail: data['adminEmail']?.toString() ?? '',
-        createdAt: DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
-            DateTime.now(),
-      );
+  static CompanyProfile _companyProfileFromJson(Map data) {
+    final legacyAddress = data['address']?.toString() ?? '';
+    final boxRaw = data['box']?.toString().trim() ?? '';
+    return CompanyProfile(
+      name: data['name']?.toString() ?? '',
+      businessNumber: data['businessNumber']?.toString() ?? '',
+      street: data['street']?.toString() ?? legacyAddress,
+      houseNumber: data['houseNumber']?.toString() ?? '',
+      box: boxRaw.isEmpty ? null : boxRaw,
+      postalCode: data['postalCode']?.toString() ?? '',
+      city: data['city']?.toString() ?? '',
+      adminName: data['adminName']?.toString() ?? '',
+      adminEmail: data['adminEmail']?.toString() ?? '',
+      createdAt:
+          DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
+          DateTime.now(),
+    );
+  }
 
   static String _dateToString(DateTime date) =>
       DateTime(date.year, date.month, date.day).toIso8601String();
 
   static Map<String, dynamic> _roleAssignmentToJson(
     _RoleAssignment assignment,
-  ) =>
-      {
-        'name': assignment.name,
-        'email': assignment.email,
-        'role': assignment.role,
-        'contractor': assignment.contractor,
-        'team': assignment.team,
-      };
+  ) => {
+    'name': assignment.name,
+    'email': assignment.email,
+    'role': assignment.role,
+    'contractor': assignment.contractor,
+    'team': assignment.team,
+  };
 
   static _RoleAssignment _roleAssignmentFromJson(Map data) => _RoleAssignment(
+    name: data['name']?.toString() ?? '',
+    email: data['email']?.toString() ?? '',
+    role: data['role']?.toString() ?? '',
+    contractor: data['contractor']?.toString(),
+    team: data['team']?.toString(),
+  );
+
+  static Map<String, dynamic> _invitationCodeToJson(
+    InvitationCodeEntry entry,
+  ) => {
+    'code': entry.code,
+    'email': entry.email,
+    'name': entry.name,
+    'role': entry.role,
+    'company': entry.company,
+    'invitedBy': entry.invitedBy,
+    'contractor': entry.contractor,
+    'team': entry.team,
+    'used': entry.used,
+    'createdAt': entry.createdAt.toIso8601String(),
+    'expiresAt': entry.expiresAt.toIso8601String(),
+  };
+
+  static List<InvitationCodeEntry> _invitationCodeList(dynamic value) {
+    if (value is! List) return <InvitationCodeEntry>[];
+    return value.map((e) => _invitationCodeFromJson(e as Map? ?? {})).toList();
+  }
+
+  static InvitationCodeEntry _invitationCodeFromJson(Map data) =>
+      InvitationCodeEntry(
+        code: data['code']?.toString() ?? '',
+        email: data['email']?.toString().toLowerCase() ?? '',
         name: data['name']?.toString() ?? '',
-        email: data['email']?.toString() ?? '',
         role: data['role']?.toString() ?? '',
+        company: data['company']?.toString() ?? '',
+        invitedBy: data['invitedBy']?.toString() ?? '',
         contractor: data['contractor']?.toString(),
         team: data['team']?.toString(),
+        used: data['used'] == true,
+        createdAt:
+            DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
+            DateTime.now(),
+        expiresAt:
+            DateTime.tryParse(data['expiresAt']?.toString() ?? '') ??
+            DateTime.now().subtract(const Duration(days: 1)),
       );
 
   static Map<String, dynamic> _teamAssignmentToJson(_TeamAssignment team) => {
-        'name': team.name,
-        'contractor': team.contractor,
-        'workingDays': team.workingDays.toList(),
-      };
+    'name': team.name,
+    'contractor': team.contractor,
+    'workingDays': team.workingDays.toList(),
+  };
 
   static _TeamAssignment _teamAssignmentFromJson(Map data) => _TeamAssignment(
-        name: data['name']?.toString() ?? '',
-        contractor: data['contractor']?.toString() ?? '',
-        workingDays: (data['workingDays'] as List?)
-                ?.map((e) => (e as num).toInt())
-                .toSet() ??
-            _RoleManagementStore._defaultWorkingDays,
-      );
+    name: data['name']?.toString() ?? '',
+    contractor: data['contractor']?.toString() ?? '',
+    workingDays:
+        (data['workingDays'] as List?)
+            ?.map((e) => (e as num).toInt())
+            .toSet() ??
+        _RoleManagementStore._defaultWorkingDays,
+  );
 }
 
 bool _isExternalRole(String role) {
@@ -1684,20 +1725,14 @@ const _statusStages = [
   'Afgewerkt',
 ];
 
-const _editableStatusStages = [
-  'In opmaak',
-  'In bestelling',
-  'Geleverd',
-];
+const _editableStatusStages = ['In opmaak', 'In bestelling', 'Geleverd'];
 
-const _extraWorkChargeTypes = [
-  'Klant',
-  'Interne fout',
-];
+const _extraWorkChargeTypes = ['Klant', 'Interne fout'];
 
 const _roleOptions = [
   'Beheerder',
   'Planner',
+  'Verkoper',
   'Administratie',
   'Boekhouding',
   'Projectleider',
@@ -1710,6 +1745,7 @@ const _roleOptions = [
 const _adminRoles = [
   'Beheerder',
   'Planner',
+  'Verkoper',
   'Administratie',
   'Boekhouding',
   'Projectleider',
@@ -1735,10 +1771,7 @@ class OfferLine {
 }
 
 class ProjectDocument {
-  const ProjectDocument({
-    required this.description,
-    required this.file,
-  });
+  const ProjectDocument({required this.description, required this.file});
 
   final String description;
   final PlatformFile file;
@@ -1775,10 +1808,8 @@ class OfferItem {
 }
 
 class OfferCategory {
-  OfferCategory({
-    required this.name,
-    List<OfferItem>? items,
-  }) : items = items ?? [];
+  OfferCategory({required this.name, List<OfferItem>? items})
+    : items = items ?? [];
 
   String name;
   final List<OfferItem> items;
@@ -1813,12 +1844,7 @@ class OfferCatalogStore {
         OfferCategory(
           name: 'Raam montage',
           items: [
-            OfferItem(
-              name: 'Tot 100 kg',
-              price: 130,
-              unit: 'stuk',
-              hours: 3.5,
-            ),
+            OfferItem(name: 'Tot 100 kg', price: 130, unit: 'stuk', hours: 3.5),
             OfferItem(
               name: '100 tot 150 kg',
               price: 160,
@@ -1842,12 +1868,7 @@ class OfferCatalogStore {
         OfferCategory(
           name: 'Deur montage',
           items: [
-            OfferItem(
-              name: 'Enkele deur',
-              price: 190,
-              unit: 'stuk',
-              hours: 5,
-            ),
+            OfferItem(name: 'Enkele deur', price: 190, unit: 'stuk', hours: 5),
             OfferItem(
               name: 'Dubbele deur',
               price: 275,
@@ -1865,12 +1886,7 @@ class OfferCatalogStore {
         OfferCategory(
           name: 'Schuifraam montage',
           items: [
-            OfferItem(
-              name: 'Tot 200 kg',
-              price: 270,
-              unit: 'stuk',
-              hours: 7.5,
-            ),
+            OfferItem(name: 'Tot 200 kg', price: 270, unit: 'stuk', hours: 7.5),
             OfferItem(
               name: 'Boven 200 kg',
               price: 395,
@@ -1895,7 +1911,8 @@ class OfferCatalogStore {
               hours: 0.5,
             ),
             OfferItem(
-              name: 'Rolluiken, screens, schuifvliegenramen, plissee, vliegendeur, …',
+              name:
+                  'Rolluiken, screens, schuifvliegenramen, plissee, vliegendeur, …',
               price: 50,
               unit: 'stuk',
               hours: 1.5,
@@ -2057,8 +2074,9 @@ class OfferCatalogStore {
   }
 
   static void addItem(String categoryName, OfferItem item) {
-    final category =
-        categories.firstWhere((entry) => entry.name == categoryName);
+    final category = categories.firstWhere(
+      (entry) => entry.name == categoryName,
+    );
     category.items.add(item);
     AppDataStore.scheduleSave();
   }
@@ -2077,8 +2095,6 @@ class OfferCatalogStore {
 }
 
 class ProjectStore {
-  // ignore: unused_field
-  static bool _seeded = false;
   static final Map<String, Map<String, List<String>>> projectsByGroup = {
     'Klanten': {
       'In opmaak': [],
@@ -2114,7 +2130,6 @@ class ProjectStore {
   static final Map<String, List<WorkDayEntry>> workLogs = {};
 
   static void clearAllProjects() {
-    _seeded = false;
     for (final groupEntry in projectsByGroup.values) {
       for (final list in groupEntry.values) {
         list.clear();
@@ -2142,12 +2157,11 @@ class ProjectStore {
   }
 
   static void seedIfEmpty() {
-    _seeded = true;
+    return;
   }
 
-
   static void markSeeded() {
-    _seeded = true;
+    return;
   }
 
   static void addProject({
@@ -2199,8 +2213,9 @@ class ProjectStore {
     workLogs.remove(name);
     ProjectLogStore.logs.remove(name);
     InvoiceStore.records.remove(name);
-    EstimatedDaysChangeStore.requests
-        .removeWhere((request) => request.project == name);
+    EstimatedDaysChangeStore.requests.removeWhere(
+      (request) => request.project == name,
+    );
     ScheduleStore.scheduled.removeWhere(
       (assignment) => assignment.project == name,
     );
@@ -2216,7 +2231,9 @@ class ProjectStore {
     final summary = _truncateText(comment.trim(), 60);
     ProjectLogStore.add(
       projectName,
-      summary.isEmpty ? 'Opmerking toegevoegd' : 'Opmerking toegevoegd: $summary',
+      summary.isEmpty
+          ? 'Opmerking toegevoegd'
+          : 'Opmerking toegevoegd: $summary',
     );
     AppDataStore.scheduleSave();
   }
@@ -2239,7 +2256,9 @@ class ProjectStore {
     final summary = _truncateText(entry.description.trim(), 60);
     ProjectLogStore.add(
       projectName,
-      summary.isEmpty ? 'Extra werk toegevoegd' : 'Extra werk toegevoegd: $summary',
+      summary.isEmpty
+          ? 'Extra werk toegevoegd'
+          : 'Extra werk toegevoegd: $summary',
     );
     AppDataStore.scheduleSave();
   }
@@ -2320,10 +2339,7 @@ class ProjectStore {
       final fromLabel = (previousGroup == null && previousStatus == null)
           ? ''
           : ' van ${previousGroup ?? '-'} · ${previousStatus ?? '-'}';
-      ProjectLogStore.add(
-        name,
-        'Verplaatst$fromLabel naar $group · $status',
-      );
+      ProjectLogStore.add(name, 'Verplaatst$fromLabel naar $group · $status');
     }
     AppDataStore.scheduleSave();
   }
@@ -2348,10 +2364,7 @@ class OfferRequestStore {
 
   static void add(OfferRequest request) {
     requests.insert(0, request);
-    ProjectLogStore.add(
-      request.project,
-      'Offerte aanvraag ingediend',
-    );
+    ProjectLogStore.add(request.project, 'Offerte aanvraag ingediend');
     AppDataStore.scheduleSave();
   }
 
@@ -2389,17 +2402,14 @@ class EstimatedDaysChangeStore {
   static void add(EstimatedDaysChangeRequest request) {
     requests.removeWhere(
       (entry) =>
-          entry.project == request.project &&
-          entry.status == 'In afwachting',
+          entry.project == request.project && entry.status == 'In afwachting',
     );
     requests.insert(0, request);
     AppDataStore.scheduleSave();
   }
 
   static List<EstimatedDaysChangeRequest> pending() {
-    return requests
-        .where((entry) => entry.status == 'In afwachting')
-        .toList();
+    return requests.where((entry) => entry.status == 'In afwachting').toList();
   }
 
   static EstimatedDaysChangeRequest? pendingForProject(String project) {
@@ -2486,7 +2496,6 @@ class ProjectDetails {
   final int estimatedDays;
 }
 
-
 class _ProjectResult {
   const _ProjectResult({
     required this.name,
@@ -2540,10 +2549,7 @@ class _PlanningItem {
 }
 
 class _ExternalProjectItem {
-  _ExternalProjectItem({
-    required this.assignment,
-    required this.details,
-  });
+  _ExternalProjectItem({required this.assignment, required this.details});
 
   final TeamAssignment assignment;
   final ProjectDetails? details;
@@ -2569,132 +2575,6 @@ class TeamAssignment {
   final String group;
 }
 
-// ignore: unused_element
-const _testAccounts = [
-  TestAccount(
-    name: 'Nick',
-    role: 'Beheerder',
-    company: 'Finestone',
-  ),
-  TestAccount(
-    name: 'Julie',
-    role: 'Planner',
-    company: 'Finestone',
-  ),
-  TestAccount(
-    name: 'Thomas',
-    role: 'Projectleider',
-    company: 'Finestone',
-  ),
-  TestAccount(
-    name: 'Igor',
-    role: 'Onderaannemer beheerder',
-    company: 'Finestone',
-    team: 'Team 1',
-  ),
-  TestAccount(
-    name: 'Victor',
-    role: 'Onderaannemer beheerder',
-    company: 'Finestone',
-  ),
-  TestAccount(
-    name: 'Ihor',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 1',
-  ),
-  TestAccount(
-    name: 'Vova',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 1',
-  ),
-  TestAccount(
-    name: 'Kiryl',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 1',
-  ),
-  TestAccount(
-    name: 'Vitaly',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 2',
-  ),
-  TestAccount(
-    name: 'Bohdan',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 2',
-  ),
-  TestAccount(
-    name: 'Vitaly Y',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 2',
-  ),
-  TestAccount(
-    name: 'Pavlo',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 3',
-  ),
-  TestAccount(
-    name: 'Ruslan',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 3',
-  ),
-  TestAccount(
-    name: 'Vadim',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 3',
-  ),
-  TestAccount(
-    name: 'Maksim',
-    role: 'Onderaannemer beheerder',
-    company: 'Finestone',
-    team: 'Team 4',
-  ),
-  TestAccount(
-    name: 'Sergei',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 4',
-  ),
-  TestAccount(
-    name: 'Dmitri',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 4',
-  ),
-  TestAccount(
-    name: 'Oleg',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 4',
-  ),
-  TestAccount(
-    name: 'Anton',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 5',
-  ),
-  TestAccount(
-    name: 'Nikita',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 5',
-  ),
-  TestAccount(
-    name: 'Yuri',
-    role: 'Werknemer',
-    company: 'Finestone',
-    team: 'Team 5',
-  ),
-];
-
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
 
@@ -2706,6 +2586,27 @@ class _LoginScreenState extends State<LoginScreen> {
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   bool _isSubmitting = false;
+
+  bool _isIdentityDeletedError(NetlifyAuthException error) {
+    final message = error.message.toLowerCase();
+    if (error.statusCode == 404) return true;
+    return message.contains('user not found') ||
+        message.contains('no user') ||
+        (message.contains('not found') && message.contains('user'));
+  }
+
+  Future<TestAccount?> _tryOfflineLogin(String email) async {
+    final canUseCached = await LocalSecretsStore.canUseOfflineSessionFor(email);
+    if (!canUseCached) return null;
+    final knownUser = AuthStore.findByEmail(email);
+    if (knownUser == null) return null;
+    return AuthStore.accountForEmail(
+      email,
+      fallbackName: knownUser.name,
+      fallbackCompany: knownUser.company,
+      fallbackRole: knownUser.role,
+    );
+  }
 
   @override
   void dispose() {
@@ -2720,9 +2621,7 @@ class _LoginScreenState extends State<LoginScreen> {
     final password = _passwordController.text;
     if (email.isEmpty || password.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Vul e-mail en wachtwoord in.'),
-        ),
+        const SnackBar(content: Text('Vul e-mail en wachtwoord in.')),
       );
       return;
     }
@@ -2734,23 +2633,112 @@ class _LoginScreenState extends State<LoginScreen> {
           email: email,
           password: password,
         );
+        await LocalSecretsStore.saveNetlifySession(session ?? const {});
         final user = (session?['user'] as Map?) ?? {};
         final metadata = (user['user_metadata'] as Map?) ?? {};
+        final appMetadata = (user['app_metadata'] as Map?) ?? {};
         final identityName =
             metadata['name']?.toString() ?? user['email']?.toString() ?? email;
-        final identityCompany =
-            metadata['company']?.toString() ?? 'Finestone';
+        var identityCompany = metadata['company']?.toString() ?? 'Finestone';
+        final identityBusinessNumber =
+            metadata['businessNumber']?.toString() ??
+            appMetadata['businessNumber']?.toString() ??
+            '';
+        final identityStreet =
+            metadata['street']?.toString() ??
+            appMetadata['street']?.toString() ??
+            '';
+        final identityHouseNumber =
+            metadata['houseNumber']?.toString() ??
+            appMetadata['houseNumber']?.toString() ??
+            '';
+        final identityBox =
+            metadata['box']?.toString() ?? appMetadata['box']?.toString() ?? '';
+        final identityPostalCode =
+            metadata['postalCode']?.toString() ??
+            appMetadata['postalCode']?.toString() ??
+            '';
+        final identityCity =
+            metadata['city']?.toString() ??
+            appMetadata['city']?.toString() ??
+            '';
+        var identityRole =
+            metadata['role']?.toString() ??
+            appMetadata['role']?.toString() ??
+            '';
+        if (identityRole.trim().isEmpty &&
+            identityBusinessNumber.trim().isNotEmpty) {
+          identityRole = 'Beheerder';
+        }
+        final identityTeam =
+            metadata['team']?.toString() ?? appMetadata['team']?.toString();
+        final identityContractor =
+            metadata['contractor']?.toString() ??
+            appMetadata['contractor']?.toString();
+        final normalizedLoginEmail = email.trim().toLowerCase();
+        if (identityRole.trim().isEmpty) {
+          CompanyProfile? adminProfile;
+          for (final company in AuthStore.companies.values) {
+            if (company.adminEmail.toLowerCase() == normalizedLoginEmail) {
+              adminProfile = company;
+              break;
+            }
+          }
+          if (adminProfile != null) {
+            identityRole = 'Beheerder';
+            if (identityCompany.trim().isEmpty ||
+                identityCompany.trim().toLowerCase() == 'finestone') {
+              identityCompany = adminProfile.name;
+            }
+          }
+        }
+        AuthStore.syncIdentityUser(
+          email: email,
+          name: identityName,
+          role: identityRole,
+          company: identityCompany,
+          contractor: identityContractor,
+          team: identityTeam,
+          businessNumber: identityBusinessNumber,
+          street: identityStreet,
+          houseNumber: identityHouseNumber,
+          box: identityBox,
+          postalCode: identityPostalCode,
+          city: identityCity,
+        );
         account = AuthStore.accountForEmail(
           email,
           fallbackName: identityName,
           fallbackCompany: identityCompany,
+          fallbackRole: identityRole.trim().isEmpty
+              ? 'Werknemer'
+              : identityRole.trim(),
         );
       } catch (error) {
+        if (error is NetlifyAuthException) {
+          if (error.isNetworkError) {
+            account = await _tryOfflineLogin(email);
+            if (account != null) {
+              setState(() => _isSubmitting = false);
+              if (!mounted) return;
+              final resolvedAccount = account;
+              Navigator.of(context).pushReplacement(
+                _appPageRoute(
+                  builder: (_) => DashboardScreen(account: resolvedAccount),
+                ),
+              );
+              return;
+            }
+          } else if (_isIdentityDeletedError(error)) {
+            AuthStore.purgeIdentityUser(email);
+            await LocalSecretsStore.clearNetlifySession(email: email);
+          }
+        }
         if (!mounted) return;
         setState(() => _isSubmitting = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(error.toString().replaceFirst('Exception: ', ''))),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
         return;
       }
     } else {
@@ -2762,22 +2750,23 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _isSubmitting = false);
     if (account == null) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Ongeldige logingegevens.')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Ongeldige logingegevens.')));
       return;
     }
     final resolvedAccount = account;
+    TextInput.finishAutofillContext(shouldSave: true);
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
-      _appPageRoute(
-        builder: (_) => DashboardScreen(account: resolvedAccount),
-      ),
+      _appPageRoute(builder: (_) => DashboardScreen(account: resolvedAccount)),
     );
   }
 
   Future<void> _resetPassword() async {
-    final controller = TextEditingController(text: _emailController.text.trim());
+    final controller = TextEditingController(
+      text: _emailController.text.trim(),
+    );
     final email = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
@@ -2803,9 +2792,9 @@ class _LoginScreenState extends State<LoginScreen> {
     final error = await NetlifyIdentityService.sendPasswordReset(email);
     if (!mounted) return;
     if (error != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error)));
       return;
     }
     ScaffoldMessenger.of(context).showSnackBar(
@@ -2833,20 +2822,31 @@ class _LoginScreenState extends State<LoginScreen> {
                 _InputCard(
                   title: 'Inloggen',
                   children: [
-                    _EditableInputField(
-                      label: 'E-mail',
-                      hint: 'E-mailadres',
-                      icon: Icons.mail_outline,
-                      keyboardType: TextInputType.emailAddress,
-                      controller: _emailController,
-                    ),
-                    const SizedBox(height: 12),
-                    _EditableInputField(
-                      label: 'Wachtwoord',
-                      hint: 'Wachtwoord',
-                      icon: Icons.lock_outline,
-                      obscure: true,
-                      controller: _passwordController,
+                    AutofillGroup(
+                      child: Column(
+                        children: [
+                          _EditableInputField(
+                            label: 'E-mail',
+                            hint: 'E-mailadres',
+                            icon: Icons.mail_outline,
+                            keyboardType: TextInputType.emailAddress,
+                            autofillHints: const [
+                              AutofillHints.username,
+                              AutofillHints.email,
+                            ],
+                            controller: _emailController,
+                          ),
+                          const SizedBox(height: 12),
+                          _EditableInputField(
+                            label: 'Wachtwoord',
+                            hint: 'Wachtwoord',
+                            icon: Icons.lock_outline,
+                            obscure: true,
+                            autofillHints: const [AutofillHints.password],
+                            controller: _passwordController,
+                          ),
+                        ],
+                      ),
                     ),
                     const SizedBox(height: 16),
                     _PrimaryButton(
@@ -2876,16 +2876,6 @@ class _LoginScreenState extends State<LoginScreen> {
                         onTap: _resetPassword,
                       ),
                     ),
-                    const SizedBox(height: 10),
-                    Text(
-                      NetlifyIdentityService.isConfigured
-                          ? 'Na registratie ontvang je een bevestigingsmail.'
-                          : 'Registreer een nieuw bedrijf om te starten.',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: const Color(0xFF6A7C78)),
-                    ),
                   ],
                 ),
               ],
@@ -2905,13 +2895,20 @@ class RegisterScreen extends StatefulWidget {
 }
 
 class _RegisterScreenState extends State<RegisterScreen> {
-  final TextEditingController _companyNameController =
-      TextEditingController();
+  int _registerMode = 0; // 0 = bedrijf, 1 = uitnodiging
+  final TextEditingController _companyNameController = TextEditingController();
   final TextEditingController _businessNumberController =
       TextEditingController();
-  final TextEditingController _addressController = TextEditingController();
+  final TextEditingController _streetController = TextEditingController();
+  final TextEditingController _houseNumberController = TextEditingController();
+  final TextEditingController _boxController = TextEditingController();
+  final TextEditingController _postalCodeController = TextEditingController();
+  final TextEditingController _cityController = TextEditingController();
   final TextEditingController _adminNameController = TextEditingController();
   final TextEditingController _adminEmailController = TextEditingController();
+  final TextEditingController _inviteCodeController = TextEditingController();
+  final TextEditingController _inviteNameController = TextEditingController();
+  final TextEditingController _inviteEmailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController =
       TextEditingController();
@@ -2921,9 +2918,16 @@ class _RegisterScreenState extends State<RegisterScreen> {
   void dispose() {
     _companyNameController.dispose();
     _businessNumberController.dispose();
-    _addressController.dispose();
+    _streetController.dispose();
+    _houseNumberController.dispose();
+    _boxController.dispose();
+    _postalCodeController.dispose();
+    _cityController.dispose();
     _adminNameController.dispose();
     _adminEmailController.dispose();
+    _inviteCodeController.dispose();
+    _inviteNameController.dispose();
+    _inviteEmailController.dispose();
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     super.dispose();
@@ -2941,85 +2945,166 @@ class _RegisterScreenState extends State<RegisterScreen> {
     }
     setState(() => _isSubmitting = true);
     String? error;
-    if (NetlifyIdentityService.isConfigured) {
-      error = await NetlifyIdentityService.signup(
-        email: _adminEmailController.text,
-        password: password,
-        name: _adminNameController.text,
-        company: _companyNameController.text,
-        businessNumber: _businessNumberController.text,
-        address: _addressController.text,
-      );
-      if (error != null &&
-          (error.toLowerCase().contains('already') ||
-              error.toLowerCase().contains('exists') ||
-              error.toLowerCase().contains('in use'))) {
-        error = 'E-mailadres is al in gebruik. Gebruik wachtwoord resetten.';
-      }
-      if (error == null) {
-        await NetlifyIdentityService.sendWelcomeEmail(
+    if (_registerMode == 0) {
+      if (NetlifyIdentityService.isConfigured) {
+        error = await NetlifyIdentityService.signup(
           email: _adminEmailController.text,
+          password: password,
           name: _adminNameController.text,
           company: _companyNameController.text,
+          businessNumber: _businessNumberController.text,
+          street: _streetController.text,
+          houseNumber: _houseNumberController.text,
+          box: _boxController.text,
+          postalCode: _postalCodeController.text,
+          city: _cityController.text,
         );
+        if (error != null &&
+            (error.toLowerCase().contains('already') ||
+                error.toLowerCase().contains('exists') ||
+                error.toLowerCase().contains('in use'))) {
+          error = 'E-mailadres is al in gebruik. Gebruik wachtwoord resetten.';
+        }
+      }
+      error ??= AuthStore.registerCompany(
+        companyName: _companyNameController.text,
+        businessNumber: _businessNumberController.text,
+        street: _streetController.text,
+        houseNumber: _houseNumberController.text,
+        box: _boxController.text,
+        postalCode: _postalCodeController.text,
+        city: _cityController.text,
+        adminName: _adminNameController.text,
+        adminEmail: _adminEmailController.text,
+        password: password,
+      );
+    } else {
+      if (_inviteCodeController.text.trim().isEmpty ||
+          _inviteNameController.text.trim().isEmpty ||
+          _inviteEmailController.text.trim().isEmpty) {
+        error = 'Vul alle velden in.';
+      }
+      if (error != null) {
+        if (!mounted) return;
+        setState(() => _isSubmitting = false);
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error)));
+        return;
+      }
+      final inviteEmail = _inviteEmailController.text.trim().toLowerCase();
+      final inviteCode = _inviteCodeController.text.trim().toUpperCase();
+      String resolvedRole = '';
+      String resolvedCompany = '';
+      String? resolvedContractor;
+      String? resolvedTeam;
+      bool shouldConsumeLocal = false;
+      InvitationCodeEntry? localInvite;
+
+      if (NetlifyIdentityService.isConfigured) {
+        try {
+          final validated = await NetlifyIdentityService.validateInvitationCode(
+            email: inviteEmail,
+            code: inviteCode,
+          );
+          final inviteMap = validated?['invite'];
+          if (inviteMap is! Map) {
+            error = 'Ongeldige of verlopen uitnodigingscode.';
+          } else {
+            resolvedRole = inviteMap['role']?.toString().trim() ?? '';
+            resolvedCompany = inviteMap['company']?.toString().trim() ?? '';
+            final contractorValue = inviteMap['contractor']?.toString().trim();
+            final teamValue = inviteMap['team']?.toString().trim();
+            resolvedContractor = contractorValue?.isEmpty == true
+                ? null
+                : contractorValue;
+            resolvedTeam = teamValue?.isEmpty == true ? null : teamValue;
+          }
+        } on NetlifyAuthException catch (e) {
+          error = e.message;
+        } catch (_) {
+          error = 'Code-validatie mislukt.';
+        }
+      } else {
+        localInvite = InvitationCodeStore.validate(
+          email: inviteEmail,
+          code: inviteCode,
+        );
+        if (localInvite == null) {
+          error = 'Ongeldige of verlopen uitnodigingscode.';
+        } else {
+          resolvedRole = localInvite.role;
+          resolvedCompany = localInvite.company;
+          resolvedContractor = localInvite.contractor;
+          resolvedTeam = localInvite.team;
+          shouldConsumeLocal = true;
+        }
+      }
+
+      if (error == null) {
+        if (NetlifyIdentityService.isConfigured) {
+          error = await NetlifyIdentityService.signupWithInvitation(
+            email: inviteEmail,
+            password: password,
+            name: _inviteNameController.text,
+            company: resolvedCompany,
+            role: resolvedRole,
+            contractor: resolvedContractor,
+            team: resolvedTeam,
+            invitationCode: inviteCode,
+          );
+        }
+      }
+
+      if (error == null) {
+        AuthStore.syncIdentityUser(
+          email: inviteEmail,
+          name: _inviteNameController.text,
+          role: resolvedRole,
+          company: resolvedCompany,
+          contractor: resolvedContractor,
+          team: resolvedTeam,
+          businessNumber: '',
+          street: '',
+          houseNumber: '',
+          box: '',
+          postalCode: '',
+          city: '',
+        );
+        if (NetlifyIdentityService.isConfigured) {
+          final consumeError =
+              await NetlifyIdentityService.consumeInvitationCode(
+                email: inviteEmail,
+                code: inviteCode,
+              );
+          if (consumeError != null) {
+            error = consumeError;
+          }
+        } else if (shouldConsumeLocal && localInvite != null) {
+          InvitationCodeStore.markUsed(localInvite);
+        }
       }
     }
-    error ??= AuthStore.registerCompany(
-      companyName: _companyNameController.text,
-      businessNumber: _businessNumberController.text,
-      address: _addressController.text,
-      adminName: _adminNameController.text,
-      adminEmail: _adminEmailController.text,
-      password: password,
-    );
     if (error != null) {
       if (!mounted) return;
       setState(() => _isSubmitting = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error)));
       return;
     }
     setState(() => _isSubmitting = false);
     if (!mounted) return;
     if (NetlifyIdentityService.isConfigured) {
-      try {
-        final session = await NetlifyIdentityService.login(
-          email: _adminEmailController.text.trim(),
-          password: _passwordController.text,
-        );
-        final user = (session?['user'] as Map?) ?? {};
-        final metadata = (user['user_metadata'] as Map?) ?? {};
-        final identityName = metadata['name']?.toString() ??
-            _adminNameController.text.trim();
-        final identityCompany = metadata['company']?.toString() ??
-            _companyNameController.text.trim();
-        final account = AuthStore.accountForEmail(
-          _adminEmailController.text.trim(),
-          fallbackName: identityName,
-          fallbackCompany: identityCompany,
-        );
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Account aangemaakt. Bevestigingsmail is verzonden.'),
+      TextInput.finishAutofillContext(shouldSave: true);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Account aangemaakt. Controleer je e-mail en activeer je account.',
           ),
-        );
-        Navigator.of(context).pushReplacement(
-          _appPageRoute(
-            builder: (_) => DashboardScreen(account: account),
-          ),
-        );
-      } catch (_) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Account aangemaakt. Bevestigingsmail is verzonden.',
-            ),
-          ),
-        );
-        Navigator.of(context).pop();
-      }
+        ),
+      );
+      Navigator.of(context).pop();
       return;
     }
     final user = AuthStore.authenticate(
@@ -3028,10 +3113,9 @@ class _RegisterScreenState extends State<RegisterScreen> {
     );
     if (user == null) return;
     final account = AuthStore.toAccount(user);
+    TextInput.finishAutofillContext(shouldSave: true);
     Navigator.of(context).pushReplacement(
-      _appPageRoute(
-        builder: (_) => DashboardScreen(account: account),
-      ),
+      _appPageRoute(builder: (_) => DashboardScreen(account: account)),
     );
   }
 
@@ -3045,7 +3129,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(20, 24, 20, 32),
               children: [
-                      Row(
+                Row(
                   children: [
                     IconButton(
                       onPressed: () => Navigator.of(context).pop(),
@@ -3059,60 +3143,172 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   ],
                 ),
                 const SizedBox(height: 12),
+                _TabToggle(
+                  labels: const ['Bedrijf', 'Uitnodiging'],
+                  selectedIndex: _registerMode,
+                  onSelect: (index) => setState(() => _registerMode = index),
+                ),
+                const SizedBox(height: 12),
                 _InputCard(
-                  title: 'Bedrijf aanmaken',
+                  title: _registerMode == 0
+                      ? 'Bedrijf aanmaken'
+                      : 'Registreren via uitnodiging',
                   children: [
-                    _EditableInputField(
-                      label: 'Bedrijfsnaam',
-                      hint: 'Bedrijfsnaam',
-                      icon: Icons.business_outlined,
-                      controller: _companyNameController,
-                    ),
-                    const SizedBox(height: 12),
-                    _EditableInputField(
-                      label: 'Bedrijfsnummer',
-                      hint: 'Bedrijfsnummer',
-                      icon: Icons.badge_outlined,
-                      controller: _businessNumberController,
-                    ),
-                    const SizedBox(height: 12),
-                    _EditableInputField(
-                      label: 'Adres bedrijf',
-                      hint: 'Adres bedrijf',
-                      icon: Icons.location_on_outlined,
-                      controller: _addressController,
-                    ),
-                    const SizedBox(height: 12),
-                    _EditableInputField(
-                      label: 'Voornaam & achternaam',
-                      hint: 'Voornaam & achternaam',
-                      icon: Icons.person_outline,
-                      controller: _adminNameController,
-                    ),
-                    const SizedBox(height: 12),
-                    _EditableInputField(
-                      label: 'E-mail',
-                      hint: 'E-mailadres',
-                      icon: Icons.mail_outline,
-                      keyboardType: TextInputType.emailAddress,
-                      controller: _adminEmailController,
-                    ),
-                    const SizedBox(height: 12),
-                    _EditableInputField(
-                      label: 'Wachtwoord',
-                      hint: 'Wachtwoord',
-                      icon: Icons.lock_outline,
-                      obscure: true,
-                      controller: _passwordController,
-                    ),
-                    const SizedBox(height: 12),
-                    _EditableInputField(
-                      label: 'Bevestig wachtwoord',
-                      hint: 'Bevestig wachtwoord',
-                      icon: Icons.lock_outline,
-                      obscure: true,
-                      controller: _confirmPasswordController,
-                    ),
+                    if (_registerMode == 0)
+                      AutofillGroup(
+                        child: Column(
+                          children: [
+                            _EditableInputField(
+                              label: 'Bedrijfsnaam',
+                              hint: 'Bedrijfsnaam',
+                              icon: Icons.business_outlined,
+                              autofillHints: const [
+                                AutofillHints.organizationName,
+                              ],
+                              controller: _companyNameController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Bedrijfsnummer',
+                              hint: 'BE0123456789',
+                              icon: Icons.badge_outlined,
+                              controller: _businessNumberController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Straat',
+                              hint: 'Straat',
+                              icon: Icons.location_on_outlined,
+                              autofillHints: const [
+                                AutofillHints.streetAddressLine1,
+                              ],
+                              controller: _streetController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Huisnummer',
+                              hint: 'Huisnummer',
+                              keyboardType: TextInputType.streetAddress,
+                              icon: Icons.home_outlined,
+                              controller: _houseNumberController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Bus (optioneel)',
+                              hint: 'Bus (optioneel)',
+                              keyboardType: TextInputType.streetAddress,
+                              icon: Icons.apartment_outlined,
+                              controller: _boxController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Postcode',
+                              hint: 'Postcode',
+                              icon: Icons.pin_drop_outlined,
+                              autofillHints: const [AutofillHints.postalCode],
+                              keyboardType: TextInputType.number,
+                              controller: _postalCodeController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Gemeente',
+                              hint: 'Gemeente',
+                              icon: Icons.location_city_outlined,
+                              autofillHints: const [AutofillHints.addressCity],
+                              controller: _cityController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Voornaam & achternaam',
+                              hint: 'Voornaam & achternaam',
+                              icon: Icons.person_outline,
+                              autofillHints: const [AutofillHints.name],
+                              controller: _adminNameController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'E-mail',
+                              hint: 'E-mailadres',
+                              icon: Icons.mail_outline,
+                              keyboardType: TextInputType.emailAddress,
+                              autofillHints: const [
+                                AutofillHints.username,
+                                AutofillHints.email,
+                              ],
+                              controller: _adminEmailController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Wachtwoord',
+                              hint: 'Wachtwoord',
+                              icon: Icons.lock_outline,
+                              obscure: true,
+                              autofillHints: const [AutofillHints.newPassword],
+                              controller: _passwordController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Bevestig wachtwoord',
+                              hint: 'Bevestig wachtwoord',
+                              icon: Icons.lock_outline,
+                              obscure: true,
+                              autofillHints: const [AutofillHints.newPassword],
+                              controller: _confirmPasswordController,
+                            ),
+                          ],
+                        ),
+                      )
+                    else
+                      AutofillGroup(
+                        child: Column(
+                          children: [
+                            _EditableInputField(
+                              label: 'Uitnodigingscode',
+                              hint: 'Code',
+                              icon: Icons.vpn_key_outlined,
+                              controller: _inviteCodeController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Voornaam & achternaam',
+                              hint: 'Voornaam & achternaam',
+                              icon: Icons.person_outline,
+                              autofillHints: const [AutofillHints.name],
+                              controller: _inviteNameController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'E-mail',
+                              hint: 'E-mailadres',
+                              icon: Icons.mail_outline,
+                              keyboardType: TextInputType.emailAddress,
+                              autofillHints: const [
+                                AutofillHints.username,
+                                AutofillHints.email,
+                              ],
+                              controller: _inviteEmailController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Wachtwoord',
+                              hint: 'Wachtwoord',
+                              icon: Icons.lock_outline,
+                              obscure: true,
+                              autofillHints: const [AutofillHints.newPassword],
+                              controller: _passwordController,
+                            ),
+                            const SizedBox(height: 12),
+                            _EditableInputField(
+                              label: 'Bevestig wachtwoord',
+                              hint: 'Bevestig wachtwoord',
+                              icon: Icons.lock_outline,
+                              obscure: true,
+                              autofillHints: const [AutofillHints.newPassword],
+                              controller: _confirmPasswordController,
+                            ),
+                          ],
+                        ),
+                      ),
                   ],
                 ),
                 const SizedBox(height: 16),
@@ -3193,14 +3389,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         onScheduleChanged: () => setState(() {}),
         onCalendarSaved: _recalculateSchedules,
       ),
-      ProjectsTab(
-        account: widget.account,
-        scheduled: _scheduled,
-      ),
-      StatisticsTab(
-        account: widget.account,
-        scheduled: _scheduled,
-      ),
+      ProjectsTab(account: widget.account, scheduled: _scheduled),
+      StatisticsTab(account: widget.account, scheduled: _scheduled),
       ProfileTab(
         account: widget.account,
         assignments: _scheduled,
@@ -3220,7 +3410,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                        Row(
+                      Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           Column(
@@ -3228,9 +3418,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             children: [
                               Text(
                                 'TimeTable',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .headlineLarge,
+                                style: Theme.of(
+                                  context,
+                                ).textTheme.headlineLarge,
                               ),
                             ],
                           ),
@@ -3317,10 +3507,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final team = entry.key;
       final items = [...entry.value]
         ..sort((a, b) => a.startDate.compareTo(b.startDate));
-      final regularItems =
-          items.where((item) => !item.isBackorder).toList();
-      final backorderItems =
-          items.where((item) => item.isBackorder).toList();
+      final regularItems = items.where((item) => !item.isBackorder).toList();
+      final backorderItems = items.where((item) => item.isBackorder).toList();
 
       DateTime? cursor;
       for (final item in regularItems) {
@@ -3399,8 +3587,7 @@ class TodayTab extends StatefulWidget {
   @override
   State<TodayTab> createState() => _TodayTabState();
 
-  DateTime _normalize(DateTime day) =>
-      DateTime(day.year, day.month, day.day);
+  DateTime _normalize(DateTime day) => DateTime(day.year, day.month, day.day);
 
   List<TeamAssignment> _assignmentsForDay(DateTime day) {
     final normalized = _normalize(day);
@@ -3428,8 +3615,9 @@ class TodayTab extends StatefulWidget {
         final remaining = List<TeamAssignment>.from(entry.value);
         final ordered = <TeamAssignment>[];
         for (final name in order) {
-          final index =
-              remaining.indexWhere((assignment) => assignment.project == name);
+          final index = remaining.indexWhere(
+            (assignment) => assignment.project == name,
+          );
           if (index != -1) {
             ordered.add(remaining.removeAt(index));
           }
@@ -3488,9 +3676,7 @@ class TodayTab extends StatefulWidget {
                     if (value == null) return;
                     selected = value;
                   },
-                  decoration: const InputDecoration(
-                    labelText: 'Project',
-                  ),
+                  decoration: const InputDecoration(labelText: 'Project'),
                 )
               else
                 Align(
@@ -3527,9 +3713,7 @@ class TodayTab extends StatefulWidget {
                 );
                 Navigator.of(dialogContext).pop();
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Offerte-aanvraag verstuurd.'),
-                  ),
+                  const SnackBar(content: Text('Offerte-aanvraag verstuurd.')),
                 );
               },
               child: const Text('Verzenden'),
@@ -3563,16 +3747,15 @@ class TodayTab extends StatefulWidget {
                     Text(
                       request.project,
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                            fontWeight: FontWeight.w600,
-                          ),
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                     const SizedBox(height: 6),
                     Text(
                       'Telefoon: $phone',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodySmall
-                          ?.copyWith(color: const Color(0xFF6A7C78)),
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF6A7C78),
+                      ),
                     ),
                     const SizedBox(height: 8),
                     _InlineButton(
@@ -3580,9 +3763,7 @@ class TodayTab extends StatefulWidget {
                       icon: Icons.call_outlined,
                       onTap: () {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text('Bellen naar $phone'),
-                          ),
+                          SnackBar(content: Text('Bellen naar $phone')),
                         );
                       },
                     ),
@@ -3678,17 +3859,22 @@ class TodayTab extends StatefulWidget {
     final isExternal = _isExternalRole(CurrentUserStore.role);
     final isWorker = CurrentUserStore.role == 'Werknemer';
     final isProjectLeader = CurrentUserStore.role == 'Projectleider';
-    final canApproveDays =
-        _canApproveEstimatedDaysChanges(CurrentUserStore.role);
+    final canApproveDays = _canApproveEstimatedDaysChanges(
+      CurrentUserStore.role,
+    );
     final pendingDayRequests = EstimatedDaysChangeStore.pending();
     final teams = isExternal ? _teamsForCurrentUser() : const <String>[];
     final matches = _assignmentsForDay(today);
     final visible = isExternal
-        ? matches.where((assignment) => teams.contains(assignment.team)).toList()
+        ? matches
+              .where((assignment) => teams.contains(assignment.team))
+              .toList()
         : matches;
     final backordersToday = visible
-        .where((assignment) =>
-            assignment.isBackorder || assignment.group == 'Nabestellingen')
+        .where(
+          (assignment) =>
+              assignment.isBackorder || assignment.group == 'Nabestellingen',
+        )
         .length;
     final customersToday = visible.length - backordersToday;
     final grouped = _groupByTeam(today, visible);
@@ -3697,10 +3883,7 @@ class TodayTab extends StatefulWidget {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          _SectionHeader(
-            title: 'Vandaag',
-            subtitle: _formatDate(today),
-          ),
+          _SectionHeader(title: 'Vandaag', subtitle: _formatDate(today)),
           if (isExternal)
             _InlineButton(
               label: 'Offerte',
@@ -3731,16 +3914,15 @@ class TodayTab extends StatefulWidget {
                             padding: const EdgeInsets.only(bottom: 10),
                             child: Text(
                               'Klanten: $customersToday · Nabestellingen: $backordersToday',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
+                              style: Theme.of(context).textTheme.bodySmall
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             ),
                           ),
                         Expanded(
                           child: _TodayProjectFullCard(
                             assignment: visible.first,
-                            details: ProjectStore.details[visible.first.project],
+                            details:
+                                ProjectStore.details[visible.first.project],
                             onUpdated: onUpdated,
                           ),
                         ),
@@ -3777,11 +3959,12 @@ class TodayTab extends StatefulWidget {
                             onTap: () async {
                               await Navigator.of(context).push(
                                 _appPageRoute(
-                                  builder: (_) => EstimatedDaysChangeDetailScreen(
-                                    request: request,
-                                    scheduled: scheduled,
-                                    onUpdated: onUpdated,
-                                  ),
+                                  builder: (_) =>
+                                      EstimatedDaysChangeDetailScreen(
+                                        request: request,
+                                        scheduled: scheduled,
+                                        onUpdated: onUpdated,
+                                      ),
                                 ),
                               );
                               onUpdated();
@@ -3820,8 +4003,7 @@ class TodayTab extends StatefulWidget {
                                               .textTheme
                                               .bodySmall
                                               ?.copyWith(
-                                                color:
-                                                    const Color(0xFF6A7C78),
+                                                color: const Color(0xFF6A7C78),
                                               ),
                                         ),
                                         const SizedBox(height: 4),
@@ -3831,8 +4013,7 @@ class TodayTab extends StatefulWidget {
                                               .textTheme
                                               .bodySmall
                                               ?.copyWith(
-                                                color:
-                                                    const Color(0xFF6A7C78),
+                                                color: const Color(0xFF6A7C78),
                                               ),
                                         ),
                                       ],
@@ -3865,25 +4046,19 @@ class TodayTab extends StatefulWidget {
                           children: [
                             Text(
                               request.project,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(fontWeight: FontWeight.w600),
                             ),
                             const SizedBox(height: 4),
                             Text(
                               'Aangevraagd door ${request.requester}',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
+                              style: Theme.of(context).textTheme.bodySmall
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             ),
                             const SizedBox(height: 4),
                             Text(
                               'Telefoon: ${ProjectStore.details[request.project]?.phone ?? '—'}',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
+                              style: Theme.of(context).textTheme.bodySmall
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             ),
                             if (request.note.isNotEmpty) ...[
@@ -3902,9 +4077,9 @@ class TodayTab extends StatefulWidget {
                                   onTap: () {
                                     final phone =
                                         ProjectStore
-                                                .details[request.project]
-                                                ?.phone ??
-                                            '—';
+                                            .details[request.project]
+                                            ?.phone ??
+                                        '—';
                                     ScaffoldMessenger.of(context).showSnackBar(
                                       SnackBar(
                                         content: Text('Bellen naar $phone'),
@@ -3942,13 +4117,13 @@ class TodayTab extends StatefulWidget {
                       team: entry.key,
                       assignments: entry.value,
                       onOpen: (assignment) async {
-                        final changed =
-                            await Navigator.of(context).push<bool>(
+                        final changed = await Navigator.of(context).push<bool>(
                           _appPageRoute(
                             builder: (_) => ProjectDetailScreen(
                               customerName: assignment.project,
                               group: assignment.group,
-                              status: ProjectStore.findStatusForProject(
+                              status:
+                                  ProjectStore.findStatusForProject(
                                     assignment.project,
                                   ) ??
                                   'Ingepland',
@@ -3970,13 +4145,13 @@ class TodayTab extends StatefulWidget {
                       team: entry.key,
                       assignments: entry.value,
                       onOpen: (assignment) async {
-                        final changed =
-                            await Navigator.of(context).push<bool>(
+                        final changed = await Navigator.of(context).push<bool>(
                           _appPageRoute(
                             builder: (_) => ProjectDetailScreen(
                               customerName: assignment.project,
                               group: assignment.group,
-                              status: ProjectStore.findStatusForProject(
+                              status:
+                                  ProjectStore.findStatusForProject(
                                     assignment.project,
                                   ) ??
                                   'Ingepland',
@@ -4037,8 +4212,7 @@ class _TodayTeamCard extends StatelessWidget {
                 onTap: () => onOpen(assignment),
                 child: Row(
                   children: [
-                    const Icon(Icons.circle,
-                        size: 8, color: Color(0xFF0B2E2B)),
+                    const Icon(Icons.circle, size: 8, color: Color(0xFF0B2E2B)),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Column(
@@ -4046,9 +4220,7 @@ class _TodayTeamCard extends StatelessWidget {
                         children: [
                           Text(
                             assignment.project,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
+                            style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(color: const Color(0xFF5A6F6C)),
                           ),
                           if ((ProjectStore
@@ -4062,12 +4234,8 @@ class _TodayTeamCard extends StatelessWidget {
                                       .details[assignment.project]
                                       ?.address ??
                                   '',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
-                                  ?.copyWith(
-                                    color: const Color(0xFF6A7C78),
-                                  ),
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(color: const Color(0xFF6A7C78)),
                             ),
                         ],
                       ),
@@ -4108,8 +4276,9 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
   DateTime _workDate = DateTime.now();
   int? _workStartMinutes;
   int? _workEndMinutes;
-  final TextEditingController _workBreakController =
-      TextEditingController(text: '30');
+  final TextEditingController _workBreakController = TextEditingController(
+    text: '30',
+  );
   List<String> _selectedWorkers = [];
   int? _editingWorkLogIndex;
   final TextEditingController _extraWorkController = TextEditingController();
@@ -4129,20 +4298,23 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
   void initState() {
     super.initState();
     final name = widget.assignment.project;
-    _beforePhotos =
-        List<PlatformFile>.from(ProjectStore.beforePhotos[name] ?? const []);
-    _afterPhotos =
-        List<PlatformFile>.from(ProjectStore.afterPhotos[name] ?? const []);
-    _extraWorks =
-        List<ExtraWorkEntry>.from(ProjectStore.extraWorks[name] ?? const []);
-    _workLogs =
-        List<WorkDayEntry>.from(ProjectStore.workLogs[name] ?? const []);
+    _beforePhotos = List<PlatformFile>.from(
+      ProjectStore.beforePhotos[name] ?? const [],
+    );
+    _afterPhotos = List<PlatformFile>.from(
+      ProjectStore.afterPhotos[name] ?? const [],
+    );
+    _extraWorks = List<ExtraWorkEntry>.from(
+      ProjectStore.extraWorks[name] ?? const [],
+    );
+    _workLogs = List<WorkDayEntry>.from(
+      ProjectStore.workLogs[name] ?? const [],
+    );
     _isBackorder = ProjectStore.isBackorder[name] ?? false;
     _backorderItems
       ..clear()
       ..addAll(ProjectStore.backorderItems[name] ?? const []);
-    _backorderNoteController.text =
-        ProjectStore.backorderNotes[name] ?? '';
+    _backorderNoteController.text = ProjectStore.backorderNotes[name] ?? '';
   }
 
   @override
@@ -4161,8 +4333,10 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
     _RoleManagementStore.seedIfEmpty();
     final team = widget.assignment.team;
     final workers = _RoleManagementStore.assignments
-        .where((assignment) =>
-            assignment.role == 'Werknemer' && assignment.team == team)
+        .where(
+          (assignment) =>
+              assignment.role == 'Werknemer' && assignment.team == team,
+        )
         .map((assignment) => assignment.name)
         .toList();
     if (workers.isEmpty) {
@@ -4216,8 +4390,7 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       );
       return;
     }
-    final breakMinutes =
-        int.tryParse(_workBreakController.text.trim()) ?? 0;
+    final breakMinutes = int.tryParse(_workBreakController.text.trim()) ?? 0;
     final entry = WorkDayEntry(
       date: DateTime(_workDate.year, _workDate.month, _workDate.day),
       startMinutes: start,
@@ -4303,7 +4476,10 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       _beforePhotos.removeAt(index);
       ProjectStore.beforePhotos[widget.assignment.project] = _beforePhotos;
     });
-    ProjectLogStore.add(widget.assignment.project, 'Foto voor de werf verwijderd');
+    ProjectLogStore.add(
+      widget.assignment.project,
+      'Foto voor de werf verwijderd',
+    );
   }
 
   void _removeAfterPhoto(int index) {
@@ -4312,7 +4488,10 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       _afterPhotos.removeAt(index);
       ProjectStore.afterPhotos[widget.assignment.project] = _afterPhotos;
     });
-    ProjectLogStore.add(widget.assignment.project, 'Foto na de werf verwijderd');
+    ProjectLogStore.add(
+      widget.assignment.project,
+      'Foto na de werf verwijderd',
+    );
   }
 
   Future<void> _pickExtraWorkPhotos() async {
@@ -4488,9 +4667,9 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       'Aanvraag geschatte dagen: $currentDays → $parsed',
     );
     _daysChangeController.clear();
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Aanvraag verstuurd.')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Aanvraag verstuurd.')));
     setState(() {});
   }
 
@@ -4508,581 +4687,532 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       widget.assignment.project,
     );
     final infoContent = Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _InfoTextBlock(
-                title: 'Informatie',
-                lines: [
-                  if (_isBackorder)
-                    const _PlainInfoLine(
-                      label: 'Type',
-                      value: 'Nabestelling',
-                    ),
-                  _PlainInfoLine(
-                    label: 'Klantnaam',
-                    value: widget.assignment.project,
-                  ),
-                  if (details?.phone.trim().isNotEmpty == true)
-                    _PlainInfoLine(
-                      label: 'Telefoonnummer',
-                      value: details!.phone,
-                    ),
-                  if (details?.address.trim().isNotEmpty == true)
-                    _PlainInfoLine(
-                      label: 'Adres',
-                      value: details!.address,
-                    ),
-                  if (details?.delivery.trim().isNotEmpty == true)
-                    _PlainInfoLine(
-                      label: 'Leveradres ramen',
-                      value: details!.delivery,
-                    ),
-                  if (details?.finish.trim().isNotEmpty == true)
-                    _PlainInfoLine(
-                      label: 'Afwerking',
-                      value: details!.finish,
-                    ),
-                  if (details?.extraNotes.trim().isNotEmpty == true)
-                    _PlainInfoLine(
-                      label: 'Extra notes',
-                      value: details!.extraNotes,
-                    ),
-                  if (_isBackorder && backorderHours > 0)
-                    _PlainInfoLine(
-                      label: 'Duur',
-                      value: _formatHours(backorderHours),
-                    ),
-                  if ((ProjectStore.backorderNotes[widget.assignment.project] ??
-                          '')
-                      .trim()
-                      .isNotEmpty)
-                    _PlainInfoLine(
-                      label: 'Beschrijving nabestelling',
-                      value:
-                          ProjectStore.backorderNotes[widget.assignment.project]!
-                              .trim(),
-                    ),
-                  if (details != null)
-                    _PlainInfoLine(
-                      label: 'Geschatte dagen',
-                      value: _formatDays(_isBackorder ? 1 : details.estimatedDays),
-                    ),
-                ],
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _InfoTextBlock(
+          title: 'Informatie',
+          lines: [
+            if (_isBackorder)
+              const _PlainInfoLine(label: 'Type', value: 'Nabestelling'),
+            _PlainInfoLine(
+              label: 'Klantnaam',
+              value: widget.assignment.project,
+            ),
+            if (details?.phone.trim().isNotEmpty == true)
+              _PlainInfoLine(label: 'Telefoonnummer', value: details!.phone),
+            if (details?.address.trim().isNotEmpty == true)
+              _PlainInfoLine(label: 'Adres', value: details!.address),
+            if (details?.delivery.trim().isNotEmpty == true)
+              _PlainInfoLine(
+                label: 'Leveradres ramen',
+                value: details!.delivery,
               ),
-              if (!_isBackorder) ...[
-                const SizedBox(height: 12),
-                if (pendingDaysRequest != null)
-                  _InfoTextBlock(
-                    title: 'Aanvraag geschatte dagen',
-                    lines: [
-                      _PlainInfoLine(
-                        label: 'Aangevraagd',
-                        value:
-                            '${pendingDaysRequest.oldDays} → ${pendingDaysRequest.newDays} dagen',
-                      ),
-                      _PlainInfoLine(
-                        label: 'Status',
-                        value: pendingDaysRequest.status,
-                      ),
-                    ],
-                  )
-                else
-                  _InputCard(
-                    title: 'Geschatte dagen aanpassen',
-                    children: [
-                      _PlainInfoLine(
-                        label: 'Huidig',
-                        value: _formatDays(details?.estimatedDays ?? 1),
-                      ),
-                      const SizedBox(height: 8),
-                      TextField(
-                        controller: _daysChangeController,
-                        keyboardType: TextInputType.number,
-                        decoration: InputDecoration(
-                          hintText: 'Nieuw aantal dagen',
-                          filled: true,
-                          fillColor: const Color(0xFFF4F1EA),
-                          enabledBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide:
-                                const BorderSide(color: Color(0xFFE1DAD0)),
-                          ),
-                          focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide:
-                                const BorderSide(color: Color(0xFF0B2E2B)),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      _PrimaryButton(
-                        label: 'Aanvraag versturen',
-                        onTap: _submitEstimatedDaysChange,
-                      ),
-                    ],
+            if (details?.finish.trim().isNotEmpty == true)
+              _PlainInfoLine(label: 'Afwerking', value: details!.finish),
+            if (details?.extraNotes.trim().isNotEmpty == true)
+              _PlainInfoLine(label: 'Extra notes', value: details!.extraNotes),
+            if (_isBackorder && backorderHours > 0)
+              _PlainInfoLine(
+                label: 'Duur',
+                value: _formatHours(backorderHours),
+              ),
+            if ((ProjectStore.backorderNotes[widget.assignment.project] ?? '')
+                .trim()
+                .isNotEmpty)
+              _PlainInfoLine(
+                label: 'Beschrijving nabestelling',
+                value: ProjectStore.backorderNotes[widget.assignment.project]!
+                    .trim(),
+              ),
+            if (details != null)
+              _PlainInfoLine(
+                label: 'Geschatte dagen',
+                value: _formatDays(_isBackorder ? 1 : details.estimatedDays),
+              ),
+          ],
+        ),
+        if (!_isBackorder) ...[
+          const SizedBox(height: 12),
+          if (pendingDaysRequest != null)
+            _InfoTextBlock(
+              title: 'Aanvraag geschatte dagen',
+              lines: [
+                _PlainInfoLine(
+                  label: 'Aangevraagd',
+                  value:
+                      '${pendingDaysRequest.oldDays} → ${pendingDaysRequest.newDays} dagen',
+                ),
+                _PlainInfoLine(
+                  label: 'Status',
+                  value: pendingDaysRequest.status,
+                ),
+              ],
+            )
+          else
+            _InputCard(
+              title: 'Geschatte dagen aanpassen',
+              children: [
+                _PlainInfoLine(
+                  label: 'Huidig',
+                  value: _formatDays(details?.estimatedDays ?? 1),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _daysChangeController,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                    hintText: 'Nieuw aantal dagen',
+                    filled: true,
+                    fillColor: const Color(0xFFF4F1EA),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
+                    ),
                   ),
-              ],
-              if (ProjectStore.documents[widget.assignment.project]
-                      ?.isNotEmpty ==
-                  true) ...[
-                const SizedBox(height: 12),
-                _ProjectDocumentsCard(
-                  customerName: widget.assignment.project,
+                ),
+                const SizedBox(height: 10),
+                _PrimaryButton(
+                  label: 'Aanvraag versturen',
+                  onTap: _submitEstimatedDaysChange,
                 ),
               ],
-              if (ProjectStore.offers[widget.assignment.project]?.isNotEmpty ==
-                  true) ...[
-                const SizedBox(height: 12),
-                _OfferOverviewCard(
-                  customerName: widget.assignment.project,
-                ),
-              ],
-            ],
-          );
+            ),
+        ],
+        if (ProjectStore.documents[widget.assignment.project]?.isNotEmpty ==
+            true) ...[
+          const SizedBox(height: 12),
+          _ProjectDocumentsCard(customerName: widget.assignment.project),
+        ],
+        if (ProjectStore.offers[widget.assignment.project]?.isNotEmpty ==
+            true) ...[
+          const SizedBox(height: 12),
+          _OfferOverviewCard(customerName: widget.assignment.project),
+        ],
+      ],
+    );
     final followUpContent = Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _ProjectSiteFollowUp(
+          siteTabIndex: _siteTabIndex,
+          onTabChange: (index) => setState(() => _siteTabIndex = index),
+          beforePhotos: _beforePhotos,
+          afterPhotos: _afterPhotos,
+          canEdit: true,
+          onAddBefore: _pickBeforePhotos,
+          onAddAfter: _pickAfterPhotos,
+          onRemoveBefore: _removeBeforePhoto,
+          onRemoveAfter: _removeAfterPhoto,
+        ),
+        if ((ProjectStore.comments[widget.assignment.project]?.isNotEmpty ??
+            false)) ...[
+          const SizedBox(height: 12),
+          _ProjectCommentsSection(
+            comments:
+                ProjectStore.comments[widget.assignment.project] ?? const [],
+            canAdd: false,
+            controller: _commentController,
+            onAdd: () {},
+          ),
+        ],
+        if (isWorker) ...[
+          const SizedBox(height: 12),
+          _InputCard(
+            title: 'Urenregistratie',
             children: [
-              _ProjectSiteFollowUp(
-                siteTabIndex: _siteTabIndex,
-                onTabChange: (index) => setState(() => _siteTabIndex = index),
-                beforePhotos: _beforePhotos,
-                afterPhotos: _afterPhotos,
-                canEdit: true,
-                onAddBefore: _pickBeforePhotos,
-                onAddAfter: _pickAfterPhotos,
-                onRemoveBefore: _removeBeforePhoto,
-                onRemoveAfter: _removeAfterPhoto,
-              ),
-              if ((ProjectStore.comments[widget.assignment.project]
-                          ?.isNotEmpty ??
-                      false)) ...[
-                const SizedBox(height: 12),
-                _ProjectCommentsSection(
-                  comments:
-                      ProjectStore.comments[widget.assignment.project] ??
-                          const [],
-                  canAdd: false,
-                  controller: _commentController,
-                  onAdd: () {},
-                ),
-              ],
-              if (isWorker) ...[
-                const SizedBox(height: 12),
-                _InputCard(
-                  title: 'Urenregistratie',
-                  children: [
-                    if (_workLogs.isEmpty)
-                      Text(
-                        'Nog geen uren geregistreerd.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
-                      )
-                    else
-                      ..._workLogs.asMap().entries.map(
-                        (entry) {
-                          final item = entry.value;
-                          final range =
-                              '${_formatDate(item.date)} · ${_formatMinutes(item.startMinutes)} - ${_formatMinutes(item.endMinutes)}';
-                          final breakText = item.breakMinutes > 0
-                              ? ' · pauze ${item.breakMinutes} min'
-                              : '';
-                          final workersText = item.workers.join(', ');
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 8),
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        '$range$breakText',
-                                        style: Theme.of(context)
-                                            .textTheme
-                                            .bodyMedium
-                                            ?.copyWith(
-                                              fontWeight: FontWeight.w600,
-                                            ),
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        workersText,
-                                        style: Theme.of(context)
-                                            .textTheme
-                                            .bodySmall
-                                            ?.copyWith(
-                                              color: const Color(0xFF6A7C78),
-                                            ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                IconButton(
-                                  icon: const Icon(Icons.edit_outlined),
-                                  onPressed: () => _editWorkLog(entry.key),
-                                ),
-                                IconButton(
-                                  icon: const Icon(Icons.delete_outline),
-                                  onPressed: () => _deleteWorkLog(entry.key),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                    const SizedBox(height: 12),
-                    Row(
+              if (_workLogs.isEmpty)
+                Text(
+                  'Nog geen uren geregistreerd.',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
+                )
+              else
+                ..._workLogs.asMap().entries.map((entry) {
+                  final item = entry.value;
+                  final range =
+                      '${_formatDate(item.date)} · ${_formatMinutes(item.startMinutes)} - ${_formatMinutes(item.endMinutes)}';
+                  final breakText = item.breakMinutes > 0
+                      ? ' · pauze ${item.breakMinutes} min'
+                      : '';
+                  final workersText = item.workers.join(', ');
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Row(
                       children: [
-                        _InlineButton(
-                          label: _formatDate(_workDate),
-                          icon: Icons.calendar_today,
-                          onTap: _pickWorkDate,
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '$range$breakText',
+                                style: Theme.of(context).textTheme.bodyMedium
+                                    ?.copyWith(fontWeight: FontWeight.w600),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                workersText,
+                                style: Theme.of(context).textTheme.bodySmall
+                                    ?.copyWith(color: const Color(0xFF6A7C78)),
+                              ),
+                            ],
+                          ),
                         ),
-                        const SizedBox(width: 8),
-                        _InlineButton(
-                          label: _workStartMinutes == null ||
-                                  _workEndMinutes == null
-                              ? 'Uren instellen'
-                              : '${_formatMinutes(_workStartMinutes!)} - ${_formatMinutes(_workEndMinutes!)}',
-                          icon: Icons.schedule,
-                          onTap: () async {
-                            int? tempStart = _workStartMinutes;
-                            int? tempEnd = _workEndMinutes;
-                            final tempBreakController = TextEditingController(
-                              text: _workBreakController.text,
-                            );
-                            await showDialog<void>(
-                              context: context,
-                              builder: (dialogContext) {
-                                return StatefulBuilder(
-                                  builder: (dialogContext, setDialogState) {
-                                    return AlertDialog(
-                                      title: const Text('Uren instellen'),
-                                      content: Column(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Row(
-                                            children: [
-                                              Expanded(
-                                                child: _InlineButton(
-                                                  label: tempStart == null
-                                                      ? 'Beginuur'
-                                                      : _formatMinutes(
-                                                          tempStart!,
-                                                        ),
-                                                  icon: Icons.schedule,
-                                                  onTap: () async {
-                                                    final picked =
-                                                        await showTimePicker(
-                                                      context: dialogContext,
-                                                      initialTime:
-                                                          TimeOfDay.now(),
-                                                    );
-                                                    if (picked == null) return;
-                                                    setDialogState(() {
-                                                      tempStart =
-                                                          _minutesFromTimeOfDay(
-                                                        picked,
-                                                      );
-                                                    });
-                                                  },
-                                                ),
-                                              ),
-                                              const SizedBox(width: 8),
-                                              Expanded(
-                                                child: _InlineButton(
-                                                  label: tempEnd == null
-                                                      ? 'Einduur'
-                                                      : _formatMinutes(
-                                                          tempEnd!,
-                                                        ),
-                                                  icon: Icons.schedule,
-                                                  onTap: () async {
-                                                    final picked =
-                                                        await showTimePicker(
-                                                      context: dialogContext,
-                                                      initialTime:
-                                                          TimeOfDay.now(),
-                                                    );
-                                                    if (picked == null) return;
-                                                    setDialogState(() {
-                                                      tempEnd =
-                                                          _minutesFromTimeOfDay(
-                                                        picked,
-                                                      );
-                                                    });
-                                                  },
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                          const SizedBox(height: 12),
-                                          TextField(
-                                            controller: tempBreakController,
-                                            keyboardType: TextInputType.number,
-                                            decoration: InputDecoration(
-                                              labelText: 'Pauze (minuten)',
-                                              filled: true,
-                                              fillColor:
-                                                  const Color(0xFFF4F1EA),
-                                              enabledBorder: OutlineInputBorder(
-                                                borderRadius:
-                                                    BorderRadius.circular(14),
-                                                borderSide: const BorderSide(
-                                                  color: Color(0xFFE1DAD0),
-                                                ),
-                                              ),
-                                              focusedBorder: OutlineInputBorder(
-                                                borderRadius:
-                                                    BorderRadius.circular(14),
-                                                borderSide: const BorderSide(
-                                                  color: Color(0xFF0B2E2B),
-                                                ),
-                                              ),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                      actions: [
-                                        TextButton(
-                                          onPressed: () =>
-                                              Navigator.of(dialogContext).pop(),
-                                          child: const Text('Annuleren'),
-                                        ),
-                                        TextButton(
-                                          onPressed: () {
-                                            setState(() {
-                                              _workStartMinutes = tempStart;
-                                              _workEndMinutes = tempEnd;
-                                              _workBreakController.text =
-                                                  tempBreakController.text;
-                                            });
-                                            Navigator.of(dialogContext).pop();
-                                          },
-                                          child: const Text('Opslaan'),
-                                        ),
-                                      ],
-                                    );
-                                  },
-                                );
-                              },
-                            );
-                          },
+                        IconButton(
+                          icon: const Icon(Icons.edit_outlined),
+                          onPressed: () => _editWorkLog(entry.key),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: () => _deleteWorkLog(entry.key),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: _teamWorkers().map((name) {
-                        final selected = _selectedWorkers.contains(name);
-                        return FilterChip(
-                          label: Text(name),
-                          selected: selected,
-                          onSelected: (value) {
-                            setState(() {
-                              if (value) {
-                                _selectedWorkers.add(name);
-                              } else {
-                                _selectedWorkers.remove(name);
-                              }
-                            });
-                          },
-                        );
-                      }).toList(),
-                    ),
-                    const SizedBox(height: 12),
-                    _PrimaryButton(
-                      label: _editingWorkLogIndex == null
-                          ? 'Uren toevoegen'
-                          : 'Uren opslaan',
-                      onTap: _saveWorkLog,
-                    ),
-                  ],
-                ),
-              ],
-              const SizedBox(height: 12),
-              _ExtraWorkSection(
-                canEdit: true,
-                isEditingExtraWork: _editingExtraWorkIndex != null,
-                extraWorks: _extraWorks,
-                extraWorkController: _extraWorkController,
-                extraHoursController: _extraHoursController,
-                extraWorkChargeType: _extraWorkChargeType,
-                onChargeTypeChanged: (value) => setState(() {
-                  _extraWorkChargeType =
-                      value ?? _extraWorkChargeTypes.first;
+                  );
                 }),
-                extraWorkFiles: _extraWorkFiles,
-                onRemoveExtraPhoto: (index) => setState(() {
-                  if (index < 0 || index >= _extraWorkFiles.length) return;
-                  _extraWorkFiles.removeAt(index);
-                }),
-                onEditExtraWork: _editExtraWork,
-                onDeleteExtraWork: _deleteExtraWork,
-                onPickExtraPhotos: _pickExtraWorkPhotos,
-                onAddExtraWork: _addExtraWork,
-                showExtraWorkSection: true,
-              ),
               const SizedBox(height: 12),
-              _InputCard(
-                title: 'Afronding',
+              Row(
                 children: [
-                  _ChoiceToggle(
-                    label: 'Status',
-                    options: const ['Nabestelling', 'Klaar'],
-                    selectedIndex: _isBackorder ? 0 : 1,
-                    onSelect: (index) => setState(() {
-                      _isBackorder = index == 0;
-                    }),
+                  _InlineButton(
+                    label: _formatDate(_workDate),
+                    icon: Icons.calendar_today,
+                    onTap: _pickWorkDate,
                   ),
-                  if (_isBackorder) ...[
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _backorderNoteController,
-                      maxLines: 3,
-                      decoration: InputDecoration(
-                        hintText: 'Beschrijving nabestelling',
-                        filled: true,
-                        fillColor: const Color(0xFFF4F1EA),
-                        enabledBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    _AddItemRow(
-                      controller: _backorderController,
-                      onAdd: _addBackorderItem,
-                    ),
-                    const SizedBox(height: 10),
-                    if (_backorderItems.isEmpty)
-                      Text(
-                        'Nog geen materialen',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
-                      )
-                    else
-                      ..._backorderItems.asMap().entries.map(
-                        (entry) => Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: _EditableBackorderItemRow(
-                            label: entry.value,
-                            onEdit: () => _editBackorderItem(entry.key),
-                            onDelete: () => _deleteBackorderItem(entry.key),
-                          ),
-                        ),
-                      ),
-                  ],
-                  const SizedBox(height: 12),
-                  _PrimaryButton(
-                    label: 'Verzenden',
-                    onTap: () {
-                      if (!_hasBeforeAfterPhotos()) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('Voeg foto’s voor en na de werf toe.'),
-                          ),
-                        );
-                        return;
-                      }
-                      if (_isBackorder && _backorderItems.isEmpty) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('Voeg eerst materialen toe.'),
-                          ),
-                        );
-                        return;
-                      }
-                      ProjectStore.setBackorder(
-                        widget.assignment.project,
-                        backorder: _isBackorder,
-                        items: _isBackorder ? _backorderItems : const [],
+                  const SizedBox(width: 8),
+                  _InlineButton(
+                    label: _workStartMinutes == null || _workEndMinutes == null
+                        ? 'Uren instellen'
+                        : '${_formatMinutes(_workStartMinutes!)} - ${_formatMinutes(_workEndMinutes!)}',
+                    icon: Icons.schedule,
+                    onTap: () async {
+                      int? tempStart = _workStartMinutes;
+                      int? tempEnd = _workEndMinutes;
+                      final tempBreakController = TextEditingController(
+                        text: _workBreakController.text,
                       );
-                      if (_isBackorder) {
-                        final note = _backorderNoteController.text.trim();
-                        final previousNote =
-                            ProjectStore.backorderNotes[widget.assignment.project] ??
-                                '';
-                        if (note.isNotEmpty) {
-                          ProjectStore.backorderNotes[
-                              widget.assignment.project] = note;
-                        } else {
-                          ProjectStore.backorderNotes
-                              .remove(widget.assignment.project);
-                        }
-                        if (note.trim() != previousNote.trim()) {
-                          final summary = _truncateText(note, 80);
-                          if (summary.isNotEmpty) {
-                            ProjectLogStore.add(
-                              widget.assignment.project,
-                              'Beschrijving nabestelling aangepast: $summary',
-                            );
-                          }
-                        }
-                      } else {
-                        ProjectStore.backorderNotes
-                            .remove(widget.assignment.project);
-                      }
-                      ProjectStore.completionTeams[widget.assignment.project] =
-                          widget.assignment.team;
-                      ScheduleStore.scheduled.removeWhere(
-                        (assignment) =>
-                            assignment.project == widget.assignment.project,
+                      await showDialog<void>(
+                        context: context,
+                        builder: (dialogContext) {
+                          return StatefulBuilder(
+                            builder: (dialogContext, setDialogState) {
+                              return AlertDialog(
+                                title: const Text('Uren instellen'),
+                                content: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: _InlineButton(
+                                            label: tempStart == null
+                                                ? 'Beginuur'
+                                                : _formatMinutes(tempStart!),
+                                            icon: Icons.schedule,
+                                            onTap: () async {
+                                              final picked =
+                                                  await showTimePicker(
+                                                    context: dialogContext,
+                                                    initialTime:
+                                                        TimeOfDay.now(),
+                                                  );
+                                              if (picked == null) return;
+                                              setDialogState(() {
+                                                tempStart =
+                                                    _minutesFromTimeOfDay(
+                                                      picked,
+                                                    );
+                                              });
+                                            },
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Expanded(
+                                          child: _InlineButton(
+                                            label: tempEnd == null
+                                                ? 'Einduur'
+                                                : _formatMinutes(tempEnd!),
+                                            icon: Icons.schedule,
+                                            onTap: () async {
+                                              final picked =
+                                                  await showTimePicker(
+                                                    context: dialogContext,
+                                                    initialTime:
+                                                        TimeOfDay.now(),
+                                                  );
+                                              if (picked == null) return;
+                                              setDialogState(() {
+                                                tempEnd = _minutesFromTimeOfDay(
+                                                  picked,
+                                                );
+                                              });
+                                            },
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 12),
+                                    TextField(
+                                      controller: tempBreakController,
+                                      keyboardType: TextInputType.number,
+                                      decoration: InputDecoration(
+                                        labelText: 'Pauze (minuten)',
+                                        filled: true,
+                                        fillColor: const Color(0xFFF4F1EA),
+                                        enabledBorder: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            14,
+                                          ),
+                                          borderSide: const BorderSide(
+                                            color: Color(0xFFE1DAD0),
+                                          ),
+                                        ),
+                                        focusedBorder: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            14,
+                                          ),
+                                          borderSide: const BorderSide(
+                                            color: Color(0xFF0B2E2B),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () =>
+                                        Navigator.of(dialogContext).pop(),
+                                    child: const Text('Annuleren'),
+                                  ),
+                                  TextButton(
+                                    onPressed: () {
+                                      setState(() {
+                                        _workStartMinutes = tempStart;
+                                        _workEndMinutes = tempEnd;
+                                        _workBreakController.text =
+                                            tempBreakController.text;
+                                      });
+                                      Navigator.of(dialogContext).pop();
+                                    },
+                                    child: const Text('Opslaan'),
+                                  ),
+                                ],
+                              );
+                            },
+                          );
+                        },
                       );
-                      if (_isBackorder) {
-                        ProjectStore.moveToGroupStatus(
-                          name: widget.assignment.project,
-                          group: 'Nabestellingen',
-                          status: 'In opmaak',
-                        );
-                        ProjectLogStore.add(
-                          widget.assignment.project,
-                          'Nabestelling verzonden',
-                        );
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('Nabestelling verzonden'),
-                          ),
-                        );
-                      } else {
-                        final targetGroup =
-                            ProjectStore.findGroupForProject(
-                                  widget.assignment.project,
-                                ) ??
-                                widget.assignment.group;
-                        ProjectStore.moveToGroupStatus(
-                          name: widget.assignment.project,
-                          group: targetGroup,
-                          status: 'Afgewerkt',
-                        );
-                        ProjectLogStore.add(
-                          widget.assignment.project,
-                          'Project afgerond',
-                        );
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Project afgerond')),
-                        );
-                      }
-                      setState(() {});
-                      widget.onUpdated?.call();
                     },
                   ),
                 ],
               ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: _teamWorkers().map((name) {
+                  final selected = _selectedWorkers.contains(name);
+                  return FilterChip(
+                    label: Text(name),
+                    selected: selected,
+                    onSelected: (value) {
+                      setState(() {
+                        if (value) {
+                          _selectedWorkers.add(name);
+                        } else {
+                          _selectedWorkers.remove(name);
+                        }
+                      });
+                    },
+                  );
+                }).toList(),
+              ),
+              const SizedBox(height: 12),
+              _PrimaryButton(
+                label: _editingWorkLogIndex == null
+                    ? 'Uren toevoegen'
+                    : 'Uren opslaan',
+                onTap: _saveWorkLog,
+              ),
             ],
-          );
+          ),
+        ],
+        const SizedBox(height: 12),
+        _ExtraWorkSection(
+          canEdit: true,
+          isEditingExtraWork: _editingExtraWorkIndex != null,
+          extraWorks: _extraWorks,
+          extraWorkController: _extraWorkController,
+          extraHoursController: _extraHoursController,
+          extraWorkChargeType: _extraWorkChargeType,
+          onChargeTypeChanged: (value) => setState(() {
+            _extraWorkChargeType = value ?? _extraWorkChargeTypes.first;
+          }),
+          extraWorkFiles: _extraWorkFiles,
+          onRemoveExtraPhoto: (index) => setState(() {
+            if (index < 0 || index >= _extraWorkFiles.length) return;
+            _extraWorkFiles.removeAt(index);
+          }),
+          onEditExtraWork: _editExtraWork,
+          onDeleteExtraWork: _deleteExtraWork,
+          onPickExtraPhotos: _pickExtraWorkPhotos,
+          onAddExtraWork: _addExtraWork,
+          showExtraWorkSection: true,
+        ),
+        const SizedBox(height: 12),
+        _InputCard(
+          title: 'Afronding',
+          children: [
+            _ChoiceToggle(
+              label: 'Status',
+              options: const ['Nabestelling', 'Klaar'],
+              selectedIndex: _isBackorder ? 0 : 1,
+              onSelect: (index) => setState(() {
+                _isBackorder = index == 0;
+              }),
+            ),
+            if (_isBackorder) ...[
+              const SizedBox(height: 12),
+              TextField(
+                controller: _backorderNoteController,
+                maxLines: 3,
+                decoration: InputDecoration(
+                  hintText: 'Beschrijving nabestelling',
+                  filled: true,
+                  fillColor: const Color(0xFFF4F1EA),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              _AddItemRow(
+                controller: _backorderController,
+                onAdd: _addBackorderItem,
+              ),
+              const SizedBox(height: 10),
+              if (_backorderItems.isEmpty)
+                Text(
+                  'Nog geen materialen',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
+                )
+              else
+                ..._backorderItems.asMap().entries.map(
+                  (entry) => Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: _EditableBackorderItemRow(
+                      label: entry.value,
+                      onEdit: () => _editBackorderItem(entry.key),
+                      onDelete: () => _deleteBackorderItem(entry.key),
+                    ),
+                  ),
+                ),
+            ],
+            const SizedBox(height: 12),
+            _PrimaryButton(
+              label: 'Verzenden',
+              onTap: () {
+                if (!_hasBeforeAfterPhotos()) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Voeg foto’s voor en na de werf toe.'),
+                    ),
+                  );
+                  return;
+                }
+                if (_isBackorder && _backorderItems.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Voeg eerst materialen toe.')),
+                  );
+                  return;
+                }
+                ProjectStore.setBackorder(
+                  widget.assignment.project,
+                  backorder: _isBackorder,
+                  items: _isBackorder ? _backorderItems : const [],
+                );
+                if (_isBackorder) {
+                  final note = _backorderNoteController.text.trim();
+                  final previousNote =
+                      ProjectStore.backorderNotes[widget.assignment.project] ??
+                      '';
+                  if (note.isNotEmpty) {
+                    ProjectStore.backorderNotes[widget.assignment.project] =
+                        note;
+                  } else {
+                    ProjectStore.backorderNotes.remove(
+                      widget.assignment.project,
+                    );
+                  }
+                  if (note.trim() != previousNote.trim()) {
+                    final summary = _truncateText(note, 80);
+                    if (summary.isNotEmpty) {
+                      ProjectLogStore.add(
+                        widget.assignment.project,
+                        'Beschrijving nabestelling aangepast: $summary',
+                      );
+                    }
+                  }
+                } else {
+                  ProjectStore.backorderNotes.remove(widget.assignment.project);
+                }
+                ProjectStore.completionTeams[widget.assignment.project] =
+                    widget.assignment.team;
+                ScheduleStore.scheduled.removeWhere(
+                  (assignment) =>
+                      assignment.project == widget.assignment.project,
+                );
+                if (_isBackorder) {
+                  ProjectStore.moveToGroupStatus(
+                    name: widget.assignment.project,
+                    group: 'Nabestellingen',
+                    status: 'In opmaak',
+                  );
+                  ProjectLogStore.add(
+                    widget.assignment.project,
+                    'Nabestelling verzonden',
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Nabestelling verzonden')),
+                  );
+                } else {
+                  final targetGroup =
+                      ProjectStore.findGroupForProject(
+                        widget.assignment.project,
+                      ) ??
+                      widget.assignment.group;
+                  ProjectStore.moveToGroupStatus(
+                    name: widget.assignment.project,
+                    group: targetGroup,
+                    status: 'Afgewerkt',
+                  );
+                  ProjectLogStore.add(
+                    widget.assignment.project,
+                    'Project afgerond',
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Project afgerond')),
+                  );
+                }
+                setState(() {});
+                widget.onUpdated?.call();
+              },
+            ),
+          ],
+        ),
+      ],
+    );
     final tabContent = _tabIndex == 0 ? infoContent : followUpContent;
 
     if (isWorker) {
@@ -5100,10 +5230,7 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
               physics: const ClampingScrollPhysics(),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  tabContent,
-                  const SizedBox(height: 16),
-                ],
+                children: [tabContent, const SizedBox(height: 16)],
               ),
             ),
           ),
@@ -5133,6 +5260,7 @@ class _PlanningTabState extends State<PlanningTab> {
     final teams = _RoleManagementStore.teams.map((team) => team.name).toList();
     return teams.isEmpty ? ['Team 1'] : teams;
   }
+
   String _selectedPlanningGroup = _projectGroups.first;
   final TextEditingController _planningSearchController =
       TextEditingController();
@@ -5150,30 +5278,36 @@ class _PlanningTabState extends State<PlanningTab> {
   }
 
   List<_PlanningItem> get _deliveredNew {
-    final items = ProjectStore.projectsByGroup['Klanten']?['Geleverd'] ??
+    final items =
+        ProjectStore.projectsByGroup['Klanten']?['Geleverd'] ??
         const <String>[];
     return items
-        .map((name) => _PlanningItem(
-              name: name,
-              estimatedDays: ProjectStore.details[name]?.estimatedDays ?? 1,
-              phone: ProjectStore.details[name]?.phone ?? '—',
-              address: ProjectStore.details[name]?.address ?? '—',
-              group: 'Klanten',
-            ))
+        .map(
+          (name) => _PlanningItem(
+            name: name,
+            estimatedDays: ProjectStore.details[name]?.estimatedDays ?? 1,
+            phone: ProjectStore.details[name]?.phone ?? '—',
+            address: ProjectStore.details[name]?.address ?? '—',
+            group: 'Klanten',
+          ),
+        )
         .toList();
   }
 
   List<_PlanningItem> get _deliveredBackorder {
-    final items = ProjectStore.projectsByGroup['Nabestellingen']?['Geleverd'] ??
+    final items =
+        ProjectStore.projectsByGroup['Nabestellingen']?['Geleverd'] ??
         const <String>[];
     return items
-        .map((name) => _PlanningItem(
-              name: name,
-              estimatedDays: 1,
-              phone: ProjectStore.details[name]?.phone ?? '—',
-              address: ProjectStore.details[name]?.address ?? '—',
-              group: 'Nabestellingen',
-            ))
+        .map(
+          (name) => _PlanningItem(
+            name: name,
+            estimatedDays: 1,
+            phone: ProjectStore.details[name]?.phone ?? '—',
+            address: ProjectStore.details[name]?.address ?? '—',
+            group: 'Nabestellingen',
+          ),
+        )
         .toList();
   }
 
@@ -5216,11 +5350,7 @@ class _PlanningTabState extends State<PlanningTab> {
     return count;
   }
 
-  bool _canScheduleOnDay(
-    String team,
-    DateTime day,
-    bool isBackorder,
-  ) {
+  bool _canScheduleOnDay(String team, DateTime day, bool isBackorder) {
     final projects = _countProjectsOnDay(team, day);
     final backorders = _countBackordersOnDay(team, day);
     if (isBackorder) {
@@ -5284,11 +5414,7 @@ class _PlanningTabState extends State<PlanningTab> {
     return true;
   }
 
-  List<DateTime> _availableStartDates(
-    String team,
-    int days,
-    bool isBackorder,
-  ) {
+  List<DateTime> _availableStartDates(String team, int days, bool isBackorder) {
     final starts = <DateTime>[];
     final today = _normalizeDate(DateTime.now());
     for (int i = 0; i < 720; i++) {
@@ -5318,8 +5444,9 @@ class _PlanningTabState extends State<PlanningTab> {
         ),
       );
     }
-    filtered.sort((a, b) =>
-        a.assignment.startDate.compareTo(b.assignment.startDate));
+    filtered.sort(
+      (a, b) => a.assignment.startDate.compareTo(b.assignment.startDate),
+    );
     return filtered;
   }
 
@@ -5341,19 +5468,26 @@ class _PlanningTabState extends State<PlanningTab> {
     if (endDate == null) {
       return;
     }
-    if (!_canScheduleRange(team, startDate, endDate, item.group == 'Nabestellingen')) {
+    if (!_canScheduleRange(
+      team,
+      startDate,
+      endDate,
+      item.group == 'Nabestellingen',
+    )) {
       return;
     }
     setState(() {
-      widget.scheduled.add(TeamAssignment(
-        project: item.name,
-        team: team,
-        startDate: startDate,
-        endDate: endDate,
-        estimatedDays: plannedDays,
-        isBackorder: item.group == 'Nabestellingen',
-        group: item.group,
-      ));
+      widget.scheduled.add(
+        TeamAssignment(
+          project: item.name,
+          team: team,
+          startDate: startDate,
+          endDate: endDate,
+          estimatedDays: plannedDays,
+          isBackorder: item.group == 'Nabestellingen',
+          group: item.group,
+        ),
+      );
       // Lists are derived from ProjectStore now.
     });
     if (item.group == 'Nabestellingen') {
@@ -5364,10 +5498,9 @@ class _PlanningTabState extends State<PlanningTab> {
         ProjectStore.backorderHours.remove(item.name);
       }
     }
-    final rangeLabel =
-        '${_formatDate(startDate)} - ${_formatDate(endDate)}';
-    final hoursLabel = item.group == 'Nabestellingen' &&
-            (backorderHours ?? 0) > 0
+    final rangeLabel = '${_formatDate(startDate)} - ${_formatDate(endDate)}';
+    final hoursLabel =
+        item.group == 'Nabestellingen' && (backorderHours ?? 0) > 0
         ? ' · ${_formatHours(backorderHours!)}'
         : '';
     ProjectLogStore.add(
@@ -5398,8 +5531,12 @@ class _PlanningTabState extends State<PlanningTab> {
   void _rescheduleAssignment(TeamAssignment assignment, DateTime newStart) {
     final isBackorder = assignment.group == 'Nabestellingen';
     final days = isBackorder ? 1 : assignment.estimatedDays;
-    final endDate =
-        _calculateEndDate(assignment.team, newStart, days, isBackorder);
+    final endDate = _calculateEndDate(
+      assignment.team,
+      newStart,
+      days,
+      isBackorder,
+    );
     if (endDate == null) return;
     if (!_canScheduleRange(assignment.team, newStart, endDate, isBackorder)) {
       return;
@@ -5451,10 +5588,7 @@ class _PlanningTabState extends State<PlanningTab> {
       widget.scheduled.remove(assignment);
       // Lists are derived from ProjectStore now.
     });
-    ProjectLogStore.add(
-      assignment.project,
-      'Planning geannuleerd',
-    );
+    ProjectLogStore.add(assignment.project, 'Planning geannuleerd');
     ProjectStore.updateStatus(
       name: assignment.project,
       group: assignment.group,
@@ -5472,14 +5606,15 @@ class _PlanningTabState extends State<PlanningTab> {
     final visibleTeams = isProjectLeader ? _teams : _teamsForCurrentUser();
     final visibleScheduled = (isExternal && !isProjectLeader)
         ? widget.scheduled
-            .where((assignment) => visibleTeams.contains(assignment.team))
-            .toList()
+              .where((assignment) => visibleTeams.contains(assignment.team))
+              .toList()
         : widget.scheduled;
     final overviewAssignments = isProjectLeader
         ? widget.scheduled
         : (isExternal ? visibleScheduled : widget.scheduled);
-    final filteredDeliveredNew =
-        _deliveredNew.where((item) => _matchesPlanningSearch(item.name)).toList();
+    final filteredDeliveredNew = _deliveredNew
+        .where((item) => _matchesPlanningSearch(item.name))
+        .toList();
     final filteredDeliveredBackorder = _deliveredBackorder
         .where((item) => _matchesPlanningSearch(item.name))
         .toList();
@@ -5503,16 +5638,13 @@ class _PlanningTabState extends State<PlanningTab> {
                 children: [
                   const Align(
                     alignment: Alignment.centerLeft,
-                    child: _SectionHeader(
-                      title: 'Planning',
-                      subtitle: '',
-                    ),
+                    child: _SectionHeader(title: 'Planning', subtitle: ''),
                   ),
                   if (!onlyScheduledView)
                     Row(
                       children: [
                         _InlineButton(
-                        label: 'Verlof',
+                          label: 'Verlof',
                           onTap: () => Navigator.of(context).push(
                             _appPageRoute(
                               builder: (_) => HolidayCalendarScreen(
@@ -5533,7 +5665,7 @@ class _PlanningTabState extends State<PlanningTab> {
                                 onCancel: _cancelAssignment,
                                 canEditPlanning:
                                     CurrentUserStore.role == 'Planner' ||
-                                        CurrentUserStore.role == 'Beheerder',
+                                    CurrentUserStore.role == 'Beheerder',
                                 onReschedule: _rescheduleAssignment,
                                 availableStarts: _availableStartDates,
                                 calculateEndDate: _calculateEndDate,
@@ -5549,26 +5681,26 @@ class _PlanningTabState extends State<PlanningTab> {
                 const SizedBox(height: 12),
                 if (!onlyScheduledView) ...[
                   _GroupToggle(
-                  groups: _projectGroups,
-                  selected: _selectedPlanningGroup,
-                  onSelect: (group) => setState(() {
-                    _selectedPlanningGroup = group;
-                  }),
-                  labelBuilder: !isExternal
-                      ? (group) {
-                          final count = group == 'Klanten'
-                              ? _deliveredNew.length
-                              : _deliveredBackorder.length;
-                          return '$group ($count)';
-                        }
-                      : null,
-                ),
-                const SizedBox(height: 12),
-                _SearchField(
-                  controller: _planningSearchController,
-                  hintText: 'Zoek klant',
-                  onChanged: (_) => setState(() {}),
-                ),
+                    groups: _projectGroups,
+                    selected: _selectedPlanningGroup,
+                    onSelect: (group) => setState(() {
+                      _selectedPlanningGroup = group;
+                    }),
+                    labelBuilder: !isExternal
+                        ? (group) {
+                            final count = group == 'Klanten'
+                                ? _deliveredNew.length
+                                : _deliveredBackorder.length;
+                            return '$group ($count)';
+                          }
+                        : null,
+                  ),
+                  const SizedBox(height: 12),
+                  _SearchField(
+                    controller: _planningSearchController,
+                    hintText: 'Zoek klant',
+                    onChanged: (_) => setState(() {}),
+                  ),
                 ],
               ],
             ],
@@ -5599,7 +5731,8 @@ class _PlanningTabState extends State<PlanningTab> {
                               builder: (_) => ProjectDetailScreen(
                                 customerName: assignment.project,
                                 group: assignment.group,
-                                status: ProjectStore.findStatusForProject(
+                                status:
+                                    ProjectStore.findStatusForProject(
                                       assignment.project,
                                     ) ??
                                     'Ingepland',
@@ -5613,8 +5746,7 @@ class _PlanningTabState extends State<PlanningTab> {
                         availableStarts: _availableStartDates,
                         calculateEndDate: _calculateEndDate,
                         showHeader: CurrentUserStore.role != 'Werknemer',
-                        initiallyExpanded:
-                            CurrentUserStore.role == 'Werknemer',
+                        initiallyExpanded: CurrentUserStore.role == 'Werknemer',
                       ),
                     ),
                   ),
@@ -5622,45 +5754,45 @@ class _PlanningTabState extends State<PlanningTab> {
                 const SizedBox(height: 12),
                 if (!isExternal && !isProjectLeader) ...[
                   if (_selectedPlanningGroup == 'Klanten') ...[
-                      ...filteredDeliveredNew.map(
-                            (item) => Padding(
-                              padding: const EdgeInsets.only(bottom: 10),
-                              child: _PlanningAssignCard(
-                                key: ValueKey(item.name),
-                                item: item,
-                                teams: _teams,
-                                onAssign: _assignItem,
-                                availableStarts: _availableStartDates,
-                                calculateEndDate: _calculateEndDate,
-                                scheduled: widget.scheduled,
-                              ),
-                            ),
-                          ),
-                      if (filteredDeliveredNew.isEmpty)
-                        const _EmptyStateCard(
-                          title: 'Geen projecten',
-                          subtitle: 'Geen geleverde nieuwe projecten.',
+                    ...filteredDeliveredNew.map(
+                      (item) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: _PlanningAssignCard(
+                          key: ValueKey(item.name),
+                          item: item,
+                          teams: _teams,
+                          onAssign: _assignItem,
+                          availableStarts: _availableStartDates,
+                          calculateEndDate: _calculateEndDate,
+                          scheduled: widget.scheduled,
                         ),
+                      ),
+                    ),
+                    if (filteredDeliveredNew.isEmpty)
+                      const _EmptyStateCard(
+                        title: 'Geen projecten',
+                        subtitle: 'Geen geleverde nieuwe projecten.',
+                      ),
                   ] else ...[
-                      ...filteredDeliveredBackorder.map(
-                            (item) => Padding(
-                              padding: const EdgeInsets.only(bottom: 10),
-                              child: _PlanningAssignCard(
-                                key: ValueKey(item.name),
-                                item: item,
-                                teams: _teams,
-                                onAssign: _assignItem,
-                                availableStarts: _availableStartDates,
-                                calculateEndDate: _calculateEndDate,
-                                scheduled: widget.scheduled,
-                              ),
-                            ),
-                          ),
-                      if (filteredDeliveredBackorder.isEmpty)
-                        const _EmptyStateCard(
-                          title: 'Geen nabestellingen',
-                          subtitle: 'Geen geleverde nabestellingen.',
+                    ...filteredDeliveredBackorder.map(
+                      (item) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: _PlanningAssignCard(
+                          key: ValueKey(item.name),
+                          item: item,
+                          teams: _teams,
+                          onAssign: _assignItem,
+                          availableStarts: _availableStartDates,
+                          calculateEndDate: _calculateEndDate,
+                          scheduled: widget.scheduled,
                         ),
+                      ),
+                    ),
+                    if (filteredDeliveredBackorder.isEmpty)
+                      const _EmptyStateCard(
+                        title: 'Geen nabestellingen',
+                        subtitle: 'Geen geleverde nabestellingen.',
+                      ),
                   ],
                 ],
                 if (onlyScheduledView) ...[
@@ -5674,19 +5806,20 @@ class _PlanningTabState extends State<PlanningTab> {
                         assignment: item.assignment,
                         details: item.details,
                         onOpen: () async {
-                          final changed =
-                              await Navigator.of(context).push<bool>(
-                            _appPageRoute(
-                              builder: (_) => ProjectDetailScreen(
-                                customerName: item.assignment.project,
-                                group: item.assignment.group,
-                                status: ProjectStore.findStatusForProject(
-                                      item.assignment.project,
-                                    ) ??
-                                    'Ingepland',
-                              ),
-                            ),
-                          );
+                          final changed = await Navigator.of(context)
+                              .push<bool>(
+                                _appPageRoute(
+                                  builder: (_) => ProjectDetailScreen(
+                                    customerName: item.assignment.project,
+                                    group: item.assignment.group,
+                                    status:
+                                        ProjectStore.findStatusForProject(
+                                          item.assignment.project,
+                                        ) ??
+                                        'Ingepland',
+                                  ),
+                                ),
+                              );
                           if (changed == true) {
                             setState(() {});
                           }
@@ -5743,7 +5876,9 @@ class StatisticsTab extends StatefulWidget {
 }
 
 class _StatisticsTabState extends State<StatisticsTab> {
-  final TextEditingController _rateController = TextEditingController(text: '45');
+  final TextEditingController _rateController = TextEditingController(
+    text: '45',
+  );
   late DateTime _weekStart;
   DateTime? _selectedWeekDay;
   late int _selectedYear;
@@ -5761,8 +5896,11 @@ class _StatisticsTabState extends State<StatisticsTab> {
     _selectedYear = DateTime.now().year;
     _performanceDay = _dateOnly(DateTime.now());
     _performanceWeekStart = _startOfWeek(_performanceDay);
-    _performanceMonthStart =
-        DateTime(_performanceDay.year, _performanceDay.month, 1);
+    _performanceMonthStart = DateTime(
+      _performanceDay.year,
+      _performanceDay.month,
+      1,
+    );
     final teams = _teamsForCurrentUser();
     if (teams.isNotEmpty) {
       _selectedTeam = teams.first;
@@ -5785,8 +5923,10 @@ class _StatisticsTabState extends State<StatisticsTab> {
   List<String> _membersForTeam(String team) {
     _RoleManagementStore.seedIfEmpty();
     return _RoleManagementStore.assignments
-        .where((assignment) =>
-            assignment.role == 'Werknemer' && assignment.team == team)
+        .where(
+          (assignment) =>
+              assignment.role == 'Werknemer' && assignment.team == team,
+        )
         .map((assignment) => assignment.name)
         .toList();
   }
@@ -5907,7 +6047,11 @@ class _StatisticsTabState extends State<StatisticsTab> {
     if (_performancePeriodIndex == 1) {
       return _performanceWeekStart.add(const Duration(days: 6));
     }
-    return DateTime(_performanceMonthStart.year, _performanceMonthStart.month + 1, 0);
+    return DateTime(
+      _performanceMonthStart.year,
+      _performanceMonthStart.month + 1,
+      0,
+    );
   }
 
   String _contractorForTeam(String team) {
@@ -6040,10 +6184,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
         }
       }
     }
-    return _ExtraHoursBreakdown(
-      chargeable: chargeable,
-      internal: internal,
-    );
+    return _ExtraHoursBreakdown(chargeable: chargeable, internal: internal);
   }
 
   @override
@@ -6053,12 +6194,12 @@ class _StatisticsTabState extends State<StatisticsTab> {
     final isWorker = CurrentUserStore.role == 'Werknemer';
     final isSubcontractorAdmin =
         CurrentUserStore.role == 'Onderaannemer beheerder' ||
-            CurrentUserStore.role == 'Onderaannemer';
+        CurrentUserStore.role == 'Onderaannemer';
 
     final assignments = _isExternal
         ? widget.scheduled
-            .where((assignment) => _visibleTeams.contains(assignment.team))
-            .toList()
+              .where((assignment) => _visibleTeams.contains(assignment.team))
+              .toList()
         : widget.scheduled;
 
     final avgPerWeek = _avgProjectsPerWeek(assignments);
@@ -6088,8 +6229,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
       totalOfferHours += _offerHoursForProject(name);
       totalExtraHours += _extraHoursForProject(name);
     }
-    final avgCost =
-        projectNames.isEmpty ? 0.0 : totalOfferPrice / projectNames.length;
+    final avgCost = projectNames.isEmpty
+        ? 0.0
+        : totalOfferPrice / projectNames.length;
 
     final rate = double.tryParse(_rateController.text.trim()) ?? 0;
     final estimatedValue = rate * (totalOfferHours + totalExtraHours);
@@ -6119,8 +6261,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
             _offerHoursForProject(project) + _extraHoursForProject(project);
         double totalPersonHours = 0;
         for (final log in logs) {
-          final minutes =
-              log.endMinutes - log.startMinutes - log.breakMinutes;
+          final minutes = log.endMinutes - log.startMinutes - log.breakMinutes;
           if (minutes <= 0) continue;
           totalPersonHours += (minutes / 60) * log.workers.length;
         }
@@ -6128,8 +6269,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
         final factor = totalPaid / totalPersonHours;
         for (final log in logs) {
           if (!log.workers.contains(user)) continue;
-          final minutes =
-              log.endMinutes - log.startMinutes - log.breakMinutes;
+          final minutes = log.endMinutes - log.startMinutes - log.breakMinutes;
           if (minutes <= 0) continue;
           final hours = minutes / 60;
           final day = _dateOnly(log.date);
@@ -6142,7 +6282,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
             prevMonthActual += hours;
             prevMonthPaid += paid;
           }
-          if (day.isAfter(currentMonthStart.subtract(const Duration(days: 1))) &&
+          if (day.isAfter(
+                currentMonthStart.subtract(const Duration(days: 1)),
+              ) &&
               day.isBefore(nextMonthStart)) {
             currentMonthActual += hours;
             currentMonthPaid += paid;
@@ -6155,24 +6297,19 @@ class _StatisticsTabState extends State<StatisticsTab> {
         }
       }
 
-      final maxWeekValue = weekDays.fold<double>(
-        0,
-        (maxValue, day) {
-          final paid = paidByDay[day] ?? 0;
-          final actual = actualByDay[day] ?? 0;
-          final dayMax = paid > actual ? paid : actual;
-          return dayMax > maxValue ? dayMax : maxValue;
-        },
-      );
+      final maxWeekValue = weekDays.fold<double>(0, (maxValue, day) {
+        final paid = paidByDay[day] ?? 0;
+        final actual = actualByDay[day] ?? 0;
+        final dayMax = paid > actual ? paid : actual;
+        return dayMax > maxValue ? dayMax : maxValue;
+      });
       final barMax = maxWeekValue <= 0 ? 1 : maxWeekValue;
       final selectedDay = weekDays.firstWhere(
         (day) =>
-            _selectedWeekDay != null &&
-            _dateOnly(_selectedWeekDay!) == day,
+            _selectedWeekDay != null && _dateOnly(_selectedWeekDay!) == day,
         orElse: () => weekDays.first,
       );
-      final selectedProjects =
-          projectsByDay[selectedDay]?.toList() ?? const [];
+      final selectedProjects = projectsByDay[selectedDay]?.toList() ?? const [];
 
       return Column(
         key: const ValueKey('stats'),
@@ -6200,25 +6337,25 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         IconButton(
                           icon: const Icon(Icons.chevron_left),
                           onPressed: () => setState(() {
-                            _weekStart =
-                                _weekStart.subtract(const Duration(days: 7));
+                            _weekStart = _weekStart.subtract(
+                              const Duration(days: 7),
+                            );
                           }),
                         ),
                         Expanded(
                           child: Text(
                             '${_formatDate(_weekStart)} - ${_formatDate(_weekStart.add(const Duration(days: 6)))}',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
+                            style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(fontWeight: FontWeight.w600),
                           ),
                         ),
                         IconButton(
                           icon: const Icon(Icons.chevron_right),
                           onPressed: () => setState(() {
-                            _weekStart =
-                                _weekStart.add(const Duration(days: 7));
+                            _weekStart = _weekStart.add(
+                              const Duration(days: 7),
+                            );
                           }),
                         ),
                       ],
@@ -6245,8 +6382,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
                               ),
                               decoration: BoxDecoration(
                                 color: isSelected
-                                    ? const Color(0xFF0B2E2B)
-                                        .withValues(alpha: 0.06)
+                                    ? const Color(
+                                        0xFF0B2E2B,
+                                      ).withValues(alpha: 0.06)
                                     : Colors.transparent,
                                 borderRadius: BorderRadius.circular(10),
                               ),
@@ -6265,8 +6403,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
                                           height: actualHeight,
                                           decoration: BoxDecoration(
                                             color: const Color(0xFFB8ADA0),
-                                            borderRadius:
-                                                BorderRadius.circular(6),
+                                            borderRadius: BorderRadius.circular(
+                                              6,
+                                            ),
                                           ),
                                         ),
                                         const SizedBox(width: 4),
@@ -6275,8 +6414,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
                                           height: paidHeight,
                                           decoration: BoxDecoration(
                                             color: const Color(0xFF0B2E2B),
-                                            borderRadius:
-                                                BorderRadius.circular(6),
+                                            borderRadius: BorderRadius.circular(
+                                              6,
+                                            ),
                                           ),
                                         ),
                                       ],
@@ -6285,9 +6425,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                                   const SizedBox(height: 4),
                                   Text(
                                     _weekdayLabel(day),
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall
+                                    style: Theme.of(context).textTheme.bodySmall
                                         ?.copyWith(
                                           color: isSelected
                                               ? const Color(0xFF0B2E2B)
@@ -6321,19 +6459,17 @@ class _StatisticsTabState extends State<StatisticsTab> {
                     const SizedBox(height: 12),
                     Text(
                       'Projecten op ${_formatDate(selectedDay)}',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(fontWeight: FontWeight.w600),
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                     const SizedBox(height: 6),
                     if (selectedProjects.isEmpty)
                       Text(
                         'Geen projecten.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodySmall
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: const Color(0xFF6A7C78),
+                        ),
                       )
                     else
                       ...selectedProjects.map(
@@ -6393,9 +6529,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           child: Text(
                             '$_selectedYear',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
+                            style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(fontWeight: FontWeight.w600),
                           ),
                         ),
@@ -6414,9 +6548,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           flex: 2,
                           child: Text(
                             'Maand',
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodySmall
+                            style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
@@ -6425,9 +6557,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           child: Text(
                             'Gekregen',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodySmall
+                            style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
@@ -6436,9 +6566,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           child: Text(
                             'Gepresteerd',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodySmall
+                            style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
@@ -6537,16 +6665,14 @@ class _StatisticsTabState extends State<StatisticsTab> {
             _offerHoursForProject(project) + _extraHoursForProject(project);
         double totalPersonHours = 0;
         for (final log in logs) {
-          final minutes =
-              log.endMinutes - log.startMinutes - log.breakMinutes;
+          final minutes = log.endMinutes - log.startMinutes - log.breakMinutes;
           if (minutes <= 0) continue;
           totalPersonHours += (minutes / 60) * log.workers.length;
         }
         if (totalPersonHours <= 0) continue;
         final factor = totalPaid / totalPersonHours;
         for (final log in logs) {
-          final minutes =
-              log.endMinutes - log.startMinutes - log.breakMinutes;
+          final minutes = log.endMinutes - log.startMinutes - log.breakMinutes;
           if (minutes <= 0) continue;
           final matchingWorkers = log.workers
               .where((worker) => teamMembers.contains(worker))
@@ -6564,7 +6690,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
             prevMonthActual += hours;
             prevMonthPaid += paid;
           }
-          if (day.isAfter(currentMonthStart.subtract(const Duration(days: 1))) &&
+          if (day.isAfter(
+                currentMonthStart.subtract(const Duration(days: 1)),
+              ) &&
               day.isBefore(nextMonthStart)) {
             currentMonthActual += hours;
             currentMonthPaid += paid;
@@ -6577,24 +6705,19 @@ class _StatisticsTabState extends State<StatisticsTab> {
         }
       }
 
-      final maxWeekValue = weekDays.fold<double>(
-        0,
-        (maxValue, day) {
-          final paid = paidByDay[day] ?? 0;
-          final actual = actualByDay[day] ?? 0;
-          final dayMax = paid > actual ? paid : actual;
-          return dayMax > maxValue ? dayMax : maxValue;
-        },
-      );
+      final maxWeekValue = weekDays.fold<double>(0, (maxValue, day) {
+        final paid = paidByDay[day] ?? 0;
+        final actual = actualByDay[day] ?? 0;
+        final dayMax = paid > actual ? paid : actual;
+        return dayMax > maxValue ? dayMax : maxValue;
+      });
       final barMax = maxWeekValue <= 0 ? 1 : maxWeekValue;
       final selectedDay = weekDays.firstWhere(
         (day) =>
-            _selectedWeekDay != null &&
-            _dateOnly(_selectedWeekDay!) == day,
+            _selectedWeekDay != null && _dateOnly(_selectedWeekDay!) == day,
         orElse: () => weekDays.first,
       );
-      final selectedProjects =
-          projectsByDay[selectedDay]?.toList() ?? const [];
+      final selectedProjects = projectsByDay[selectedDay]?.toList() ?? const [];
 
       DateTime performanceStart;
       DateTime performanceEnd;
@@ -6603,12 +6726,14 @@ class _StatisticsTabState extends State<StatisticsTab> {
         performanceEnd = _performanceDay;
       } else if (_performancePeriodIndex == 1) {
         performanceStart = _performanceWeekStart;
-        performanceEnd =
-            _performanceWeekStart.add(const Duration(days: 6));
+        performanceEnd = _performanceWeekStart.add(const Duration(days: 6));
       } else {
         performanceStart = _performanceMonthStart;
-        performanceEnd =
-            DateTime(_performanceMonthStart.year, _performanceMonthStart.month + 1, 0);
+        performanceEnd = DateTime(
+          _performanceMonthStart.year,
+          _performanceMonthStart.month + 1,
+          0,
+        );
       }
 
       final projectsInRange = <String>{};
@@ -6662,20 +6787,17 @@ class _StatisticsTabState extends State<StatisticsTab> {
             doorBreakdown[item] = (doorBreakdown[item] ?? 0) + qty;
             continue;
           }
-          if (category.contains('afwerking') &&
-              category.contains('mdf')) {
+          if (category.contains('afwerking') && category.contains('mdf')) {
             finishMdf += qty;
             mdfBreakdown[item] = (mdfBreakdown[item] ?? 0) + qty;
             continue;
           }
-          if (category.contains('afwerking') &&
-              category.contains('pvc')) {
+          if (category.contains('afwerking') && category.contains('pvc')) {
             finishPvc += qty;
             pvcBreakdown[item] = (pvcBreakdown[item] ?? 0) + qty;
             continue;
           }
-          if (category.contains('afwerking') &&
-              category.contains('pleister')) {
+          if (category.contains('afwerking') && category.contains('pleister')) {
             finishPleister += qty;
             pleisterBreakdown[item] = (pleisterBreakdown[item] ?? 0) + qty;
             continue;
@@ -6687,8 +6809,11 @@ class _StatisticsTabState extends State<StatisticsTab> {
         }
       }
 
-      final workingDaysCount =
-          _workingDaysCount(selectedTeam, performanceStart, performanceEnd);
+      final workingDaysCount = _workingDaysCount(
+        selectedTeam,
+        performanceStart,
+        performanceEnd,
+      );
       double avg(double value) =>
           workingDaysCount == 0 ? 0 : value / workingDaysCount;
 
@@ -6712,9 +6837,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                   onTap: () {
                     Navigator.of(context).push(
                       _appPageRoute(
-                        builder: (_) => _PayrollScreen(
-                          teams: teams,
-                        ),
+                        builder: (_) => _PayrollScreen(teams: teams),
                       ),
                     );
                   },
@@ -6770,9 +6893,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           Expanded(
                             child: Text(
                               _formatDate(_performanceDay),
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(fontWeight: FontWeight.w600),
                             ),
                           ),
@@ -6787,8 +6908,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
                                 lastDate: DateTime(2030),
                               );
                               if (picked != null) {
-                                setState(() =>
-                                    _performanceDay = _dateOnly(picked));
+                                setState(
+                                  () => _performanceDay = _dateOnly(picked),
+                                );
                               }
                             },
                           ),
@@ -6808,17 +6930,16 @@ class _StatisticsTabState extends State<StatisticsTab> {
                             child: Text(
                               '${_formatDate(_performanceWeekStart)} - ${_formatDate(_performanceWeekStart.add(const Duration(days: 6)))}',
                               textAlign: TextAlign.center,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(fontWeight: FontWeight.w600),
                             ),
                           ),
                           IconButton(
                             icon: const Icon(Icons.chevron_right),
                             onPressed: () => setState(() {
-                              _performanceWeekStart = _performanceWeekStart
-                                  .add(const Duration(days: 7));
+                              _performanceWeekStart = _performanceWeekStart.add(
+                                const Duration(days: 7),
+                              );
                             }),
                           ),
                         ],
@@ -6840,9 +6961,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                             child: Text(
                               '${_monthLabel(_performanceMonthStart.month)} ${_performanceMonthStart.year}',
                               textAlign: TextAlign.center,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(fontWeight: FontWeight.w600),
                             ),
                           ),
@@ -6871,15 +6990,17 @@ class _StatisticsTabState extends State<StatisticsTab> {
                     const SizedBox(height: 6),
                     _StatRow(label: 'Afwerking PVC', value: '$finishPvc'),
                     const SizedBox(height: 6),
-                    _StatRow(label: 'Afwerking pleister', value: '$finishPleister'),
+                    _StatRow(
+                      label: 'Afwerking pleister',
+                      value: '$finishPleister',
+                    ),
                     if (workingDaysCount > 0) ...[
                       const SizedBox(height: 10),
                       Text(
                         'Gemiddeld per werkdag',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(fontWeight: FontWeight.w600),
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                       const SizedBox(height: 6),
                       _StatRow(
@@ -6907,10 +7028,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
                       const SizedBox(height: 10),
                       Text(
                         'Onderverdeling gewicht/grootte',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(fontWeight: FontWeight.w600),
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                       const SizedBox(height: 6),
                       if (windowBreakdown.isNotEmpty) ...[
@@ -6921,9 +7041,8 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         ...windowBreakdown.entries.map(
                           (entry) => Text(
                             '${entry.key}: ${entry.value}',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: const Color(0xFF6A7C78),
-                                ),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
                         const SizedBox(height: 6),
@@ -6936,9 +7055,8 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         ...slidingBreakdown.entries.map(
                           (entry) => Text(
                             '${entry.key}: ${entry.value}',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: const Color(0xFF6A7C78),
-                                ),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
                         const SizedBox(height: 6),
@@ -6951,9 +7069,8 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         ...doorBreakdown.entries.map(
                           (entry) => Text(
                             '${entry.key}: ${entry.value}',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: const Color(0xFF6A7C78),
-                                ),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
                         const SizedBox(height: 6),
@@ -6966,9 +7083,8 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         ...gateBreakdown.entries.map(
                           (entry) => Text(
                             '${entry.key}: ${entry.value}',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: const Color(0xFF6A7C78),
-                                ),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
                         const SizedBox(height: 6),
@@ -6981,9 +7097,8 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         ...mdfBreakdown.entries.map(
                           (entry) => Text(
                             '${entry.key}: ${entry.value}',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: const Color(0xFF6A7C78),
-                                ),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
                         const SizedBox(height: 6),
@@ -6996,9 +7111,8 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         ...pvcBreakdown.entries.map(
                           (entry) => Text(
                             '${entry.key}: ${entry.value}',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: const Color(0xFF6A7C78),
-                                ),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
                         const SizedBox(height: 6),
@@ -7011,9 +7125,8 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         ...pleisterBreakdown.entries.map(
                           (entry) => Text(
                             '${entry.key}: ${entry.value}',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: const Color(0xFF6A7C78),
-                                ),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
                       ],
@@ -7029,25 +7142,25 @@ class _StatisticsTabState extends State<StatisticsTab> {
                         IconButton(
                           icon: const Icon(Icons.chevron_left),
                           onPressed: () => setState(() {
-                            _weekStart =
-                                _weekStart.subtract(const Duration(days: 7));
+                            _weekStart = _weekStart.subtract(
+                              const Duration(days: 7),
+                            );
                           }),
                         ),
                         Expanded(
                           child: Text(
                             '${_formatDate(_weekStart)} - ${_formatDate(_weekStart.add(const Duration(days: 6)))}',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
+                            style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(fontWeight: FontWeight.w600),
                           ),
                         ),
                         IconButton(
                           icon: const Icon(Icons.chevron_right),
                           onPressed: () => setState(() {
-                            _weekStart =
-                                _weekStart.add(const Duration(days: 7));
+                            _weekStart = _weekStart.add(
+                              const Duration(days: 7),
+                            );
                           }),
                         ),
                       ],
@@ -7074,8 +7187,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
                               ),
                               decoration: BoxDecoration(
                                 color: isSelected
-                                    ? const Color(0xFF0B2E2B)
-                                        .withValues(alpha: 0.06)
+                                    ? const Color(
+                                        0xFF0B2E2B,
+                                      ).withValues(alpha: 0.06)
                                     : Colors.transparent,
                                 borderRadius: BorderRadius.circular(10),
                               ),
@@ -7094,8 +7208,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
                                           height: actualHeight,
                                           decoration: BoxDecoration(
                                             color: const Color(0xFFB8ADA0),
-                                            borderRadius:
-                                                BorderRadius.circular(6),
+                                            borderRadius: BorderRadius.circular(
+                                              6,
+                                            ),
                                           ),
                                         ),
                                         const SizedBox(width: 4),
@@ -7104,8 +7219,9 @@ class _StatisticsTabState extends State<StatisticsTab> {
                                           height: paidHeight,
                                           decoration: BoxDecoration(
                                             color: const Color(0xFF0B2E2B),
-                                            borderRadius:
-                                                BorderRadius.circular(6),
+                                            borderRadius: BorderRadius.circular(
+                                              6,
+                                            ),
                                           ),
                                         ),
                                       ],
@@ -7114,9 +7230,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                                   const SizedBox(height: 4),
                                   Text(
                                     _weekdayLabel(day),
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall
+                                    style: Theme.of(context).textTheme.bodySmall
                                         ?.copyWith(
                                           color: isSelected
                                               ? const Color(0xFF0B2E2B)
@@ -7150,19 +7264,17 @@ class _StatisticsTabState extends State<StatisticsTab> {
                     const SizedBox(height: 12),
                     Text(
                       'Projecten op ${_formatDate(selectedDay)}',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(fontWeight: FontWeight.w600),
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                     const SizedBox(height: 6),
                     if (selectedProjects.isEmpty)
                       Text(
                         'Geen projecten.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodySmall
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: const Color(0xFF6A7C78),
+                        ),
                       )
                     else
                       ...selectedProjects.map(
@@ -7222,9 +7334,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           child: Text(
                             '$_selectedYear',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
+                            style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(fontWeight: FontWeight.w600),
                           ),
                         ),
@@ -7243,9 +7353,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           flex: 2,
                           child: Text(
                             'Maand',
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodySmall
+                            style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
@@ -7254,9 +7362,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           child: Text(
                             'Gekregen',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodySmall
+                            style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
@@ -7265,9 +7371,7 @@ class _StatisticsTabState extends State<StatisticsTab> {
                           child: Text(
                             'Gepresteerd',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodySmall
+                            style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ),
@@ -7336,532 +7440,573 @@ class _StatisticsTabState extends State<StatisticsTab> {
           child: ListView(
             padding: const EdgeInsets.fromLTRB(20, 0, 20, 100),
             children: [
-        if (_isAdmin) ...[
-          const SizedBox(height: 16),
-          Builder(
-            builder: (context) {
-              final performanceStart = _performanceStartDate();
-              final performanceEnd = _performanceEndDate();
-              _RoleManagementStore.seedIfEmpty();
-              final teamNames = _RoleManagementStore.teams.isEmpty
-                  ? <String>['Team 1']
-                  : _RoleManagementStore.teams
-                      .map((team) => team.name)
-                      .toList()
-                    ..sort();
-              final summaries = <_TeamPlacementSummary>[];
-              for (final team in teamNames) {
-                final projects =
-                    _projectsForTeamInRange(team, performanceStart, performanceEnd);
-                final stats = _placementStatsForProjects(projects);
-                final extra = _extraHoursBreakdownForProjects(projects);
-                summaries.add(
-                  _TeamPlacementSummary(
-                    team: team,
-                    contractor: _contractorForTeam(team),
-                    stats: stats,
-                    extraHours: extra,
-                  ),
-                );
-              }
-              final grouped = <String, List<_TeamPlacementSummary>>{};
-              for (final summary in summaries) {
-                grouped.putIfAbsent(summary.contractor, () => []).add(summary);
-              }
-              final contractorKeys = grouped.keys.toList()..sort();
-
-              return _InputCard(
-                title: 'Plaatsingen per team',
-                children: [
-                  _TabToggle(
-                    labels: const ['Dag', 'Week', 'Maand'],
-                    selectedIndex: _performancePeriodIndex,
-                    onSelect: (index) => setState(() {
-                      _performancePeriodIndex = index;
-                    }),
-                  ),
-                  const SizedBox(height: 12),
-                  if (_performancePeriodIndex == 0)
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            _formatDate(_performanceDay),
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(fontWeight: FontWeight.w600),
-                          ),
-                        ),
-                        _InlineButton(
-                          label: 'Kies datum',
-                          icon: Icons.calendar_today,
-                          onTap: () async {
-                            final picked = await showDatePicker(
-                              context: context,
-                              initialDate: _performanceDay,
-                              firstDate: DateTime(2024),
-                              lastDate: DateTime(2030),
-                            );
-                            if (picked != null) {
-                              setState(() =>
-                                  _performanceDay = _dateOnly(picked));
-                            }
-                          },
-                        ),
-                      ],
-                    )
-                  else if (_performancePeriodIndex == 1)
-                    Row(
-                      children: [
-                        IconButton(
-                          icon: const Icon(Icons.chevron_left),
-                          onPressed: () => setState(() {
-                            _performanceWeekStart = _performanceWeekStart
-                                .subtract(const Duration(days: 7));
-                          }),
-                        ),
-                        Expanded(
-                          child: Text(
-                            '${_formatDate(_performanceWeekStart)} - ${_formatDate(_performanceWeekStart.add(const Duration(days: 6)))}',
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(fontWeight: FontWeight.w600),
-                          ),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.chevron_right),
-                          onPressed: () => setState(() {
-                            _performanceWeekStart = _performanceWeekStart
-                                .add(const Duration(days: 7));
-                          }),
-                        ),
-                      ],
-                    )
-                  else
-                    Row(
-                      children: [
-                        IconButton(
-                          icon: const Icon(Icons.chevron_left),
-                          onPressed: () => setState(() {
-                            _performanceMonthStart = DateTime(
-                              _performanceMonthStart.year,
-                              _performanceMonthStart.month - 1,
-                              1,
-                            );
-                          }),
-                        ),
-                        Expanded(
-                          child: Text(
-                            '${_monthLabel(_performanceMonthStart.month)} ${_performanceMonthStart.year}',
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(fontWeight: FontWeight.w600),
-                          ),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.chevron_right),
-                          onPressed: () => setState(() {
-                            _performanceMonthStart = DateTime(
-                              _performanceMonthStart.year,
-                              _performanceMonthStart.month + 1,
-                              1,
-                            );
-                          }),
-                        ),
-                      ],
-                    ),
-                  const SizedBox(height: 12),
-                  if (summaries.isEmpty)
-                    Text(
-                      'Nog geen teams beschikbaar.',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: const Color(0xFF6A7C78)),
-                    )
-                  else
-                    ...contractorKeys.map((contractor) {
-                      final teamItems = grouped[contractor] ?? [];
-                      int contractorWindows = 0;
-                      int contractorSliding = 0;
-                      int contractorDoors = 0;
-                      int contractorGates = 0;
-                      double contractorChargeable = 0;
-                      double contractorInternal = 0;
-                      for (final item in teamItems) {
-                        contractorWindows += item.stats.windows;
-                        contractorSliding += item.stats.sliding;
-                        contractorDoors += item.stats.doors;
-                        contractorGates += item.stats.gates;
-                        contractorChargeable += item.extraHours.chargeable;
-                        contractorInternal += item.extraHours.internal;
-                      }
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 8),
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(16),
-                            border:
-                                Border.all(color: const Color(0xFFE1DAD0)),
-                          ),
-                          child: Theme(
-                            data: Theme.of(context)
-                                .copyWith(dividerColor: Colors.transparent),
-                            child: ExpansionTile(
-                              tilePadding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 8,
-                              ),
-                              childrenPadding:
-                                  const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                              title: Text(
-                                contractor,
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .bodyMedium
-                                    ?.copyWith(fontWeight: FontWeight.w600),
-                              ),
-                              subtitle: Text(
-                                'Ramen $contractorWindows · Schuiframen $contractorSliding · Deuren $contractorDoors · Poorten $contractorGates\n'
-                                'Extra uren klant ${_formatHours(contractorChargeable)} · intern ${_formatHours(contractorInternal)}',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .bodySmall
-                                    ?.copyWith(color: const Color(0xFF6A7C78)),
-                              ),
-                              children: teamItems.map((item) {
-                                return Padding(
-                                  padding: const EdgeInsets.only(bottom: 8),
-                                  child: Container(
-                                    padding: const EdgeInsets.all(12),
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFFF4F1EA),
-                                      borderRadius: BorderRadius.circular(12),
-                                      border: Border.all(
-                                        color: const Color(0xFFE1DAD0),
-                                      ),
-                                    ),
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          item.team,
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .bodyMedium
-                                              ?.copyWith(
-                                                fontWeight: FontWeight.w600,
-                                                color:
-                                                    const Color(0xFF243B3A),
-                                              ),
-                                        ),
-                                        const SizedBox(height: 6),
-                                        _StatRow(
-                                          label: 'Ramen',
-                                          value: '${item.stats.windows}',
-                                        ),
-                                        const SizedBox(height: 4),
-                                        _StatRow(
-                                          label: 'Schuiframen',
-                                          value: '${item.stats.sliding}',
-                                        ),
-                                        const SizedBox(height: 4),
-                                        _StatRow(
-                                          label: 'Deuren',
-                                          value: '${item.stats.doors}',
-                                        ),
-                                        const SizedBox(height: 4),
-                                        _StatRow(
-                                          label: 'Poorten',
-                                          value: '${item.stats.gates}',
-                                        ),
-                                        const SizedBox(height: 4),
-                                        _StatRow(
-                                          label: 'Afwerking MDF',
-                                          value: '${item.stats.finishMdf}',
-                                        ),
-                                        const SizedBox(height: 4),
-                                        _StatRow(
-                                          label: 'Afwerking PVC',
-                                          value: '${item.stats.finishPvc}',
-                                        ),
-                                        const SizedBox(height: 4),
-                                        _StatRow(
-                                          label: 'Afwerking pleister',
-                                          value: '${item.stats.finishPleister}',
-                                        ),
-                                        const SizedBox(height: 6),
-                                        _StatRow(
-                                          label: 'Extra uren klant',
-                                          value:
-                                              _formatHours(item.extraHours.chargeable),
-                                        ),
-                                        const SizedBox(height: 4),
-                                        _StatRow(
-                                          label: 'Extra uren intern',
-                                          value:
-                                              _formatHours(item.extraHours.internal),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                );
-                              }).toList(),
-                            ),
-                          ),
+              if (_isAdmin) ...[
+                const SizedBox(height: 16),
+                Builder(
+                  builder: (context) {
+                    final performanceStart = _performanceStartDate();
+                    final performanceEnd = _performanceEndDate();
+                    _RoleManagementStore.seedIfEmpty();
+                    final teamNames =
+                        _RoleManagementStore.teams.isEmpty
+                              ? <String>['Team 1']
+                              : _RoleManagementStore.teams
+                                    .map((team) => team.name)
+                                    .toList()
+                          ..sort();
+                    final summaries = <_TeamPlacementSummary>[];
+                    for (final team in teamNames) {
+                      final projects = _projectsForTeamInRange(
+                        team,
+                        performanceStart,
+                        performanceEnd,
+                      );
+                      final stats = _placementStatsForProjects(projects);
+                      final extra = _extraHoursBreakdownForProjects(projects);
+                      summaries.add(
+                        _TeamPlacementSummary(
+                          team: team,
+                          contractor: _contractorForTeam(team),
+                          stats: stats,
+                          extraHours: extra,
                         ),
                       );
-                    }),
-                ],
-              );
-            },
-          ),
-        ],
-        const SizedBox(height: 16),
-        Builder(
-          builder: (context) {
-            final weekDays = _weekDays(_weekStart);
-            final weekStart = weekDays.first;
-            final weekEnd = weekDays.last;
-            final projectsByDay = <DateTime, Set<String>>{};
-            for (final entry in ProjectStore.workLogs.entries) {
-              final project = entry.key;
-              for (final log in entry.value) {
-                final day = _dateOnly(log.date);
-                if (day.isBefore(weekStart) || day.isAfter(weekEnd)) {
-                  continue;
-                }
-                projectsByDay.putIfAbsent(day, () => <String>{}).add(project);
-              }
-            }
-            final statsByDay = <DateTime, _PlacementStats>{};
-            final totalsByDay = <DateTime, int>{};
-            int maxTotal = 1;
-            for (final day in weekDays) {
-              final stats =
-                  _placementStatsForProjects(projectsByDay[day] ?? {});
-              statsByDay[day] = stats;
-              final total = stats.windows +
-                  stats.sliding +
-                  stats.doors +
-                  stats.gates +
-                  stats.finishMdf +
-                  stats.finishPvc +
-                  stats.finishPleister;
-              totalsByDay[day] = total;
-              if (total > maxTotal) {
-                maxTotal = total;
-              }
-            }
-            final selectedDay = weekDays.firstWhere(
-              (day) =>
-                  _selectedWeekDay != null &&
-                  _dateOnly(_selectedWeekDay!) == day,
-              orElse: () => weekDays.first,
-            );
-            final selectedStats =
-                statsByDay[selectedDay] ?? _placementStatsForProjects({});
+                    }
+                    final grouped = <String, List<_TeamPlacementSummary>>{};
+                    for (final summary in summaries) {
+                      grouped
+                          .putIfAbsent(summary.contractor, () => [])
+                          .add(summary);
+                    }
+                    final contractorKeys = grouped.keys.toList()..sort();
 
-            return _InputCard(
-              title: 'Weekoverzicht plaatsingen',
-              children: [
-                Row(
-                  children: [
-                    IconButton(
-                      icon: const Icon(Icons.chevron_left),
-                      onPressed: () => setState(() {
-                        _weekStart =
-                            _weekStart.subtract(const Duration(days: 7));
-                      }),
-                    ),
-                    Expanded(
-                      child: Text(
-                        '${_formatDate(_weekStart)} - ${_formatDate(_weekStart.add(const Duration(days: 6)))}',
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(fontWeight: FontWeight.w600),
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.chevron_right),
-                      onPressed: () => setState(() {
-                        _weekStart = _weekStart.add(const Duration(days: 7));
-                      }),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: weekDays.map((day) {
-                    final total = totalsByDay[day] ?? 0;
-                    final height = (total / maxTotal) * 90;
-                    final isSelected = selectedDay == day;
-                    return Expanded(
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(10),
-                        onTap: () => setState(() {
-                          _selectedWeekDay = day;
-                        }),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            vertical: 6,
-                            horizontal: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: isSelected
-                                ? const Color(0xFF0B2E2B)
-                                    .withValues(alpha: 0.06)
-                                : Colors.transparent,
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Column(
+                    return _InputCard(
+                      title: 'Plaatsingen per team',
+                      children: [
+                        _TabToggle(
+                          labels: const ['Dag', 'Week', 'Maand'],
+                          selectedIndex: _performancePeriodIndex,
+                          onSelect: (index) => setState(() {
+                            _performancePeriodIndex = index;
+                          }),
+                        ),
+                        const SizedBox(height: 12),
+                        if (_performancePeriodIndex == 0)
+                          Row(
                             children: [
-                              SizedBox(
-                                height: 100,
-                                child: Align(
-                                  alignment: Alignment.bottomCenter,
-                                  child: Container(
-                                    width: 16,
-                                    height: height,
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFF0B2E2B),
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                  ),
+                              Expanded(
+                                child: Text(
+                                  _formatDate(_performanceDay),
+                                  style: Theme.of(context).textTheme.bodyMedium
+                                      ?.copyWith(fontWeight: FontWeight.w600),
                                 ),
                               ),
-                              const SizedBox(height: 4),
-                              Text(
-                                _weekdayLabel(day),
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .bodySmall
-                                    ?.copyWith(
-                                      color: isSelected
-                                          ? const Color(0xFF0B2E2B)
-                                          : const Color(0xFF6A7C78),
-                                      fontWeight: isSelected
-                                          ? FontWeight.w600
-                                          : FontWeight.w400,
-                                    ),
+                              _InlineButton(
+                                label: 'Kies datum',
+                                icon: Icons.calendar_today,
+                                onTap: () async {
+                                  final picked = await showDatePicker(
+                                    context: context,
+                                    initialDate: _performanceDay,
+                                    firstDate: DateTime(2024),
+                                    lastDate: DateTime(2030),
+                                  );
+                                  if (picked != null) {
+                                    setState(
+                                      () => _performanceDay = _dateOnly(picked),
+                                    );
+                                  }
+                                },
+                              ),
+                            ],
+                          )
+                        else if (_performancePeriodIndex == 1)
+                          Row(
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.chevron_left),
+                                onPressed: () => setState(() {
+                                  _performanceWeekStart = _performanceWeekStart
+                                      .subtract(const Duration(days: 7));
+                                }),
+                              ),
+                              Expanded(
+                                child: Text(
+                                  '${_formatDate(_performanceWeekStart)} - ${_formatDate(_performanceWeekStart.add(const Duration(days: 6)))}',
+                                  textAlign: TextAlign.center,
+                                  style: Theme.of(context).textTheme.bodyMedium
+                                      ?.copyWith(fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.chevron_right),
+                                onPressed: () => setState(() {
+                                  _performanceWeekStart = _performanceWeekStart
+                                      .add(const Duration(days: 7));
+                                }),
+                              ),
+                            ],
+                          )
+                        else
+                          Row(
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.chevron_left),
+                                onPressed: () => setState(() {
+                                  _performanceMonthStart = DateTime(
+                                    _performanceMonthStart.year,
+                                    _performanceMonthStart.month - 1,
+                                    1,
+                                  );
+                                }),
+                              ),
+                              Expanded(
+                                child: Text(
+                                  '${_monthLabel(_performanceMonthStart.month)} ${_performanceMonthStart.year}',
+                                  textAlign: TextAlign.center,
+                                  style: Theme.of(context).textTheme.bodyMedium
+                                      ?.copyWith(fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.chevron_right),
+                                onPressed: () => setState(() {
+                                  _performanceMonthStart = DateTime(
+                                    _performanceMonthStart.year,
+                                    _performanceMonthStart.month + 1,
+                                    1,
+                                  );
+                                }),
                               ),
                             ],
                           ),
-                        ),
-                      ),
+                        const SizedBox(height: 12),
+                        if (summaries.isEmpty)
+                          Text(
+                            'Nog geen teams beschikbaar.',
+                            style: Theme.of(context).textTheme.bodyMedium
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
+                          )
+                        else
+                          ...contractorKeys.map((contractor) {
+                            final teamItems = grouped[contractor] ?? [];
+                            int contractorWindows = 0;
+                            int contractorSliding = 0;
+                            int contractorDoors = 0;
+                            int contractorGates = 0;
+                            double contractorChargeable = 0;
+                            double contractorInternal = 0;
+                            for (final item in teamItems) {
+                              contractorWindows += item.stats.windows;
+                              contractorSliding += item.stats.sliding;
+                              contractorDoors += item.stats.doors;
+                              contractorGates += item.stats.gates;
+                              contractorChargeable +=
+                                  item.extraHours.chargeable;
+                              contractorInternal += item.extraHours.internal;
+                            }
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(16),
+                                  border: Border.all(
+                                    color: const Color(0xFFE1DAD0),
+                                  ),
+                                ),
+                                child: Theme(
+                                  data: Theme.of(
+                                    context,
+                                  ).copyWith(dividerColor: Colors.transparent),
+                                  child: ExpansionTile(
+                                    tilePadding: const EdgeInsets.symmetric(
+                                      horizontal: 16,
+                                      vertical: 8,
+                                    ),
+                                    childrenPadding: const EdgeInsets.fromLTRB(
+                                      16,
+                                      0,
+                                      16,
+                                      16,
+                                    ),
+                                    title: Text(
+                                      contractor,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodyMedium
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                    ),
+                                    subtitle: Text(
+                                      'Ramen $contractorWindows · Schuiframen $contractorSliding · Deuren $contractorDoors · Poorten $contractorGates\n'
+                                      'Extra uren klant ${_formatHours(contractorChargeable)} · intern ${_formatHours(contractorInternal)}',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: const Color(0xFF6A7C78),
+                                          ),
+                                    ),
+                                    children: teamItems.map((item) {
+                                      return Padding(
+                                        padding: const EdgeInsets.only(
+                                          bottom: 8,
+                                        ),
+                                        child: Container(
+                                          padding: const EdgeInsets.all(12),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFFF4F1EA),
+                                            borderRadius: BorderRadius.circular(
+                                              12,
+                                            ),
+                                            border: Border.all(
+                                              color: const Color(0xFFE1DAD0),
+                                            ),
+                                          ),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                item.team,
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .bodyMedium
+                                                    ?.copyWith(
+                                                      fontWeight:
+                                                          FontWeight.w600,
+                                                      color: const Color(
+                                                        0xFF243B3A,
+                                                      ),
+                                                    ),
+                                              ),
+                                              const SizedBox(height: 6),
+                                              _StatRow(
+                                                label: 'Ramen',
+                                                value: '${item.stats.windows}',
+                                              ),
+                                              const SizedBox(height: 4),
+                                              _StatRow(
+                                                label: 'Schuiframen',
+                                                value: '${item.stats.sliding}',
+                                              ),
+                                              const SizedBox(height: 4),
+                                              _StatRow(
+                                                label: 'Deuren',
+                                                value: '${item.stats.doors}',
+                                              ),
+                                              const SizedBox(height: 4),
+                                              _StatRow(
+                                                label: 'Poorten',
+                                                value: '${item.stats.gates}',
+                                              ),
+                                              const SizedBox(height: 4),
+                                              _StatRow(
+                                                label: 'Afwerking MDF',
+                                                value:
+                                                    '${item.stats.finishMdf}',
+                                              ),
+                                              const SizedBox(height: 4),
+                                              _StatRow(
+                                                label: 'Afwerking PVC',
+                                                value:
+                                                    '${item.stats.finishPvc}',
+                                              ),
+                                              const SizedBox(height: 4),
+                                              _StatRow(
+                                                label: 'Afwerking pleister',
+                                                value:
+                                                    '${item.stats.finishPleister}',
+                                              ),
+                                              const SizedBox(height: 6),
+                                              _StatRow(
+                                                label: 'Extra uren klant',
+                                                value: _formatHours(
+                                                  item.extraHours.chargeable,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              _StatRow(
+                                                label: 'Extra uren intern',
+                                                value: _formatHours(
+                                                  item.extraHours.internal,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      );
+                                    }).toList(),
+                                  ),
+                                ),
+                              ),
+                            );
+                          }),
+                      ],
                     );
-                  }).toList(),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  'Elementen op ${_formatDate(selectedDay)}',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 6),
-                _StatRow(label: 'Ramen', value: '${selectedStats.windows}'),
-                const SizedBox(height: 4),
-                _StatRow(
-                  label: 'Schuiframen',
-                  value: '${selectedStats.sliding}',
-                ),
-                const SizedBox(height: 4),
-                _StatRow(label: 'Deuren', value: '${selectedStats.doors}'),
-                const SizedBox(height: 4),
-                _StatRow(label: 'Poorten', value: '${selectedStats.gates}'),
-                const SizedBox(height: 4),
-                _StatRow(
-                  label: 'Afwerking MDF',
-                  value: '${selectedStats.finishMdf}',
-                ),
-                const SizedBox(height: 4),
-                _StatRow(
-                  label: 'Afwerking PVC',
-                  value: '${selectedStats.finishPvc}',
-                ),
-                const SizedBox(height: 4),
-                _StatRow(
-                  label: 'Afwerking pleister',
-                  value: '${selectedStats.finishPleister}',
+                  },
                 ),
               ],
-            );
-          },
-        ),
-        const SizedBox(height: 16),
-        _InputCard(
-          title: 'Prestaties',
-          children: [
-            _StatRow(
-              label: 'Gemiddelde projecten per week',
-              value: avgPerWeek.toStringAsFixed(1),
-            ),
-            if (canSeeHours) ...[
-              const SizedBox(height: 8),
-              _StatRow(
-                label: 'Geschatte uren (offerte)',
-                value: _formatPrice(totalOfferHours),
+              const SizedBox(height: 16),
+              Builder(
+                builder: (context) {
+                  final weekDays = _weekDays(_weekStart);
+                  final weekStart = weekDays.first;
+                  final weekEnd = weekDays.last;
+                  final projectsByDay = <DateTime, Set<String>>{};
+                  for (final entry in ProjectStore.workLogs.entries) {
+                    final project = entry.key;
+                    for (final log in entry.value) {
+                      final day = _dateOnly(log.date);
+                      if (day.isBefore(weekStart) || day.isAfter(weekEnd)) {
+                        continue;
+                      }
+                      projectsByDay
+                          .putIfAbsent(day, () => <String>{})
+                          .add(project);
+                    }
+                  }
+                  final statsByDay = <DateTime, _PlacementStats>{};
+                  final totalsByDay = <DateTime, int>{};
+                  int maxTotal = 1;
+                  for (final day in weekDays) {
+                    final stats = _placementStatsForProjects(
+                      projectsByDay[day] ?? {},
+                    );
+                    statsByDay[day] = stats;
+                    final total =
+                        stats.windows +
+                        stats.sliding +
+                        stats.doors +
+                        stats.gates +
+                        stats.finishMdf +
+                        stats.finishPvc +
+                        stats.finishPleister;
+                    totalsByDay[day] = total;
+                    if (total > maxTotal) {
+                      maxTotal = total;
+                    }
+                  }
+                  final selectedDay = weekDays.firstWhere(
+                    (day) =>
+                        _selectedWeekDay != null &&
+                        _dateOnly(_selectedWeekDay!) == day,
+                    orElse: () => weekDays.first,
+                  );
+                  final selectedStats =
+                      statsByDay[selectedDay] ?? _placementStatsForProjects({});
+
+                  return _InputCard(
+                    title: 'Weekoverzicht plaatsingen',
+                    children: [
+                      Row(
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.chevron_left),
+                            onPressed: () => setState(() {
+                              _weekStart = _weekStart.subtract(
+                                const Duration(days: 7),
+                              );
+                            }),
+                          ),
+                          Expanded(
+                            child: Text(
+                              '${_formatDate(_weekStart)} - ${_formatDate(_weekStart.add(const Duration(days: 6)))}',
+                              textAlign: TextAlign.center,
+                              style: Theme.of(context).textTheme.bodyMedium
+                                  ?.copyWith(fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.chevron_right),
+                            onPressed: () => setState(() {
+                              _weekStart = _weekStart.add(
+                                const Duration(days: 7),
+                              );
+                            }),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: weekDays.map((day) {
+                          final total = totalsByDay[day] ?? 0;
+                          final height = (total / maxTotal) * 90;
+                          final isSelected = selectedDay == day;
+                          return Expanded(
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(10),
+                              onTap: () => setState(() {
+                                _selectedWeekDay = day;
+                              }),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 6,
+                                  horizontal: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isSelected
+                                      ? const Color(
+                                          0xFF0B2E2B,
+                                        ).withValues(alpha: 0.06)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Column(
+                                  children: [
+                                    SizedBox(
+                                      height: 100,
+                                      child: Align(
+                                        alignment: Alignment.bottomCenter,
+                                        child: Container(
+                                          width: 16,
+                                          height: height,
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF0B2E2B),
+                                            borderRadius: BorderRadius.circular(
+                                              8,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      _weekdayLabel(day),
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: isSelected
+                                                ? const Color(0xFF0B2E2B)
+                                                : const Color(0xFF6A7C78),
+                                            fontWeight: isSelected
+                                                ? FontWeight.w600
+                                                : FontWeight.w400,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        'Elementen op ${_formatDate(selectedDay)}',
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _StatRow(
+                        label: 'Ramen',
+                        value: '${selectedStats.windows}',
+                      ),
+                      const SizedBox(height: 4),
+                      _StatRow(
+                        label: 'Schuiframen',
+                        value: '${selectedStats.sliding}',
+                      ),
+                      const SizedBox(height: 4),
+                      _StatRow(
+                        label: 'Deuren',
+                        value: '${selectedStats.doors}',
+                      ),
+                      const SizedBox(height: 4),
+                      _StatRow(
+                        label: 'Poorten',
+                        value: '${selectedStats.gates}',
+                      ),
+                      const SizedBox(height: 4),
+                      _StatRow(
+                        label: 'Afwerking MDF',
+                        value: '${selectedStats.finishMdf}',
+                      ),
+                      const SizedBox(height: 4),
+                      _StatRow(
+                        label: 'Afwerking PVC',
+                        value: '${selectedStats.finishPvc}',
+                      ),
+                      const SizedBox(height: 4),
+                      _StatRow(
+                        label: 'Afwerking pleister',
+                        value: '${selectedStats.finishPleister}',
+                      ),
+                    ],
+                  );
+                },
               ),
-              const SizedBox(height: 8),
-              _StatRow(
-                label: 'Extra uren',
-                value: _formatPrice(totalExtraHours),
-              ),
-            ],
-            if (canSeePrices) ...[
-              const SizedBox(height: 8),
-              _StatRow(
-                label: 'Gemiddelde kost per plaatsing',
-                value: '€${_formatPrice(avgCost)}',
-              ),
-            ],
-          ],
-        ),
-        if (_isExternal && canSeeHours) ...[
-          const SizedBox(height: 16),
-          _InputCard(
-            title: 'Uren & opbrengst',
-            children: [
-              TextField(
-                controller: _rateController,
-                keyboardType: TextInputType.number,
-                decoration: InputDecoration(
-                  labelText: 'Uurprijs (optioneel)',
-                  filled: true,
-                  fillColor: const Color(0xFFF4F1EA),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                    borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
+              const SizedBox(height: 16),
+              _InputCard(
+                title: 'Prestaties',
+                children: [
+                  _StatRow(
+                    label: 'Gemiddelde projecten per week',
+                    value: avgPerWeek.toStringAsFixed(1),
                   ),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                    borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
-                  ),
+                  if (canSeeHours) ...[
+                    const SizedBox(height: 8),
+                    _StatRow(
+                      label: 'Geschatte uren (offerte)',
+                      value: _formatPrice(totalOfferHours),
+                    ),
+                    const SizedBox(height: 8),
+                    _StatRow(
+                      label: 'Extra uren',
+                      value: _formatPrice(totalExtraHours),
+                    ),
+                  ],
+                  if (canSeePrices) ...[
+                    const SizedBox(height: 8),
+                    _StatRow(
+                      label: 'Gemiddelde kost per plaatsing',
+                      value: '€${_formatPrice(avgCost)}',
+                    ),
+                  ],
+                ],
+              ),
+              if (_isExternal && canSeeHours) ...[
+                const SizedBox(height: 16),
+                _InputCard(
+                  title: 'Uren & opbrengst',
+                  children: [
+                    TextField(
+                      controller: _rateController,
+                      keyboardType: TextInputType.number,
+                      decoration: InputDecoration(
+                        labelText: 'Uurprijs (optioneel)',
+                        filled: true,
+                        fillColor: const Color(0xFFF4F1EA),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: const BorderSide(
+                            color: Color(0xFFE1DAD0),
+                          ),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: const BorderSide(
+                            color: Color(0xFF0B2E2B),
+                          ),
+                        ),
+                      ),
+                      onChanged: (_) => setState(() {}),
+                    ),
+                    const SizedBox(height: 10),
+                    _StatRow(
+                      label: 'Geschatte opbrengst',
+                      value: rate == 0
+                          ? '—'
+                          : '€${_formatPrice(estimatedValue)}',
+                    ),
+                  ],
                 ),
-                onChanged: (_) => setState(() {}),
-              ),
-              const SizedBox(height: 10),
-              _StatRow(
-                label: 'Geschatte opbrengst',
-                value: rate == 0
-                    ? '—'
-                    : '€${_formatPrice(estimatedValue)}',
-              ),
-            ],
-          ),
-        ],
+              ],
             ],
           ),
         ),
@@ -7882,18 +8027,14 @@ class _StatRow extends StatelessWidget {
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         Expanded(
-          child: Text(
-            label,
-            style: Theme.of(context).textTheme.bodyMedium,
-          ),
+          child: Text(label, style: Theme.of(context).textTheme.bodyMedium),
         ),
         const SizedBox(width: 12),
         Text(
           value,
-          style: Theme.of(context)
-              .textTheme
-              .bodyMedium
-              ?.copyWith(fontWeight: FontWeight.w600),
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
         ),
       ],
     );
@@ -7973,10 +8114,7 @@ class _LegendDot extends StatelessWidget {
       return Container(
         width: 8,
         height: 8,
-        decoration: BoxDecoration(
-          color: color,
-          shape: BoxShape.circle,
-        ),
+        decoration: BoxDecoration(color: color, shape: BoxShape.circle),
       );
     }
     return Row(
@@ -7985,18 +8123,14 @@ class _LegendDot extends StatelessWidget {
         Container(
           width: 10,
           height: 10,
-          decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
-          ),
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
         ),
         const SizedBox(width: 6),
         Text(
           text,
-          style: Theme.of(context)
-              .textTheme
-              .bodySmall
-              ?.copyWith(color: const Color(0xFF6A7C78)),
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
         ),
       ],
     );
@@ -8004,9 +8138,7 @@ class _LegendDot extends StatelessWidget {
 }
 
 class _PayrollScreen extends StatefulWidget {
-  const _PayrollScreen({
-    required this.teams,
-  });
+  const _PayrollScreen({required this.teams});
 
   final List<String> teams;
 
@@ -8062,8 +8194,10 @@ class _PayrollScreenState extends State<_PayrollScreen> {
   List<String> _membersForTeam(String team) {
     _RoleManagementStore.seedIfEmpty();
     return _RoleManagementStore.assignments
-        .where((assignment) =>
-            assignment.role == 'Werknemer' && assignment.team == team)
+        .where(
+          (assignment) =>
+              assignment.role == 'Werknemer' && assignment.team == team,
+        )
         .map((assignment) => assignment.name)
         .toList();
   }
@@ -8138,8 +8272,7 @@ class _PayrollScreenState extends State<_PayrollScreen> {
           if (!allWorkers.contains(worker)) continue;
           final hours = minutes / 60;
           actualByWorker[worker] = (actualByWorker[worker] ?? 0) + hours;
-          paidByWorker[worker] =
-              (paidByWorker[worker] ?? 0) + hours * factor;
+          paidByWorker[worker] = (paidByWorker[worker] ?? 0) + hours * factor;
         }
       }
     }
@@ -8183,9 +8316,7 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                           Expanded(
                             child: Text(
                               _formatDate(_selectedDay),
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(fontWeight: FontWeight.w600),
                             ),
                           ),
@@ -8200,7 +8331,9 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                                 lastDate: DateTime(2030),
                               );
                               if (picked != null) {
-                                setState(() => _selectedDay = _dateOnly(picked));
+                                setState(
+                                  () => _selectedDay = _dateOnly(picked),
+                                );
                               }
                             },
                           ),
@@ -8212,25 +8345,25 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                           IconButton(
                             icon: const Icon(Icons.chevron_left),
                             onPressed: () => setState(() {
-                              _weekStart =
-                                  _weekStart.subtract(const Duration(days: 7));
+                              _weekStart = _weekStart.subtract(
+                                const Duration(days: 7),
+                              );
                             }),
                           ),
                           Expanded(
                             child: Text(
                               '${_formatDate(_weekStart)} - ${_formatDate(_weekStart.add(const Duration(days: 6)))}',
                               textAlign: TextAlign.center,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(fontWeight: FontWeight.w600),
                             ),
                           ),
                           IconButton(
                             icon: const Icon(Icons.chevron_right),
                             onPressed: () => setState(() {
-                              _weekStart =
-                                  _weekStart.add(const Duration(days: 7));
+                              _weekStart = _weekStart.add(
+                                const Duration(days: 7),
+                              );
                             }),
                           ),
                         ],
@@ -8252,9 +8385,7 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                             child: Text(
                               '${_monthLabel(_monthStart.month)} ${_monthStart.year}',
                               textAlign: TextAlign.center,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(fontWeight: FontWeight.w600),
                             ),
                           ),
@@ -8283,9 +8414,7 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                         if (workers.isEmpty)
                           Text(
                             'Geen werknemers.',
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodySmall
+                            style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           )
                         else ...[
@@ -8295,10 +8424,10 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                                 flex: 4,
                                 child: Text(
                                   'Werknemer',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodySmall
-                                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: const Color(0xFF6A7C78),
+                                      ),
                                 ),
                               ),
                               Expanded(
@@ -8306,10 +8435,10 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                                 child: Text(
                                   'Gekregen',
                                   textAlign: TextAlign.center,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodySmall
-                                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: const Color(0xFF6A7C78),
+                                      ),
                                 ),
                               ),
                               Expanded(
@@ -8317,10 +8446,10 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                                 child: Text(
                                   'Gepresteerd',
                                   textAlign: TextAlign.center,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodySmall
-                                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: const Color(0xFF6A7C78),
+                                      ),
                                 ),
                               ),
                             ],
@@ -8337,9 +8466,9 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                                     flex: 4,
                                     child: Text(
                                       worker,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodyMedium,
+                                      style: Theme.of(
+                                        context,
+                                      ).textTheme.bodyMedium,
                                     ),
                                   ),
                                   Expanded(
@@ -8347,9 +8476,9 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                                     child: Text(
                                       _formatHours(paid),
                                       textAlign: TextAlign.center,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodyMedium,
+                                      style: Theme.of(
+                                        context,
+                                      ).textTheme.bodyMedium,
                                     ),
                                   ),
                                   Expanded(
@@ -8357,9 +8486,9 @@ class _PayrollScreenState extends State<_PayrollScreen> {
                                     child: Text(
                                       _formatHours(actual),
                                       textAlign: TextAlign.center,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodyMedium,
+                                      style: Theme.of(
+                                        context,
+                                      ).textTheme.bodyMedium,
                                     ),
                                   ),
                                 ],
@@ -8391,7 +8520,6 @@ class _ProjectsTabState extends State<ProjectsTab> {
     super.dispose();
   }
 
-
   List<_ProjectResult> _filteredCustomers() {
     final isExternal = _isExternalRole(CurrentUserStore.role);
     final visibleProjects = isExternal ? _visibleProjects() : null;
@@ -8403,11 +8531,13 @@ class _ProjectsTabState extends State<ProjectsTab> {
       final customers =
           ProjectStore.projectsByGroup[_selectedGroup]?[_selectedStatus] ?? [];
       return customers
-          .map((name) => _ProjectResult(
-                name: name,
-                group: _selectedGroup,
-                status: _selectedStatus,
-              ))
+          .map(
+            (name) => _ProjectResult(
+              name: name,
+              group: _selectedGroup,
+              status: _selectedStatus,
+            ),
+          )
           .toList();
     }
 
@@ -8423,11 +8553,13 @@ class _ProjectsTabState extends State<ProjectsTab> {
         for (final statusEntry in groupEntry.value.entries) {
           for (final name in statusEntry.value) {
             if (name.toLowerCase().contains(query)) {
-              results.add(_ProjectResult(
-                name: name,
-                group: groupEntry.key,
-                status: statusEntry.key,
-              ));
+              results.add(
+                _ProjectResult(
+                  name: name,
+                  group: groupEntry.key,
+                  status: statusEntry.key,
+                ),
+              );
             }
           }
         }
@@ -8461,9 +8593,7 @@ class _ProjectsTabState extends State<ProjectsTab> {
   }
 
   List<_ProjectResult> _visibleByGroup(String group) {
-    return _visibleProjects()
-        .where((item) => item.group == group)
-        .toList()
+    return _visibleProjects().where((item) => item.group == group).toList()
       ..sort((a, b) => a.name.compareTo(b.name));
   }
 
@@ -8472,13 +8602,19 @@ class _ProjectsTabState extends State<ProjectsTab> {
     final isSearching = _searchController.text.trim().isNotEmpty;
     final isExternal = _isExternalRole(CurrentUserStore.role);
     final isWorker = CurrentUserStore.role == 'Werknemer';
-    final isSubcontractor = CurrentUserStore.role == 'Onderaannemer' ||
+    final isSubcontractor =
+        CurrentUserStore.role == 'Onderaannemer' ||
         CurrentUserStore.role == 'Onderaannemer beheerder';
-    final canInvoice = CurrentUserStore.role == 'Onderaannemer' ||
+    final canInvoice =
+        CurrentUserStore.role == 'Onderaannemer' ||
         CurrentUserStore.role == 'Onderaannemer beheerder';
     final hasProjectAction = !isExternal || canInvoice;
-    final filteredResults = isSearching ? _filteredCustomers() : const <_ProjectResult>[];
-    final groupedResults = !isExternal ? const <_ProjectResult>[] : _visibleByGroup(_selectedGroup);
+    final filteredResults = isSearching
+        ? _filteredCustomers()
+        : const <_ProjectResult>[];
+    final groupedResults = !isExternal
+        ? const <_ProjectResult>[]
+        : _visibleByGroup(_selectedGroup);
     return Column(
       key: const ValueKey('projects'),
       children: [
@@ -8508,8 +8644,7 @@ class _ProjectsTabState extends State<ProjectsTab> {
                         label: 'Project +',
                         height: 42,
                         onTap: () async {
-                          final result =
-                              await Navigator.of(context).push<bool>(
+                          final result = await Navigator.of(context).push<bool>(
                             _appPageRoute(
                               builder: (_) => AddProjectScreen(
                                 initialGroup: _selectedGroup,
@@ -8574,16 +8709,16 @@ class _ProjectsTabState extends State<ProjectsTab> {
                         showStatus: !isSubcontractor,
                         onCenterTap: isExternal
                             ? () async {
-                                final changed =
-                                    await Navigator.of(context).push<bool>(
-                                  _appPageRoute(
-                                    builder: (_) => ProjectDetailScreen(
-                                      customerName: result.name,
-                                      group: result.group,
-                                      status: result.status,
-                                    ),
-                                  ),
-                                );
+                                final changed = await Navigator.of(context)
+                                    .push<bool>(
+                                      _appPageRoute(
+                                        builder: (_) => ProjectDetailScreen(
+                                          customerName: result.name,
+                                          group: result.group,
+                                          status: result.status,
+                                        ),
+                                      ),
+                                    );
                                 if (changed == true) {
                                   setState(() {});
                                 }
@@ -8591,16 +8726,16 @@ class _ProjectsTabState extends State<ProjectsTab> {
                             : null,
                         onIconTap: null,
                         onArrowTap: () async {
-                          final changed =
-                              await Navigator.of(context).push<bool>(
-                            _appPageRoute(
-                              builder: (_) => ProjectDetailScreen(
-                                customerName: result.name,
-                                group: result.group,
-                                status: result.status,
-                              ),
-                            ),
-                          );
+                          final changed = await Navigator.of(context)
+                              .push<bool>(
+                                _appPageRoute(
+                                  builder: (_) => ProjectDetailScreen(
+                                    customerName: result.name,
+                                    group: result.group,
+                                    status: result.status,
+                                  ),
+                                ),
+                              );
                           if (changed == true) {
                             setState(() {});
                           }
@@ -8621,17 +8756,20 @@ class _ProjectsTabState extends State<ProjectsTab> {
                       child: _StatusRow(
                         status: status,
                         count:
-                            ProjectStore.projectsByGroup[_selectedGroup]?[status]
-                                    ?.length ??
-                                0,
-                        onTap: () => Navigator.of(context).push(
-                          _appPageRoute(
-                            builder: (_) => StatusDetailScreen(
-                              group: _selectedGroup,
-                              status: status,
-                            ),
-                          ),
-                        ).then((_) => setState(() {})),
+                            ProjectStore
+                                .projectsByGroup[_selectedGroup]?[status]
+                                ?.length ??
+                            0,
+                        onTap: () => Navigator.of(context)
+                            .push(
+                              _appPageRoute(
+                                builder: (_) => StatusDetailScreen(
+                                  group: _selectedGroup,
+                                  status: status,
+                                ),
+                              ),
+                            )
+                            .then((_) => setState(() {})),
                       ),
                     );
                   },
@@ -8656,32 +8794,32 @@ class _ProjectsTabState extends State<ProjectsTab> {
                         compact: isWorker,
                         showStatus: !isSubcontractor,
                         onCenterTap: () async {
-                          final changed =
-                              await Navigator.of(context).push<bool>(
-                            _appPageRoute(
-                              builder: (_) => ProjectDetailScreen(
-                                customerName: result.name,
-                                group: result.group,
-                                status: result.status,
-                              ),
-                            ),
-                          );
+                          final changed = await Navigator.of(context)
+                              .push<bool>(
+                                _appPageRoute(
+                                  builder: (_) => ProjectDetailScreen(
+                                    customerName: result.name,
+                                    group: result.group,
+                                    status: result.status,
+                                  ),
+                                ),
+                              );
                           if (changed == true) {
                             setState(() {});
                           }
                         },
                         onIconTap: null,
                         onArrowTap: () async {
-                          final changed =
-                              await Navigator.of(context).push<bool>(
-                            _appPageRoute(
-                              builder: (_) => ProjectDetailScreen(
-                                customerName: result.name,
-                                group: result.group,
-                                status: result.status,
-                              ),
-                            ),
-                          );
+                          final changed = await Navigator.of(context)
+                              .push<bool>(
+                                _appPageRoute(
+                                  builder: (_) => ProjectDetailScreen(
+                                    customerName: result.name,
+                                    group: result.group,
+                                    status: result.status,
+                                  ),
+                                ),
+                              );
                           if (changed == true) {
                             setState(() {});
                           }
@@ -8706,9 +8844,7 @@ class _ProjectsTabState extends State<ProjectsTab> {
 }
 
 class _InvoiceScreen extends StatefulWidget {
-  const _InvoiceScreen({
-    required this.teamNames,
-  });
+  const _InvoiceScreen({required this.teamNames});
 
   final List<String> teamNames;
 
@@ -8801,9 +8937,9 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
     record.extraHoursBilled = item.extraHoursTotal;
     AppDataStore.scheduleSave();
     setState(() {});
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Facturatie goedgekeurd')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Facturatie goedgekeurd')));
   }
 
   @override
@@ -8839,10 +8975,9 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                     subtitle: 'Er zijn geen projecten om te factureren.',
                   )
                 else
-                  ...items.map(
-                    (item) {
-                      final offerTotal = _offerPriceTotal(item.offerLines);
-                      return Padding(
+                  ...items.map((item) {
+                    final offerTotal = _offerPriceTotal(item.offerLines);
+                    return Padding(
                       padding: const EdgeInsets.only(bottom: 12),
                       child: Container(
                         decoration: BoxDecoration(
@@ -8851,23 +8986,26 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                           border: Border.all(color: const Color(0xFFE1DAD0)),
                         ),
                         child: Theme(
-                          data: Theme.of(context)
-                              .copyWith(dividerColor: Colors.transparent),
+                          data: Theme.of(
+                            context,
+                          ).copyWith(dividerColor: Colors.transparent),
                           child: ExpansionTile(
                             tilePadding: const EdgeInsets.symmetric(
                               horizontal: 16,
                               vertical: 8,
                             ),
-                            childrenPadding:
-                                const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                            childrenPadding: const EdgeInsets.fromLTRB(
+                              16,
+                              0,
+                              16,
+                              16,
+                            ),
                             title: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
                                   item.name,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodyMedium
+                                  style: Theme.of(context).textTheme.bodyMedium
                                       ?.copyWith(
                                         fontWeight: FontWeight.w600,
                                         color: const Color(0xFF243B3A),
@@ -8876,9 +9014,7 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                                 const SizedBox(height: 4),
                                 Text(
                                   '${item.group} · ${item.isBackorder ? 'Nabestelling' : item.status}',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodySmall
+                                  style: Theme.of(context).textTheme.bodySmall
                                       ?.copyWith(
                                         color: const Color(0xFF6A7C78),
                                       ),
@@ -8887,9 +9023,7 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                                   const SizedBox(height: 4),
                                   Text(
                                     'Te factureren: ${_formatPrice((item.includeOffer ? item.offerHours : 0) + item.extraHoursDelta)} uur',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall
+                                    style: Theme.of(context).textTheme.bodySmall
                                         ?.copyWith(
                                           color: const Color(0xFF6A7C78),
                                         ),
@@ -8905,155 +9039,152 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                               onPressed: () => _approveInvoice(item),
                             ),
                             children: [
-                              if (item.includeOffer && item.offerLines.isNotEmpty)
-                                ...[
-                                  Align(
-                                    alignment: Alignment.centerLeft,
-                                    child: Text(
-                                      'Offerte',
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodyMedium
-                                          ?.copyWith(
-                                              fontWeight: FontWeight.w600),
-                                    ),
+                              if (item.includeOffer &&
+                                  item.offerLines.isNotEmpty) ...[
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    'Offerte',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(fontWeight: FontWeight.w600),
                                   ),
-                                  const SizedBox(height: 8),
-                                  ...(() {
-                                    final grouped =
-                                        <String, List<OfferLine>>{};
-                                    for (final line in item.offerLines) {
-                                      grouped
-                                          .putIfAbsent(line.category, () => [])
-                                          .add(line);
-                                    }
-                                    Widget cell(
-                                      String value, {
-                                      bool header = false,
-                                      TextAlign align = TextAlign.left,
-                                    }) {
-                                      return Padding(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 8,
-                                          vertical: 6,
-                                        ),
-                                        child: Text(
-                                          value,
-                                          textAlign: align,
-                                          maxLines: 2,
-                                          style: header
-                                              ? Theme.of(context)
-                                                  .textTheme
-                                                  .bodySmall
-                                                  ?.copyWith(
-                                                    fontWeight: FontWeight.w600,
-                                                    color:
-                                                        const Color(0xFF243B3A),
-                                                  )
-                                              : Theme.of(context)
-                                                  .textTheme
-                                                  .bodySmall
-                                                  ?.copyWith(
-                                                    color:
-                                                        const Color(0xFF6A7C78),
-                                                  ),
-                                        ),
-                                      );
-                                    }
-
-                                    TableRow headerRow() {
-                                      return TableRow(
-                                        decoration: const BoxDecoration(
-                                          color: Color(0xFFF4F1EA),
-                                        ),
-                                        children: [
-                                          cell('Omschrijving', header: true),
-                                          cell(
-                                            'Aantal',
-                                            header: true,
-                                            align: TextAlign.right,
-                                          ),
-                                          cell(
-                                            'Eenheid',
-                                            header: true,
-                                            align: TextAlign.right,
-                                          ),
-                                          if (canSeePrices)
-                                            cell(
-                                              'Prijs per eenheid',
-                                              header: true,
-                                              align: TextAlign.right,
-                                            ),
-                                        ],
-                                      );
-                                    }
-
-                                    return grouped.entries.expand((entry) sync* {
-                                      yield Align(
-                                        alignment: Alignment.centerLeft,
-                                        child: Text(
-                                          entry.key,
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .bodySmall
-                                              ?.copyWith(
+                                ),
+                                const SizedBox(height: 8),
+                                ...(() {
+                                  final grouped = <String, List<OfferLine>>{};
+                                  for (final line in item.offerLines) {
+                                    grouped
+                                        .putIfAbsent(line.category, () => [])
+                                        .add(line);
+                                  }
+                                  Widget cell(
+                                    String value, {
+                                    bool header = false,
+                                    TextAlign align = TextAlign.left,
+                                  }) {
+                                    return Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 6,
+                                      ),
+                                      child: Text(
+                                        value,
+                                        textAlign: align,
+                                        maxLines: 2,
+                                        style: header
+                                            ? Theme.of(
+                                                context,
+                                              ).textTheme.bodySmall?.copyWith(
                                                 fontWeight: FontWeight.w600,
+                                                color: const Color(0xFF243B3A),
+                                              )
+                                            : Theme.of(
+                                                context,
+                                              ).textTheme.bodySmall?.copyWith(
+                                                color: const Color(0xFF6A7C78),
                                               ),
+                                      ),
+                                    );
+                                  }
+
+                                  TableRow headerRow() {
+                                    return TableRow(
+                                      decoration: const BoxDecoration(
+                                        color: Color(0xFFF4F1EA),
+                                      ),
+                                      children: [
+                                        cell('Omschrijving', header: true),
+                                        cell(
+                                          'Aantal',
+                                          header: true,
+                                          align: TextAlign.right,
                                         ),
-                                      );
-                                      yield const SizedBox(height: 6);
-                                      yield Container(
-                                        decoration: BoxDecoration(
-                                          borderRadius:
-                                              BorderRadius.circular(12),
-                                          border: Border.all(
-                                            color: const Color(0xFFE1DAD0),
+                                        cell(
+                                          'Eenheid',
+                                          header: true,
+                                          align: TextAlign.right,
+                                        ),
+                                        if (canSeePrices)
+                                          cell(
+                                            'Prijs per eenheid',
+                                            header: true,
+                                            align: TextAlign.right,
                                           ),
+                                      ],
+                                    );
+                                  }
+
+                                  return grouped.entries.expand((entry) sync* {
+                                    yield Align(
+                                      alignment: Alignment.centerLeft,
+                                      child: Text(
+                                        entry.key,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodySmall
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                      ),
+                                    );
+                                    yield const SizedBox(height: 6);
+                                    yield Container(
+                                      decoration: BoxDecoration(
+                                        borderRadius: BorderRadius.circular(12),
+                                        border: Border.all(
+                                          color: const Color(0xFFE1DAD0),
                                         ),
-                                        child: Table(
-                                          columnWidths: {
-                                            0: const FlexColumnWidth(2.2),
-                                            1: const FlexColumnWidth(1.3),
-                                            2: const FlexColumnWidth(1.3),
-                                            if (canSeePrices)
-                                              3: const FlexColumnWidth(1.6),
-                                          },
-                                          children: [
-                                            headerRow(),
-                                            ...entry.value.map((line) {
-                                              final offerItem =
-                                                  OfferCatalogStore.findItem(
-                                                line.category,
-                                                line.item,
-                                              );
-                                              final unit =
-                                                  offerItem?.unit ?? '';
-                                              final price = offerItem == null ||
-                                                      !canSeePrices
-                                                  ? ''
-                                                  : '€${_formatPrice(offerItem.price)}';
-                                              return TableRow(
-                                                children: [
-                                                  cell(line.item),
+                                      ),
+                                      child: Table(
+                                        columnWidths: {
+                                          0: const FlexColumnWidth(2.2),
+                                          1: const FlexColumnWidth(1.3),
+                                          2: const FlexColumnWidth(1.3),
+                                          if (canSeePrices)
+                                            3: const FlexColumnWidth(1.6),
+                                        },
+                                        children: [
+                                          headerRow(),
+                                          ...entry.value.map((line) {
+                                            final offerItem =
+                                                OfferCatalogStore.findItem(
+                                                  line.category,
+                                                  line.item,
+                                                );
+                                            final unit = offerItem?.unit ?? '';
+                                            final price =
+                                                offerItem == null ||
+                                                    !canSeePrices
+                                                ? ''
+                                                : '€${_formatPrice(offerItem.price)}';
+                                            return TableRow(
+                                              children: [
+                                                cell(line.item),
+                                                cell(
+                                                  '${line.quantity}',
+                                                  align: TextAlign.right,
+                                                ),
+                                                cell(
+                                                  unit,
+                                                  align: TextAlign.right,
+                                                ),
+                                                if (canSeePrices)
                                                   cell(
-                                                    '${line.quantity}',
+                                                    price,
                                                     align: TextAlign.right,
                                                   ),
-                                                  cell(unit,
-                                                      align: TextAlign.right),
-                                                  if (canSeePrices)
-                                                    cell(price,
-                                                        align: TextAlign.right),
-                                                ],
-                                              );
-                                            }),
-                                          ],
-                                        ),
-                                      );
-                                      yield const SizedBox(height: 10);
-                                    }).toList();
-                                  })(),
-                                ],
+                                              ],
+                                            );
+                                          }),
+                                        ],
+                                      ),
+                                    );
+                                    yield const SizedBox(height: 10);
+                                  }).toList();
+                                })(),
+                              ],
                               if (item.includeOffer &&
                                   item.offerLines.isNotEmpty &&
                                   canSeePrices) ...[
@@ -9076,9 +9207,7 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                                   canSeeHours
                                       ? 'Extra uren: ${_formatPrice(item.extraHoursDelta)}'
                                       : 'Extra uren geregistreerd',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodyMedium
+                                  style: Theme.of(context).textTheme.bodyMedium
                                       ?.copyWith(fontWeight: FontWeight.w600),
                                 ),
                               ),
@@ -9087,8 +9216,7 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                         ),
                       ),
                     );
-                    },
-                  ),
+                  }),
               ],
             ),
           ),
@@ -9119,6 +9247,7 @@ class _ProfileTabState extends State<ProfileTab> {
   final List<DocumentEntry> _documents = [];
   bool _showDocumentForm = false;
   String _profileName = 'Liam Vermeulen';
+  String _companyKey = '';
   PlatformFile? _profilePhoto;
   DateTime? _leaveFrom;
   DateTime? _leaveTo;
@@ -9127,6 +9256,15 @@ class _ProfileTabState extends State<ProfileTab> {
       TextEditingController();
   DateTime? _docExpiry;
   PlatformFile? _docFile;
+
+  Future<void> _logout() async {
+    await LocalSecretsStore.clearNetlifySession(email: widget.account.email);
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      _appPageRoute(builder: (_) => const LoginScreen()),
+      (route) => false,
+    );
+  }
 
   @override
   void dispose() {
@@ -9139,10 +9277,13 @@ class _ProfileTabState extends State<ProfileTab> {
   void initState() {
     super.initState();
     _profileName = widget.account.name;
+    _companyKey = AuthStore._companyKey(widget.account.company);
     _RoleManagementStore.seedIfEmpty();
     _documents.clear();
     _documents.addAll(ProfileDocumentStore.forUser(_profileName));
   }
+
+  CompanyProfile? _activeCompanyProfile() => AuthStore.companies[_companyKey];
 
   Future<void> _pickDocumentFile() async {
     final result = await FilePicker.platform.pickFiles(
@@ -9155,7 +9296,10 @@ class _ProfileTabState extends State<ProfileTab> {
     });
   }
 
-  Future<void> _pickDate(BuildContext context, ValueChanged<DateTime> onPick) async {
+  Future<void> _pickDate(
+    BuildContext context,
+    ValueChanged<DateTime> onPick,
+  ) async {
     final picked = await showDatePicker(
       context: context,
       firstDate: DateTime(2024, 1, 1),
@@ -9175,11 +9319,7 @@ class _ProfileTabState extends State<ProfileTab> {
     }
     setState(() {
       _documents.add(
-        DocumentEntry(
-          description: desc,
-          expiry: _docExpiry!,
-          file: _docFile!,
-        ),
+        DocumentEntry(description: desc, expiry: _docExpiry!, file: _docFile!),
       );
       ProfileDocumentStore.setForUser(
         _profileName,
@@ -9226,7 +9366,6 @@ class _ProfileTabState extends State<ProfileTab> {
         return 'Nog goed te keuren';
     }
   }
-
 
   Future<void> _openRolesManagement() async {
     await Navigator.of(context).push<List<_RoleAssignment>>(
@@ -9357,6 +9496,195 @@ class _ProfileTabState extends State<ProfileTab> {
     );
   }
 
+  Future<void> _editCompanyProfile() async {
+    final profile = _activeCompanyProfile();
+    if (profile == null) return;
+    final companyNameController = TextEditingController(text: profile.name);
+    final businessNumberController = TextEditingController(
+      text: profile.businessNumber,
+    );
+    final streetController = TextEditingController(text: profile.street);
+    final houseNumberController = TextEditingController(
+      text: profile.houseNumber,
+    );
+    final boxController = TextEditingController(text: profile.box ?? '');
+    final postalCodeController = TextEditingController(
+      text: profile.postalCode,
+    );
+    final cityController = TextEditingController(text: profile.city);
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) {
+        return Padding(
+          padding: EdgeInsets.fromLTRB(
+            20,
+            20,
+            20,
+            20 + MediaQuery.of(context).viewInsets.bottom,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Bedrijfsgegevens bewerken',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 12),
+                _EditableInputField(
+                  label: 'Bedrijfsnaam',
+                  hint: 'Bedrijfsnaam',
+                  icon: Icons.business_outlined,
+                  controller: companyNameController,
+                ),
+                const SizedBox(height: 10),
+                _EditableInputField(
+                  label: 'Bedrijfsnummer',
+                  hint: 'BE0123456789',
+                  icon: Icons.badge_outlined,
+                  controller: businessNumberController,
+                ),
+                const SizedBox(height: 10),
+                _EditableInputField(
+                  label: 'Straat',
+                  hint: 'Straat',
+                  icon: Icons.location_on_outlined,
+                  controller: streetController,
+                ),
+                const SizedBox(height: 10),
+                _EditableInputField(
+                  label: 'Huisnummer',
+                  hint: 'Huisnummer',
+                  icon: Icons.home_outlined,
+                  controller: houseNumberController,
+                ),
+                const SizedBox(height: 10),
+                _EditableInputField(
+                  label: 'Bus (optioneel)',
+                  hint: 'Bus (optioneel)',
+                  icon: Icons.apartment_outlined,
+                  controller: boxController,
+                ),
+                const SizedBox(height: 10),
+                _EditableInputField(
+                  label: 'Postcode',
+                  hint: 'Postcode',
+                  icon: Icons.pin_drop_outlined,
+                  keyboardType: TextInputType.number,
+                  controller: postalCodeController,
+                ),
+                const SizedBox(height: 10),
+                _EditableInputField(
+                  label: 'Gemeente',
+                  hint: 'Gemeente',
+                  icon: Icons.location_city_outlined,
+                  controller: cityController,
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _SecondaryButton(
+                        label: 'Annuleer',
+                        onTap: () => Navigator.of(context).pop(),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _PrimaryButton(
+                        label: 'Opslaan',
+                        onTap: () {
+                          final companyName = companyNameController.text.trim();
+                          final businessNumber =
+                              AuthStore._normalizeBusinessNumber(
+                                businessNumberController.text,
+                              );
+                          final street = streetController.text.trim();
+                          final houseNumber = houseNumberController.text.trim();
+                          final box = boxController.text.trim();
+                          final postalCode = postalCodeController.text.trim();
+                          final city = cityController.text.trim();
+                          if (companyName.isEmpty ||
+                              businessNumber.isEmpty ||
+                              street.isEmpty ||
+                              houseNumber.isEmpty ||
+                              postalCode.isEmpty ||
+                              city.isEmpty) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Vul alle verplichte velden in.'),
+                              ),
+                            );
+                            return;
+                          }
+                          final oldCompanyName = profile.name;
+                          final oldCompanyKey = AuthStore._companyKey(
+                            oldCompanyName,
+                          );
+                          final newCompanyKey = AuthStore._companyKey(
+                            companyName,
+                          );
+                          final updatedProfile = CompanyProfile(
+                            name: companyName,
+                            businessNumber: businessNumber,
+                            street: street,
+                            houseNumber: houseNumber,
+                            box: box.isEmpty ? null : box,
+                            postalCode: postalCode,
+                            city: city,
+                            adminName: profile.adminName,
+                            adminEmail: profile.adminEmail,
+                            createdAt: profile.createdAt,
+                          );
+                          setState(() {
+                            if (oldCompanyKey != newCompanyKey) {
+                              AuthStore.companies.remove(oldCompanyKey);
+                            }
+                            AuthStore.companies[newCompanyKey] = updatedProfile;
+                            _companyKey = newCompanyKey;
+                            for (var i = 0; i < AuthStore.users.length; i++) {
+                              final user = AuthStore.users[i];
+                              if (AuthStore._companyKey(user.company) ==
+                                  oldCompanyKey) {
+                                AuthStore.users[i] = AuthUser(
+                                  name: user.name,
+                                  email: user.email,
+                                  company: companyName,
+                                  passwordHash: user.passwordHash,
+                                  passwordSalt: user.passwordSalt,
+                                  role: user.role,
+                                  team: user.team,
+                                );
+                              }
+                            }
+                            if (AuthStore._companyKey(
+                                  CurrentUserStore.company,
+                                ) ==
+                                oldCompanyKey) {
+                              CurrentUserStore.company = companyName;
+                            }
+                          });
+                          AppDataStore.scheduleSave();
+                          Navigator.of(context).pop();
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   int _countForGroup(String group, List<String> statuses) {
     final groupMap = ProjectStore.projectsByGroup[group];
     if (groupMap == null) return 0;
@@ -9384,10 +9712,12 @@ class _ProfileTabState extends State<ProfileTab> {
 
   @override
   Widget build(BuildContext context) {
-    final canManageRoles = widget.account.role == 'Beheerder' ||
+    final canManageRoles =
+        widget.account.role == 'Beheerder' ||
         widget.account.role == 'Onderaannemer' ||
         widget.account.role == 'Onderaannemer beheerder';
-    final canManageOffers = widget.account.role == 'Beheerder' ||
+    final canManageOffers =
+        widget.account.role == 'Beheerder' ||
         widget.account.role == 'Onderaannemer' ||
         widget.account.role == 'Onderaannemer beheerder';
     final isWorkerProfile = widget.account.role == 'Werknemer';
@@ -9407,52 +9737,44 @@ class _ProfileTabState extends State<ProfileTab> {
     }
     final openOrders = isWorkerProfile
         ? 0
-        : _countForGroup(
-            'Klanten',
-            const ['In opmaak', 'In bestelling', 'Geleverd'],
-          );
+        : _countForGroup('Klanten', const [
+            'In opmaak',
+            'In bestelling',
+            'Geleverd',
+          ]);
     final plannedProjects = isWorkerProfile
-        ? _countForGroupForProjects(
-              'Klanten',
-              const ['Ingepland'],
-              workerProjects,
-            ) +
-            _countForGroupForProjects(
-              'Nabestellingen',
-              const ['Ingepland'],
-              workerProjects,
-            )
-        : _countForGroup(
-              'Klanten',
-              const ['Ingepland'],
-            ) +
-            _countForGroup('Nabestellingen', const ['Ingepland']);
+        ? _countForGroupForProjects('Klanten', const [
+                'Ingepland',
+              ], workerProjects) +
+              _countForGroupForProjects('Nabestellingen', const [
+                'Ingepland',
+              ], workerProjects)
+        : _countForGroup('Klanten', const ['Ingepland']) +
+              _countForGroup('Nabestellingen', const ['Ingepland']);
     final backorders = isWorkerProfile
         ? 0
-        : _countForGroup(
-            'Nabestellingen',
-            const ['In opmaak', 'In bestelling', 'Geleverd'],
-          );
+        : _countForGroup('Nabestellingen', const [
+            'In opmaak',
+            'In bestelling',
+            'Geleverd',
+          ]);
     final completedProjects = isWorkerProfile
-        ? _countForGroupForProjects(
-              'Klanten',
-              const ['Afgewerkt'],
-              workerProjects,
-            ) +
-            _countForGroupForProjects(
-              'Nabestellingen',
-              const ['Afgewerkt'],
-              workerProjects,
-            )
-        : _countForGroup(
-              'Klanten',
-              const ['Afgewerkt'],
-            ) +
-            _countForGroup('Nabestellingen', const ['Afgewerkt']);
-    final myRequests = LeaveRequestStore.requests
-        .where((request) => request.requester == _profileName)
-        .toList()
-      ..sort((a, b) => b.from.compareTo(a.from));
+        ? _countForGroupForProjects('Klanten', const [
+                'Afgewerkt',
+              ], workerProjects) +
+              _countForGroupForProjects('Nabestellingen', const [
+                'Afgewerkt',
+              ], workerProjects)
+        : _countForGroup('Klanten', const ['Afgewerkt']) +
+              _countForGroup('Nabestellingen', const ['Afgewerkt']);
+    final myRequests =
+        LeaveRequestStore.requests
+            .where((request) => request.requester == _profileName)
+            .toList()
+          ..sort((a, b) => b.from.compareTo(a.from));
+    final companyProfile = _activeCompanyProfile();
+    final canEditCompanyProfile =
+        widget.account.role == 'Beheerder' && companyProfile != null;
 
     final content = <Widget>[];
     if (_tabIndex == 0) {
@@ -9463,6 +9785,29 @@ class _ProfileTabState extends State<ProfileTab> {
           photo: _profilePhoto,
           onEdit: _editProfile,
         ),
+        if (companyProfile != null) ...[
+          const SizedBox(height: 12),
+          _InputCard(
+            title: 'Bedrijfsgegevens',
+            headerTrailing: canEditCompanyProfile
+                ? IconButton(
+                    onPressed: _editCompanyProfile,
+                    icon: const Icon(Icons.edit_outlined),
+                    tooltip: 'Bedrijfsgegevens bewerken',
+                  )
+                : null,
+            children: [
+              _InfoRow(label: 'Bedrijfsnaam', value: companyProfile.name),
+              const SizedBox(height: 6),
+              _InfoRow(
+                label: 'Bedrijfsnummer',
+                value: companyProfile.businessNumber,
+              ),
+              const SizedBox(height: 6),
+              _InfoRow(label: 'Adres', value: companyProfile.formattedAddress),
+            ],
+          ),
+        ],
         const SizedBox(height: 12),
         _StatsGrid(
           items: [
@@ -9492,28 +9837,14 @@ class _ProfileTabState extends State<ProfileTab> {
         ),
         const SizedBox(height: 12),
         if (canManageRoles) ...[
-          _PrimaryButton(
-            label: 'Rollenbeheer',
-            onTap: _openRolesManagement,
-          ),
+          _PrimaryButton(label: 'Rollenbeheer', onTap: _openRolesManagement),
           const SizedBox(height: 12),
         ],
         if (canManageOffers) ...[
-          _PrimaryButton(
-            label: 'Offertebeheer',
-            onTap: _openOfferManagement,
-          ),
+          _PrimaryButton(label: 'Offertebeheer', onTap: _openOfferManagement),
           const SizedBox(height: 12),
         ],
-        _DangerButton(
-          label: 'Uitloggen',
-          onTap: () => Navigator.of(context).pushAndRemoveUntil(
-            _appPageRoute(
-              builder: (_) => const LoginScreen(),
-            ),
-            (route) => false,
-          ),
-        ),
+        _DangerButton(label: 'Uitloggen', onTap: _logout),
       ]);
     } else if (_tabIndex == 1) {
       content.addAll([
@@ -9560,10 +9891,7 @@ class _ProfileTabState extends State<ProfileTab> {
                 onAdd: _pickDocumentFile,
               ),
               const SizedBox(height: 12),
-              _PrimaryButton(
-                label: 'Document opslaan',
-                onTap: _addDocument,
-              ),
+              _PrimaryButton(label: 'Document opslaan', onTap: _addDocument),
             ],
           ],
         ),
@@ -9571,10 +9899,9 @@ class _ProfileTabState extends State<ProfileTab> {
         if (_documents.isEmpty)
           Text(
             'Nog geen documenten toegevoegd.',
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF6A7C78)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
           )
         else
           ..._documents.map(
@@ -9606,13 +9933,9 @@ class _ProfileTabState extends State<ProfileTab> {
                         context: context,
                         firstDate: DateTime(2024, 1, 1),
                         lastDate: DateTime(2030, 12, 31),
-                        initialDateRange:
-                            _leaveFrom != null && _leaveTo != null
-                                ? DateTimeRange(
-                                    start: _leaveFrom!,
-                                    end: _leaveTo!,
-                                  )
-                                : null,
+                        initialDateRange: _leaveFrom != null && _leaveTo != null
+                            ? DateTimeRange(start: _leaveFrom!, end: _leaveTo!)
+                            : null,
                       );
                       if (range == null) return;
                       setState(() {
@@ -9696,10 +10019,9 @@ class _ProfileTabState extends State<ProfileTab> {
             if (myRequests.isEmpty)
               Text(
                 'Nog geen aanvragen.',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodyMedium
-                    ?.copyWith(color: const Color(0xFF6A7C78)),
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFF6A7C78),
+                ),
               )
             else
               ...myRequests.map(
@@ -9717,17 +10039,13 @@ class _ProfileTabState extends State<ProfileTab> {
                       children: [
                         Text(
                           '${_formatDate(request.from)} - ${_formatDate(request.to)}',
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodyMedium
+                          style: Theme.of(context).textTheme.bodyMedium
                               ?.copyWith(fontWeight: FontWeight.w600),
                         ),
                         const SizedBox(height: 4),
                         Text(
                           _leaveStatusLabel(request.status),
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall
+                          style: Theme.of(context).textTheme.bodySmall
                               ?.copyWith(color: const Color(0xFF6A7C78)),
                         ),
                         if (request.reason.isNotEmpty) ...[
@@ -9752,17 +10070,10 @@ class _ProfileTabState extends State<ProfileTab> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _SectionHeader(
-                title: 'Persoonlijk',
-                subtitle: '',
-              ),
+              _SectionHeader(title: 'Persoonlijk', subtitle: ''),
               const SizedBox(height: 12),
               _ProfileTabSwitch(
-                labels: const [
-                  'Gegevens',
-                  'Documenten',
-                  'Verlof',
-                ],
+                labels: const ['Gegevens', 'Documenten', 'Verlof'],
                 selectedIndex: _tabIndex,
                 onSelect: (index) => setState(() => _tabIndex = index),
               ),
@@ -9772,10 +10083,7 @@ class _ProfileTabState extends State<ProfileTab> {
         Expanded(
           child: ListView(
             padding: const EdgeInsets.fromLTRB(20, 0, 20, 100),
-            children: [
-              const SizedBox(height: 16),
-              ...content,
-            ],
+            children: [const SizedBox(height: 16), ...content],
           ),
         ),
       ],
@@ -9799,12 +10107,46 @@ class _SectionHeader extends StatelessWidget {
           const SizedBox(height: 4),
           Text(
             subtitle,
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF5A6F6C)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF5A6F6C)),
           ),
         ],
+      ],
+    );
+  }
+}
+
+class _InfoRow extends StatelessWidget {
+  const _InfoRow({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 120,
+          child: Text(
+            label,
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            value,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: const Color(0xFF0B2E2B),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -9839,8 +10181,9 @@ class _ProfileTabSwitch extends StatelessWidget {
                 duration: const Duration(milliseconds: 200),
                 padding: const EdgeInsets.symmetric(vertical: 10),
                 decoration: BoxDecoration(
-                  color:
-                      isSelected ? const Color(0xFF0B2E2B) : Colors.transparent,
+                  color: isSelected
+                      ? const Color(0xFF0B2E2B)
+                      : Colors.transparent,
                   borderRadius: BorderRadius.circular(14),
                 ),
                 child: Center(
@@ -9848,11 +10191,11 @@ class _ProfileTabSwitch extends StatelessWidget {
                     labels[index],
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          color: isSelected
-                              ? const Color(0xFFFFE9CC)
-                              : const Color(0xFF4B6763),
-                        ),
+                      fontWeight: FontWeight.w600,
+                      color: isSelected
+                          ? const Color(0xFFFFE9CC)
+                          : const Color(0xFF4B6763),
+                    ),
                   ),
                 ),
               ),
@@ -9863,7 +10206,6 @@ class _ProfileTabSwitch extends StatelessWidget {
     );
   }
 }
-
 
 String _profileRoleLabel(TestAccount account) {
   if (account.team != null && account.team!.isNotEmpty) {
@@ -9898,16 +10240,6 @@ class _RoleManagementStore {
     DateTime.thursday,
     DateTime.friday,
   };
-  // ignore: unused_field
-  static const Set<int> _saturdayWorkingDays = {
-    DateTime.monday,
-    DateTime.tuesday,
-    DateTime.wednesday,
-    DateTime.thursday,
-    DateTime.friday,
-    DateTime.saturday,
-  };
-
   static void seedIfEmpty() {
     return;
   }
@@ -9943,6 +10275,97 @@ class ProfileDocumentStore {
   }
 }
 
+class InvitationCodeEntry {
+  InvitationCodeEntry({
+    required this.code,
+    required this.email,
+    required this.name,
+    required this.role,
+    required this.company,
+    required this.invitedBy,
+    required this.expiresAt,
+    this.contractor,
+    this.team,
+    this.used = false,
+    DateTime? createdAt,
+  }) : createdAt = createdAt ?? DateTime.now();
+
+  final String code;
+  final String email;
+  final String name;
+  final String role;
+  final String company;
+  final String invitedBy;
+  final DateTime createdAt;
+  final DateTime expiresAt;
+  final String? contractor;
+  final String? team;
+  bool used;
+}
+
+class InvitationCodeStore {
+  static final List<InvitationCodeEntry> entries = [];
+
+  static String generateCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    final random = Random.secure();
+    return List.generate(8, (_) => chars[random.nextInt(chars.length)]).join();
+  }
+
+  static InvitationCodeEntry create({
+    required String email,
+    required String name,
+    required String role,
+    required String company,
+    required String invitedBy,
+    String? contractor,
+    String? team,
+    Duration validFor = const Duration(hours: 24),
+  }) {
+    final normalizedEmail = email.trim().toLowerCase();
+    entries.removeWhere(
+      (entry) => entry.email == normalizedEmail && !entry.used,
+    );
+    final entry = InvitationCodeEntry(
+      code: generateCode(),
+      email: normalizedEmail,
+      name: name.trim(),
+      role: role.trim(),
+      company: company.trim(),
+      invitedBy: invitedBy.trim(),
+      contractor: contractor?.trim().isEmpty == true
+          ? null
+          : contractor?.trim(),
+      team: team?.trim().isEmpty == true ? null : team?.trim(),
+      expiresAt: DateTime.now().add(validFor),
+    );
+    entries.add(entry);
+    AppDataStore.scheduleSave();
+    return entry;
+  }
+
+  static InvitationCodeEntry? validate({
+    required String email,
+    required String code,
+  }) {
+    final normalizedEmail = email.trim().toLowerCase();
+    final normalizedCode = code.trim().toUpperCase();
+    for (final entry in entries.reversed) {
+      if (entry.email != normalizedEmail) continue;
+      if (entry.code.toUpperCase() != normalizedCode) continue;
+      if (entry.used) return null;
+      if (DateTime.now().isAfter(entry.expiresAt)) return null;
+      return entry;
+    }
+    return null;
+  }
+
+  static void markUsed(InvitationCodeEntry entry) {
+    entry.used = true;
+    AppDataStore.scheduleSave();
+  }
+}
+
 class _TeamAssignment {
   _TeamAssignment({
     required this.name,
@@ -9956,19 +10379,28 @@ class _TeamAssignment {
 }
 
 class _UndoAction {
-  _UndoAction({
-    required this.assignments,
-    required this.teams,
-  });
+  _UndoAction({required this.assignments, required this.teams});
 
   final List<_RoleAssignment> assignments;
   final List<_TeamAssignment> teams;
 }
 
+class _InviteManagerInput {
+  _InviteManagerInput()
+    : nameController = TextEditingController(),
+      emailController = TextEditingController();
+
+  final TextEditingController nameController;
+  final TextEditingController emailController;
+
+  void dispose() {
+    nameController.dispose();
+    emailController.dispose();
+  }
+}
+
 class _RolesManagementScreen extends StatefulWidget {
   const _RolesManagementScreen({
-    // ignore: unused_element_parameter
-    super.key,
     required this.assignments,
     required this.currentAccount,
   });
@@ -9992,6 +10424,7 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
   late final bool _isContractor;
   bool _showInvite = false;
   _UndoAction? _lastUndo;
+  final List<_InviteManagerInput> _managerInputs = [_InviteManagerInput()];
 
   @override
   void dispose() {
@@ -10000,6 +10433,9 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
     _emailController.dispose();
     _contractorController.dispose();
     _teamController.dispose();
+    for (final input in _managerInputs) {
+      input.dispose();
+    }
     super.dispose();
   }
 
@@ -10008,9 +10444,9 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
     final email = _emailController.text.trim();
     if (_selectedRole != 'Team') {
       if (name.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Vul een naam in')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Vul een naam in')));
         return;
       }
     }
@@ -10027,7 +10463,9 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
     final isAdminRole = _adminRoles.contains(_selectedRole);
     if (!_isAdminLike && isAdminRole) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Geen rechten voor administratieve rollen')),
+        const SnackBar(
+          content: Text('Geen rechten voor administratieve rollen'),
+        ),
       );
       return;
     }
@@ -10037,6 +10475,39 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
           const SnackBar(content: Text('Vul de onderaannemer naam in')),
         );
         return;
+      }
+      if (_selectedRole == 'Onderaannemer') {
+        final managers = _managerInputs
+            .map(
+              (input) => (
+                name: input.nameController.text.trim(),
+                email: input.emailController.text.trim().toLowerCase(),
+              ),
+            )
+            .where((entry) => entry.name.isNotEmpty || entry.email.isNotEmpty)
+            .toList();
+        if (managers.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Voeg minstens 1 beheerder toe met naam en e-mail.',
+              ),
+            ),
+          );
+          return;
+        }
+        for (final manager in managers) {
+          if (manager.name.isEmpty ||
+              manager.email.isEmpty ||
+              !manager.email.contains('@')) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Controleer naam en e-mail van beheerders.'),
+              ),
+            );
+            return;
+          }
+        }
       }
       if (_selectedRole == 'Onderaannemer beheerder') {
         if (contractor.isEmpty) {
@@ -10054,9 +10525,9 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
           return;
         }
         if (team.isEmpty) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Vul het team in')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('Vul het team in')));
           return;
         }
       }
@@ -10068,39 +10539,162 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
           return;
         }
         if (team.isEmpty) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Vul het team in')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('Vul het team in')));
           return;
         }
       }
     }
-    if (_selectedRole != 'Team' &&
-        _selectedRole != 'Onderaannemer' &&
-        NetlifyIdentityService.isConfigured) {
-      final inviteError = await NetlifyIdentityService.inviteUser(
-        email: email,
-        name: name,
-        role: _selectedRole,
-        invitedBy: widget.currentAccount.name,
+    Future<String?> sendInviteCodeMail({
+      required String inviteeName,
+      required String inviteeEmail,
+      required String inviteRole,
+      String? inviteContractor,
+      String? inviteTeam,
+    }) async {
+      InvitationCodeEntry? localInvite;
+      String codeForMail;
+      DateTime expiresAtForMail;
+
+      if (NetlifyIdentityService.isConfigured) {
+        try {
+          final created = await NetlifyIdentityService.createInvitationCode(
+            email: inviteeEmail,
+            name: inviteeName,
+            role: inviteRole,
+            company: widget.currentAccount.company,
+            invitedBy: widget.currentAccount.name,
+            contractor: inviteContractor,
+            team: inviteTeam,
+          );
+          final inviteMap = created?['invite'];
+          if (inviteMap is! Map) {
+            return 'Uitnodigingscode aanmaken mislukt.';
+          }
+          codeForMail =
+              inviteMap['code']?.toString().trim().toUpperCase() ?? '';
+          final expiresRaw = inviteMap['expiresAt']?.toString() ?? '';
+          expiresAtForMail =
+              DateTime.tryParse(expiresRaw) ??
+              DateTime.now().add(const Duration(hours: 24));
+          if (codeForMail.isEmpty) {
+            return 'Uitnodigingscode aanmaken mislukt.';
+          }
+        } on NetlifyAuthException catch (e) {
+          return e.message;
+        } catch (_) {
+          return 'Uitnodigingscode aanmaken mislukt.';
+        }
+      } else {
+        localInvite = InvitationCodeStore.create(
+          email: inviteeEmail,
+          name: inviteeName,
+          role: inviteRole,
+          company: widget.currentAccount.company,
+          invitedBy: widget.currentAccount.name,
+          contractor: inviteContractor,
+          team: inviteTeam,
+        );
+        codeForMail = localInvite.code;
+        expiresAtForMail = localInvite.expiresAt;
+      }
+
+      if (!NetlifyIdentityService.isConfigured) return null;
+      return NetlifyIdentityService.sendInvitationCodeEmail(
+        email: inviteeEmail,
+        name: inviteeName,
+        role: inviteRole,
         company: widget.currentAccount.company,
-        contractor: contractor,
-        team: team,
+        invitedBy: widget.currentAccount.name,
+        code: codeForMail,
+        expiresAt: expiresAtForMail,
+        contractor: inviteContractor,
+        team: inviteTeam,
+      );
+    }
+
+    if (_selectedRole == 'Onderaannemer') {
+      final contractorName = name;
+      final managers = _managerInputs
+          .map(
+            (input) => (
+              name: input.nameController.text.trim(),
+              email: input.emailController.text.trim().toLowerCase(),
+            ),
+          )
+          .where((entry) => entry.name.isNotEmpty || entry.email.isNotEmpty)
+          .toList();
+      for (final manager in managers) {
+        final inviteError = await sendInviteCodeMail(
+          inviteeName: manager.name,
+          inviteeEmail: manager.email,
+          inviteRole: 'Onderaannemer beheerder',
+          inviteContractor: contractorName,
+        );
+        if (inviteError != null) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(inviteError)));
+          return;
+        }
+      }
+      setState(() {
+        widget.assignments.add(
+          _RoleAssignment(
+            name: contractorName,
+            email: '',
+            role: 'Onderaannemer',
+            contractor: contractorName,
+          ),
+        );
+        for (final manager in managers) {
+          widget.assignments.add(
+            _RoleAssignment(
+              name: manager.name,
+              email: manager.email,
+              role: 'Onderaannemer beheerder',
+              contractor: contractorName,
+            ),
+          );
+        }
+        _nameController.clear();
+        _emailController.clear();
+        _contractorController.clear();
+        _teamController.clear();
+        _selectedContractor = null;
+        for (final input in _managerInputs) {
+          input.dispose();
+        }
+        _managerInputs
+          ..clear()
+          ..add(_InviteManagerInput());
+        if (_isContractor) {
+          _contractorController.text = _contractorNameForCurrentAccount();
+        }
+        _selectedRole = _isContractor ? 'Werknemer' : _roleOptions.first;
+        _showInvite = false;
+      });
+      AppDataStore.scheduleSave();
+      return;
+    }
+
+    if (_selectedRole != 'Team' && _selectedRole != 'Onderaannemer') {
+      final inviteError = await sendInviteCodeMail(
+        inviteeName: name,
+        inviteeEmail: email,
+        inviteRole: _selectedRole,
+        inviteContractor: contractor.isEmpty ? null : contractor,
+        inviteTeam: team.isEmpty ? null : team,
       );
       if (inviteError != null) {
         if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(inviteError)),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(inviteError)));
         return;
       }
-      await NetlifyIdentityService.sendInvitationNoticeEmail(
-        email: email,
-        name: name,
-        role: _selectedRole,
-        invitedBy: widget.currentAccount.name,
-        company: widget.currentAccount.company,
-      );
     }
     setState(() {
       if (_selectedRole == 'Team') {
@@ -10108,8 +10702,10 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
           _TeamAssignment(
             name: team,
             contractor: contractor,
-            workingDays:
-                _RoleManagementStore.workingDaysForTeam(team, contractor: contractor),
+            workingDays: _RoleManagementStore.workingDaysForTeam(
+              team,
+              contractor: contractor,
+            ),
           ),
         );
       } else {
@@ -10121,8 +10717,8 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
             contractor: _selectedRole == 'Onderaannemer'
                 ? name
                 : contractor.isEmpty
-                    ? null
-                    : contractor,
+                ? null
+                : contractor,
             team: team.isEmpty ? null : team,
           ),
         );
@@ -10131,6 +10727,12 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
       _emailController.clear();
       _contractorController.clear();
       _teamController.clear();
+      for (final input in _managerInputs) {
+        input.dispose();
+      }
+      _managerInputs
+        ..clear()
+        ..add(_InviteManagerInput());
       _selectedContractor = null;
       if (_isContractor) {
         _contractorController.text = _contractorNameForCurrentAccount();
@@ -10176,10 +10778,11 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
           );
         }
       }
-      final teamAssignments = ScheduleStore.scheduled
-          .where((assignment) => assignment.team == newName)
-          .toList()
-        ..sort((a, b) => a.startDate.compareTo(b.startDate));
+      final teamAssignments =
+          ScheduleStore.scheduled
+              .where((assignment) => assignment.team == newName)
+              .toList()
+            ..sort((a, b) => a.startDate.compareTo(b.startDate));
       if (teamAssignments.isNotEmpty) {
         DateTime? cursor;
         final recalculated = <TeamAssignment>[];
@@ -10285,12 +10888,12 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
     final contractorOptions = _contractorNames();
     String? contractor = assignment.contractor;
     if (newRole == 'Onderaannemer beheerder' || newRole == 'Werknemer') {
-      contractor ??= contractorOptions.isNotEmpty ? contractorOptions.first : null;
+      contractor ??= contractorOptions.isNotEmpty
+          ? contractorOptions.first
+          : null;
       if (contractor == null || contractor.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Voeg eerst een onderaannemer toe.'),
-          ),
+          const SnackBar(content: Text('Voeg eerst een onderaannemer toe.')),
         );
         return;
       }
@@ -10300,9 +10903,7 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
       final team = teams.isNotEmpty ? teams.first : null;
       if (team == null || team.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Voeg eerst een team toe.'),
-          ),
+          const SnackBar(content: Text('Voeg eerst een team toe.')),
         );
         return;
       }
@@ -10357,10 +10958,12 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
         final removedTeams = _RoleManagementStore.teams
             .where((team) => team.contractor == contractor)
             .toList();
-        widget.assignments
-            .removeWhere((entry) => removedAssignments.contains(entry));
-        _RoleManagementStore.teams
-            .removeWhere((team) => removedTeams.contains(team));
+        widget.assignments.removeWhere(
+          (entry) => removedAssignments.contains(entry),
+        );
+        _RoleManagementStore.teams.removeWhere(
+          (team) => removedTeams.contains(team),
+        );
         _lastUndo = _UndoAction(
           assignments: removedAssignments,
           teams: removedTeams,
@@ -10377,7 +10980,9 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
   void _deleteTeam(String contractor, String team) {
     setState(() {
       final removedTeams = _RoleManagementStore.teams
-          .where((entry) => entry.contractor == contractor && entry.name == team)
+          .where(
+            (entry) => entry.contractor == contractor && entry.name == team,
+          )
           .toList();
       final removedAssignments = widget.assignments
           .where(
@@ -10387,10 +10992,12 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
                 entry.team == team,
           )
           .toList();
-      _RoleManagementStore.teams
-          .removeWhere((entry) => removedTeams.contains(entry));
-      widget.assignments
-          .removeWhere((entry) => removedAssignments.contains(entry));
+      _RoleManagementStore.teams.removeWhere(
+        (entry) => removedTeams.contains(entry),
+      );
+      widget.assignments.removeWhere(
+        (entry) => removedAssignments.contains(entry),
+      );
       _lastUndo = _UndoAction(
         assignments: removedAssignments,
         teams: removedTeams,
@@ -10416,36 +11023,39 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
     if (!mounted) return;
     final messenger = ScaffoldMessenger.maybeOf(context);
     if (messenger == null) return;
-    messenger.showSnackBar(
-      SnackBar(
-        duration: const Duration(seconds: 5),
-        behavior: SnackBarBehavior.floating,
-        onVisible: () {},
-        content: Row(
-          children: [
-            IconButton(
-              icon: const Icon(Icons.close),
-              color: Colors.white,
-              onPressed: () {
-                _lastUndo = null;
-                messenger.hideCurrentSnackBar();
-              },
+    messenger
+        .showSnackBar(
+          SnackBar(
+            duration: const Duration(seconds: 5),
+            behavior: SnackBarBehavior.floating,
+            onVisible: () {},
+            content: Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  color: Colors.white,
+                  onPressed: () {
+                    _lastUndo = null;
+                    messenger.hideCurrentSnackBar();
+                  },
+                ),
+                Expanded(child: Text(message)),
+                TextButton(
+                  onPressed: _undoLast,
+                  child: const Text(
+                    'Ongedaan maken',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                ),
+              ],
             ),
-            Expanded(child: Text(message)),
-            TextButton(
-              onPressed: _undoLast,
-              child: const Text(
-                'Ongedaan maken',
-                style: TextStyle(color: Colors.white),
-              ),
-            ),
-          ],
-        ),
-        dismissDirection: DismissDirection.horizontal,
-      ),
-    ).closed.then((_) {
-      _lastUndo = null;
-    });
+            dismissDirection: DismissDirection.horizontal,
+          ),
+        )
+        .closed
+        .then((_) {
+          _lastUndo = null;
+        });
   }
 
   List<_RoleAssignment> _adminAssignments() {
@@ -10515,8 +11125,8 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
     if (_isContractor) {
       final contractorName = _contractorNameForCurrentAccount();
       return hierarchy
-          .map((key, value) => MapEntry(key, value))
-          .containsKey(contractorName)
+              .map((key, value) => MapEntry(key, value))
+              .containsKey(contractorName)
           ? {contractorName: hierarchy[contractorName]!}
           : {};
     }
@@ -10527,7 +11137,8 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
   void initState() {
     super.initState();
     _isAdminLike = widget.currentAccount.role == 'Beheerder';
-    _isContractor = widget.currentAccount.role == 'Onderaannemer' ||
+    _isContractor =
+        widget.currentAccount.role == 'Onderaannemer' ||
         widget.currentAccount.role == 'Onderaannemer beheerder';
     if (_isContractor) {
       _contractorController.text = _contractorNameForCurrentAccount();
@@ -10541,8 +11152,8 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
     final availableInviteRoles = _isAdminLike
         ? _roleOptions
         : _isContractor
-            ? const ['Werknemer', 'Onderaannemer beheerder', 'Team']
-            : _practicalRoles;
+        ? const ['Werknemer', 'Onderaannemer beheerder', 'Team']
+        : _practicalRoles;
     final contractorOptions = _isContractor
         ? [_contractorNameForCurrentAccount()]
         : _contractorNames();
@@ -10557,9 +11168,9 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
                 Row(
                   children: [
                     IconButton(
-                      onPressed: () => Navigator.of(context).pop(
-                        List<_RoleAssignment>.from(widget.assignments),
-                      ),
+                      onPressed: () => Navigator.of(
+                        context,
+                      ).pop(List<_RoleAssignment>.from(widget.assignments)),
                       icon: const Icon(Icons.arrow_back),
                     ),
                     const SizedBox(width: 6),
@@ -10576,111 +11187,204 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
                     ),
                   ],
                 ),
-                  const SizedBox(height: 12),
-                  if (_showInvite) ...[
-                    _InputCard(
-                      title: _selectedRole == 'Onderaannemer' ||
-                              _selectedRole == 'Team'
-                          ? 'Nieuwe toevoegen'
-                          : 'Iemand uitnodigen',
-                      children: [
-                        if (_selectedRole != 'Team') ...[
-                          TextField(
-                            controller: _nameController,
-                            decoration: InputDecoration(
-                              hintText: _selectedRole == 'Onderaannemer'
-                                  ? 'Bedrijfsnaam'
-                                  : 'Naam',
-                              filled: true,
-                              fillColor: const Color(0xFFF4F1EA),
-                              enabledBorder: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(14),
-                                borderSide:
-                                    const BorderSide(color: Color(0xFFE1DAD0)),
-                              ),
-                              focusedBorder: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(14),
-                                borderSide:
-                                    const BorderSide(color: Color(0xFF0B2E2B)),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          if (_selectedRole != 'Onderaannemer')
-                            TextField(
-                              controller: _emailController,
-                              decoration: InputDecoration(
-                                hintText: 'E-mailadres',
-                                filled: true,
-                                fillColor: const Color(0xFFF4F1EA),
-                                enabledBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(
-                                      color: Color(0xFFE1DAD0)),
-                                ),
-                                focusedBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(
-                                      color: Color(0xFF0B2E2B)),
-                                ),
-                              ),
-                              keyboardType: TextInputType.emailAddress,
-                            ),
-                          if (_selectedRole != 'Onderaannemer')
-                            const SizedBox(height: 10),
-                        ],
-                        DropdownButtonFormField<String>(
-                          key: ValueKey('role-$_selectedRole'),
-                          initialValue: _selectedRole,
-                          items: availableInviteRoles
-                              .map(
-                                (role) => DropdownMenuItem<String>(
-                                  value: role,
-                                  child: Text(role),
-                                ),
-                              )
-                              .toList(),
-                          onChanged: (value) {
-                            if (value == null) return;
-                            setState(() {
-                              _selectedRole = value;
-                              final options = _isContractor
-                                  ? [_contractorNameForCurrentAccount()]
-                                  : _contractorNames();
-                              if (_selectedRole != 'Onderaannemer' &&
-                                  options.isNotEmpty) {
-                                _selectedContractor ??= options.first;
-                              } else {
-                                _selectedContractor = null;
-                              }
-                            });
-                          },
+                const SizedBox(height: 12),
+                if (_showInvite) ...[
+                  _InputCard(
+                    title:
+                        _selectedRole == 'Onderaannemer' ||
+                            _selectedRole == 'Team'
+                        ? 'Nieuwe toevoegen'
+                        : 'Iemand uitnodigen',
+                    children: [
+                      if (_selectedRole != 'Team') ...[
+                        TextField(
+                          controller: _nameController,
                           decoration: InputDecoration(
-                            prefixIcon: const Icon(Icons.badge_outlined,
-                                color: Color(0xFF6A7C78)),
+                            hintText: _selectedRole == 'Onderaannemer'
+                                ? 'Bedrijfsnaam'
+                                : 'Naam',
                             filled: true,
                             fillColor: const Color(0xFFF4F1EA),
                             enabledBorder: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(14),
-                              borderSide:
-                                  const BorderSide(color: Color(0xFFE1DAD0)),
+                              borderSide: const BorderSide(
+                                color: Color(0xFFE1DAD0),
+                              ),
                             ),
                             focusedBorder: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(14),
-                              borderSide:
-                                  const BorderSide(color: Color(0xFF0B2E2B)),
+                              borderSide: const BorderSide(
+                                color: Color(0xFF0B2E2B),
+                              ),
                             ),
                           ),
                         ),
-                        if (_practicalRoles.contains(_selectedRole)) ...[
-                          if (_selectedRole != 'Onderaannemer') ...[
-                            const SizedBox(height: 10),
-                            if (contractorOptions.isEmpty)
+                        const SizedBox(height: 10),
+                        if (_selectedRole != 'Onderaannemer')
+                          TextField(
+                            controller: _emailController,
+                            decoration: InputDecoration(
+                              hintText: 'E-mailadres',
+                              filled: true,
+                              fillColor: const Color(0xFFF4F1EA),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: const BorderSide(
+                                  color: Color(0xFFE1DAD0),
+                                ),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: const BorderSide(
+                                  color: Color(0xFF0B2E2B),
+                                ),
+                              ),
+                            ),
+                            keyboardType: TextInputType.emailAddress,
+                          ),
+                        if (_selectedRole != 'Onderaannemer')
+                          const SizedBox(height: 10),
+                      ],
+                      if (_selectedRole == 'Onderaannemer') ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          'Beheerders toevoegen',
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(fontWeight: FontWeight.w600),
+                        ),
+                        const SizedBox(height: 8),
+                        ..._managerInputs.asMap().entries.map((entry) {
+                          final index = entry.key;
+                          final manager = entry.value;
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: TextField(
+                                    controller: manager.nameController,
+                                    decoration: InputDecoration(
+                                      hintText: 'Naam beheerder',
+                                      filled: true,
+                                      fillColor: const Color(0xFFF4F1EA),
+                                      enabledBorder: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(14),
+                                        borderSide: const BorderSide(
+                                          color: Color(0xFFE1DAD0),
+                                        ),
+                                      ),
+                                      focusedBorder: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(14),
+                                        borderSide: const BorderSide(
+                                          color: Color(0xFF0B2E2B),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: TextField(
+                                    controller: manager.emailController,
+                                    keyboardType: TextInputType.emailAddress,
+                                    decoration: InputDecoration(
+                                      hintText: 'E-mail beheerder',
+                                      filled: true,
+                                      fillColor: const Color(0xFFF4F1EA),
+                                      enabledBorder: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(14),
+                                        borderSide: const BorderSide(
+                                          color: Color(0xFFE1DAD0),
+                                        ),
+                                      ),
+                                      focusedBorder: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(14),
+                                        borderSide: const BorderSide(
+                                          color: Color(0xFF0B2E2B),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                if (_managerInputs.length > 1)
+                                  IconButton(
+                                    onPressed: () {
+                                      setState(() {
+                                        _managerInputs[index].dispose();
+                                        _managerInputs.removeAt(index);
+                                      });
+                                    },
+                                    icon: const Icon(Icons.close),
+                                  ),
+                              ],
+                            ),
+                          );
+                        }),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: _InlineButton(
+                            label: 'Beheerder toevoegen',
+                            onTap: () => setState(
+                              () => _managerInputs.add(_InviteManagerInput()),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                      DropdownButtonFormField<String>(
+                        key: ValueKey('role-$_selectedRole'),
+                        initialValue: _selectedRole,
+                        items: availableInviteRoles
+                            .map(
+                              (role) => DropdownMenuItem<String>(
+                                value: role,
+                                child: Text(role),
+                              ),
+                            )
+                            .toList(),
+                        onChanged: (value) {
+                          if (value == null) return;
+                          setState(() {
+                            _selectedRole = value;
+                            final options = _isContractor
+                                ? [_contractorNameForCurrentAccount()]
+                                : _contractorNames();
+                            if (_selectedRole != 'Onderaannemer' &&
+                                options.isNotEmpty) {
+                              _selectedContractor ??= options.first;
+                            } else {
+                              _selectedContractor = null;
+                            }
+                          });
+                        },
+                        decoration: InputDecoration(
+                          prefixIcon: const Icon(
+                            Icons.badge_outlined,
+                            color: Color(0xFF6A7C78),
+                          ),
+                          filled: true,
+                          fillColor: const Color(0xFFF4F1EA),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: const BorderSide(
+                              color: Color(0xFFE1DAD0),
+                            ),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: const BorderSide(
+                              color: Color(0xFF0B2E2B),
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (_practicalRoles.contains(_selectedRole)) ...[
+                        if (_selectedRole != 'Onderaannemer') ...[
+                          const SizedBox(height: 10),
+                          if (contractorOptions.isEmpty)
                             Text(
                               'Voeg eerst een onderaannemer toe.',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
+                              style: Theme.of(context).textTheme.bodySmall
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             )
                           else
@@ -10689,7 +11393,8 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
                                 _selectedContractor ?? contractorOptions.first,
                               ),
                               initialValue:
-                                  _selectedContractor ?? contractorOptions.first,
+                                  _selectedContractor ??
+                                  contractorOptions.first,
                               items: contractorOptions
                                   .map(
                                     (contractor) => DropdownMenuItem<String>(
@@ -10703,213 +11408,219 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
                                 setState(() => _selectedContractor = value);
                               },
                               decoration: InputDecoration(
-                                prefixIcon: const Icon(Icons.apartment_outlined,
-                                    color: Color(0xFF6A7C78)),
+                                prefixIcon: const Icon(
+                                  Icons.apartment_outlined,
+                                  color: Color(0xFF6A7C78),
+                                ),
                                 filled: true,
                                 fillColor: const Color(0xFFF4F1EA),
                                 enabledBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(14),
                                   borderSide: const BorderSide(
-                                      color: Color(0xFFE1DAD0)),
+                                    color: Color(0xFFE1DAD0),
+                                  ),
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(14),
                                   borderSide: const BorderSide(
-                                      color: Color(0xFF0B2E2B)),
+                                    color: Color(0xFF0B2E2B),
+                                  ),
                                 ),
                               ),
                             ),
-                          ],
-                          if (_selectedRole == 'Team') ...[
-                            const SizedBox(height: 10),
-                            TextField(
-                              controller: _teamController,
-                              decoration: InputDecoration(
-                                hintText: 'Team',
-                                filled: true,
-                                fillColor: const Color(0xFFF4F1EA),
-                                enabledBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(
-                                      color: Color(0xFFE1DAD0)),
+                        ],
+                        if (_selectedRole == 'Team') ...[
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: _teamController,
+                            decoration: InputDecoration(
+                              hintText: 'Team',
+                              filled: true,
+                              fillColor: const Color(0xFFF4F1EA),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: const BorderSide(
+                                  color: Color(0xFFE1DAD0),
                                 ),
-                                focusedBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(14),
-                                  borderSide: const BorderSide(
-                                      color: Color(0xFF0B2E2B)),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: const BorderSide(
+                                  color: Color(0xFF0B2E2B),
                                 ),
                               ),
                             ),
-                          ],
-                          if (_selectedRole == 'Werknemer') ...[
-                            const SizedBox(height: 10),
-                            Builder(
-                              builder: (context) {
-                                final contractor =
-                                    _resolvedContractor(_nameController.text.trim());
-                                final teams = contractor.isEmpty
-                                    ? const <String>[]
-                                    : _teamNames(contractor);
-                                if (teams.isEmpty) {
-                                  return Text(
-                                    'Voeg eerst een team toe.',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall
-                                        ?.copyWith(
-                                          color: const Color(0xFF6A7C78),
-                                        ),
-                                  );
-                                }
-                                final selectedTeam =
-                                    _teamController.text.isNotEmpty
-                                        ? _teamController.text
-                                        : teams.first;
-                                return DropdownButtonFormField<String>(
-                                  key: ValueKey(selectedTeam),
-                                  initialValue: selectedTeam,
-                                  items: teams
-                                      .map(
-                                        (team) => DropdownMenuItem<String>(
-                                          value: team,
-                                          child: Text(team),
-                                        ),
-                                      )
-                                      .toList(),
-                                  onChanged: (value) {
-                                    if (value == null) return;
-                                    setState(() => _teamController.text = value);
-                                  },
-                                  decoration: InputDecoration(
-                                    prefixIcon: const Icon(Icons.group_outlined,
-                                        color: Color(0xFF6A7C78)),
-                                    filled: true,
-                                    fillColor: const Color(0xFFF4F1EA),
-                                    enabledBorder: OutlineInputBorder(
-                                      borderRadius: BorderRadius.circular(14),
-                                      borderSide: const BorderSide(
-                                          color: Color(0xFFE1DAD0)),
-                                    ),
-                                    focusedBorder: OutlineInputBorder(
-                                      borderRadius: BorderRadius.circular(14),
-                                      borderSide: const BorderSide(
-                                          color: Color(0xFF0B2E2B)),
+                          ),
+                        ],
+                        if (_selectedRole == 'Werknemer') ...[
+                          const SizedBox(height: 10),
+                          Builder(
+                            builder: (context) {
+                              final contractor = _resolvedContractor(
+                                _nameController.text.trim(),
+                              );
+                              final teams = contractor.isEmpty
+                                  ? const <String>[]
+                                  : _teamNames(contractor);
+                              if (teams.isEmpty) {
+                                return Text(
+                                  'Voeg eerst een team toe.',
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: const Color(0xFF6A7C78),
+                                      ),
+                                );
+                              }
+                              final selectedTeam =
+                                  _teamController.text.isNotEmpty
+                                  ? _teamController.text
+                                  : teams.first;
+                              return DropdownButtonFormField<String>(
+                                key: ValueKey(selectedTeam),
+                                initialValue: selectedTeam,
+                                items: teams
+                                    .map(
+                                      (team) => DropdownMenuItem<String>(
+                                        value: team,
+                                        child: Text(team),
+                                      ),
+                                    )
+                                    .toList(),
+                                onChanged: (value) {
+                                  if (value == null) return;
+                                  setState(() => _teamController.text = value);
+                                },
+                                decoration: InputDecoration(
+                                  prefixIcon: const Icon(
+                                    Icons.group_outlined,
+                                    color: Color(0xFF6A7C78),
+                                  ),
+                                  filled: true,
+                                  fillColor: const Color(0xFFF4F1EA),
+                                  enabledBorder: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                    borderSide: const BorderSide(
+                                      color: Color(0xFFE1DAD0),
                                     ),
                                   ),
-                                );
-                              },
-                            ),
-                          ],
-                        ],
-                        const SizedBox(height: 12),
-                        _PrimaryButton(
-                          label: _selectedRole == 'Onderaannemer' ||
-                                  _selectedRole == 'Team'
-                              ? 'Aanmaken'
-                              : 'Uitnodigen',
-                          onTap: () {
-                            _invite();
-                          },
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 16),
-                  ],
-                  if (_isAdminLike) ...[
-                    _TabToggle(
-                      labels: const ['Administratief', 'Praktisch'],
-                      selectedIndex: _tabIndex,
-                      onSelect: (index) => setState(() => _tabIndex = index),
-                    ),
-                    const SizedBox(height: 12),
-                  ],
-                  if (_isAdminLike && _tabIndex == 0) ...[
-                    if (_adminAssignments().isEmpty)
-                      Text(
-                        'Nog geen administratieve rollen.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
-                      )
-                    else
-                      ..._adminAssignments().map(
-                        (assignment) => Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: _RoleAssignmentRow(
-                            assignment: assignment,
-                            onRoleChanged: (value) {
-                              _applyRoleChange(assignment, value);
-                            },
-                            canEditRole: _isAdminLike,
-                            allowedRoles: _adminRoles,
-                            canDelete: _canDeleteAssignment(assignment),
-                            onDelete: () => _deleteAssignment(assignment),
-                          ),
-                        ),
-                      ),
-                  ] else ...[
-                    if (_practicalHierarchy().isEmpty)
-                      Text(
-                        'Nog geen praktische teams.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
-                      )
-                    else
-                      ..._practicalHierarchy().entries.map(
-                        (contractorEntry) => Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: _ContractorSection(
-                            contractor: contractorEntry.key,
-                            teams: contractorEntry.value,
-                            assignments: widget.assignments,
-                            canEdit: _isAdminLike || _isContractor,
-                            canDeleteTeam:
-                                _canDeleteTeam(contractorEntry.key),
-                            onDeleteTeam: (team) =>
-                                _deleteTeam(contractorEntry.key, team),
-                            onUpdateTeam: (team, newName, workingDays) =>
-                                _updateTeam(
-                                  contractorEntry.key,
-                                  team,
-                                  newName,
-                                  workingDays,
-                                ),
-                            canDeleteWorker: (worker) =>
-                                _canDeleteAssignment(worker),
-                            onDeleteWorker: (worker) =>
-                                _deleteAssignment(worker),
-                            canDeleteContractor: _isAdminLike,
-                            onDeleteContractor: () {
-                              final assignment = widget.assignments.firstWhere(
-                                (entry) =>
-                                    entry.role == 'Onderaannemer' &&
-                                    entry.name == contractorEntry.key,
-                                orElse: () => _RoleAssignment(
-                                  name: contractorEntry.key,
-                                  email: '',
-                                  role: 'Onderaannemer',
+                                  focusedBorder: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                    borderSide: const BorderSide(
+                                      color: Color(0xFF0B2E2B),
+                                    ),
+                                  ),
                                 ),
                               );
-                              _deleteAssignment(assignment);
-                            },
-                            onRoleChanged: (assignment, role) {
-                              _applyRoleChange(assignment, role);
-                            },
-                            onTeamChanged: (assignment, team) {
-                              setState(() => assignment.team = team);
-                              AppDataStore.scheduleSave();
-                            },
-                            onContractorChanged: (assignment, contractor) {
-                              setState(() => assignment.contractor = contractor);
-                              AppDataStore.scheduleSave();
                             },
                           ),
+                        ],
+                      ],
+                      const SizedBox(height: 12),
+                      _PrimaryButton(
+                        label:
+                            _selectedRole == 'Onderaannemer' ||
+                                _selectedRole == 'Team'
+                            ? 'Aanmaken'
+                            : 'Uitnodigen',
+                        onTap: () {
+                          _invite();
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                ],
+                if (_isAdminLike) ...[
+                  _TabToggle(
+                    labels: const ['Administratief', 'Praktisch'],
+                    selectedIndex: _tabIndex,
+                    onSelect: (index) => setState(() => _tabIndex = index),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                if (_isAdminLike && _tabIndex == 0) ...[
+                  if (_adminAssignments().isEmpty)
+                    Text(
+                      'Nog geen administratieve rollen.',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF6A7C78),
+                      ),
+                    )
+                  else
+                    ..._adminAssignments().map(
+                      (assignment) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: _RoleAssignmentRow(
+                          assignment: assignment,
+                          onRoleChanged: (value) {
+                            _applyRoleChange(assignment, value);
+                          },
+                          canEditRole: _isAdminLike,
+                          allowedRoles: _adminRoles,
+                          canDelete: _canDeleteAssignment(assignment),
+                          onDelete: () => _deleteAssignment(assignment),
                         ),
                       ),
-                  ],
+                    ),
+                ] else ...[
+                  if (_practicalHierarchy().isEmpty)
+                    Text(
+                      'Nog geen praktische teams.',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF6A7C78),
+                      ),
+                    )
+                  else
+                    ..._practicalHierarchy().entries.map(
+                      (contractorEntry) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: _ContractorSection(
+                          contractor: contractorEntry.key,
+                          teams: contractorEntry.value,
+                          assignments: widget.assignments,
+                          canEdit: _isAdminLike || _isContractor,
+                          canDeleteTeam: _canDeleteTeam(contractorEntry.key),
+                          onDeleteTeam: (team) =>
+                              _deleteTeam(contractorEntry.key, team),
+                          onUpdateTeam: (team, newName, workingDays) =>
+                              _updateTeam(
+                                contractorEntry.key,
+                                team,
+                                newName,
+                                workingDays,
+                              ),
+                          canDeleteWorker: (worker) =>
+                              _canDeleteAssignment(worker),
+                          onDeleteWorker: (worker) => _deleteAssignment(worker),
+                          canDeleteContractor: _isAdminLike,
+                          onDeleteContractor: () {
+                            final assignment = widget.assignments.firstWhere(
+                              (entry) =>
+                                  entry.role == 'Onderaannemer' &&
+                                  entry.name == contractorEntry.key,
+                              orElse: () => _RoleAssignment(
+                                name: contractorEntry.key,
+                                email: '',
+                                role: 'Onderaannemer',
+                              ),
+                            );
+                            _deleteAssignment(assignment);
+                          },
+                          onRoleChanged: (assignment, role) {
+                            _applyRoleChange(assignment, role);
+                          },
+                          onTeamChanged: (assignment, team) {
+                            setState(() => assignment.team = team);
+                            AppDataStore.scheduleSave();
+                          },
+                          onContractorChanged: (assignment, contractor) {
+                            setState(() => assignment.contractor = contractor);
+                            AppDataStore.scheduleSave();
+                          },
+                        ),
+                      ),
+                    ),
+                ],
               ],
             ),
           ),
@@ -11013,17 +11724,13 @@ class _OfferManagementScreenState extends State<OfferManagementScreen> {
               if (_isAdmin) ...[
                 TextField(
                   controller: nameController,
-                  decoration: const InputDecoration(
-                    hintText: 'Naam',
-                  ),
+                  decoration: const InputDecoration(hintText: 'Naam'),
                 ),
                 const SizedBox(height: 10),
                 TextField(
                   controller: priceController,
                   keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'Prijs (EUR)',
-                  ),
+                  decoration: const InputDecoration(hintText: 'Prijs (EUR)'),
                 ),
                 const SizedBox(height: 10),
                 TextField(
@@ -11035,27 +11742,24 @@ class _OfferManagementScreenState extends State<OfferManagementScreen> {
               ] else ...[
                 Text(
                   item?.name ?? '',
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        fontWeight: FontWeight.w600,
-                      ),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 6),
                 Text(
                   item == null
                       ? ''
                       : 'EUR ${_formatPrice(item.price)} / ${item.unit}',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodySmall
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
                 ),
                 const SizedBox(height: 12),
                 TextField(
                   controller: hoursController,
                   keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    hintText: 'Uren',
-                  ),
+                  decoration: const InputDecoration(hintText: 'Uren'),
                 ),
               ],
               const SizedBox(height: 16),
@@ -11089,11 +11793,7 @@ class _OfferManagementScreenState extends State<OfferManagementScreen> {
                             if (item == null) {
                               OfferCatalogStore.addItem(
                                 category.name,
-                                OfferItem(
-                                  name: name,
-                                  price: price,
-                                  unit: unit,
-                                ),
+                                OfferItem(name: name, price: price, unit: unit),
                               );
                             } else {
                               item.name = name;
@@ -11103,8 +11803,9 @@ class _OfferManagementScreenState extends State<OfferManagementScreen> {
                           });
                           AppDataStore.scheduleSave();
                         } else if (_isContractor && item != null) {
-                          final hours =
-                              double.tryParse(hoursController.text.trim());
+                          final hours = double.tryParse(
+                            hoursController.text.trim(),
+                          );
                           setState(() {
                             item.hours = hours;
                           });
@@ -11160,10 +11861,9 @@ class _OfferManagementScreenState extends State<OfferManagementScreen> {
                 if (categories.isEmpty)
                   Text(
                     'Nog geen onderverdelingen toegevoegd.',
-                    style: Theme.of(context)
-                        .textTheme
-                        .bodyMedium
-                        ?.copyWith(color: const Color(0xFF6A7C78)),
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFF6A7C78),
+                    ),
                   )
                 else
                   ...categories.map(
@@ -11175,9 +11875,7 @@ class _OfferManagementScreenState extends State<OfferManagementScreen> {
                           if (category.items.isEmpty)
                             Text(
                               'Nog geen elementen toegevoegd.',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
+                              style: Theme.of(context).textTheme.bodySmall
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             )
                           else
@@ -11208,19 +11906,24 @@ class _OfferManagementScreenState extends State<OfferManagementScreen> {
                                                 .textTheme
                                                 .bodySmall
                                                 ?.copyWith(
-                                                  color:
-                                                      const Color(0xFF6A7C78),
+                                                  color: const Color(
+                                                    0xFF6A7C78,
+                                                  ),
                                                 ),
                                           ),
                                         ],
                                       ),
                                     ),
                                     IconButton(
-                                      icon:
-                                          const Icon(Icons.edit_outlined, size: 18),
+                                      icon: const Icon(
+                                        Icons.edit_outlined,
+                                        size: 18,
+                                      ),
                                       color: const Color(0xFF6A7C78),
-                                      onPressed: () =>
-                                          _openItemEditor(category: category, item: item),
+                                      onPressed: () => _openItemEditor(
+                                        category: category,
+                                        item: item,
+                                      ),
                                     ),
                                   ],
                                 ),
@@ -11275,15 +11978,14 @@ class _RoleAssignmentRow extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-            Row(
+          Row(
             children: [
               Expanded(
                 child: Text(
                   '${assignment.name} — ${assignment.role}',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(fontWeight: FontWeight.w600),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
                 ),
               ),
               if (canEditRole)
@@ -11331,7 +12033,7 @@ class _ContractorSection extends StatelessWidget {
   final bool canDeleteTeam;
   final ValueChanged<String> onDeleteTeam;
   final void Function(String team, String newName, Set<int> workingDays)
-      onUpdateTeam;
+  onUpdateTeam;
   final bool Function(_RoleAssignment worker) canDeleteWorker;
   final void Function(_RoleAssignment worker) onDeleteWorker;
   final bool canDeleteContractor;
@@ -11339,7 +12041,7 @@ class _ContractorSection extends StatelessWidget {
   final void Function(_RoleAssignment assignment, String role) onRoleChanged;
   final void Function(_RoleAssignment assignment, String team) onTeamChanged;
   final void Function(_RoleAssignment assignment, String contractor)
-      onContractorChanged;
+  onContractorChanged;
 
   _RoleAssignment? _contractorAssignment() {
     return assignments.firstWhere(
@@ -11402,18 +12104,16 @@ class _ContractorSection extends StatelessWidget {
                   currentRole: contractorAssignment.role,
                   allowedRoles: _practicalRoles,
                   onSave: (role) => onRoleChanged(contractorAssignment, role),
-                  onDelete:
-                      canDeleteContractor ? onDeleteContractor : null,
+                  onDelete: canDeleteContractor ? onDeleteContractor : null,
                 ),
               ),
           ],
         ),
         subtitle: Text(
           _adminLabel(),
-          style: Theme.of(context)
-              .textTheme
-              .bodySmall
-              ?.copyWith(color: const Color(0xFF6A7C78)),
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
         ),
         children: [
           if (managers.isNotEmpty)
@@ -11426,14 +12126,16 @@ class _ContractorSection extends StatelessWidget {
                   border: Border.all(color: const Color(0xFFEDE5DA)),
                 ),
                 child: ExpansionTile(
-                  tilePadding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                  tilePadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 4,
+                  ),
                   title: Text(
                     'Beheerders',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          color: const Color(0xFF0B2E2B),
-                        ),
+                      fontWeight: FontWeight.w600,
+                      color: const Color(0xFF0B2E2B),
+                    ),
                   ),
                   children: managers
                       .map(
@@ -11462,10 +12164,9 @@ class _ContractorSection extends StatelessWidget {
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
               child: Text(
                 'Geen beheerders toegevoegd.',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodySmall
-                    ?.copyWith(color: const Color(0xFF6A7C78)),
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
               ),
             ),
           ...teams.entries.map(
@@ -11478,11 +12179,8 @@ class _ContractorSection extends StatelessWidget {
                 canEdit: canEdit,
                 canDeleteTeam: canDeleteTeam,
                 onDeleteTeam: () => onDeleteTeam(teamEntry.key),
-                onUpdateTeam: (newName, workingDays) => onUpdateTeam(
-                  teamEntry.key,
-                  newName,
-                  workingDays,
-                ),
+                onUpdateTeam: (newName, workingDays) =>
+                    onUpdateTeam(teamEntry.key, newName, workingDays),
                 canDeleteWorker: canDeleteWorker,
                 onDeleteWorker: onDeleteWorker,
                 onRoleChanged: onRoleChanged,
@@ -11525,7 +12223,7 @@ class _TeamSection extends StatelessWidget {
   final void Function(_RoleAssignment assignment, String role) onRoleChanged;
   final void Function(_RoleAssignment assignment, String team) onTeamChanged;
   final void Function(_RoleAssignment assignment, String contractor)
-      onContractorChanged;
+  onContractorChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -11543,9 +12241,9 @@ class _TeamSection extends StatelessWidget {
               child: Text(
                 team,
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                      color: const Color(0xFF0B2E2B),
-                    ),
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xFF0B2E2B),
+                ),
               ),
             ),
             if (canEdit)
@@ -11555,11 +12253,10 @@ class _TeamSection extends StatelessWidget {
                 onPressed: () => _openTeamEditor(
                   context,
                   currentName: team,
-                  currentWorkdays:
-                      _RoleManagementStore.workingDaysForTeam(
-                        team,
-                        contractor: contractor,
-                      ),
+                  currentWorkdays: _RoleManagementStore.workingDaysForTeam(
+                    team,
+                    contractor: contractor,
+                  ),
                   onSave: onUpdateTeam,
                   onDelete: canDeleteTeam ? onDeleteTeam : null,
                 ),
@@ -11605,7 +12302,7 @@ class _WorkerRow extends StatelessWidget {
   final void Function(_RoleAssignment assignment, String role) onRoleChanged;
   final void Function(_RoleAssignment assignment, String team) onTeamChanged;
   final void Function(_RoleAssignment assignment, String contractor)
-      onContractorChanged;
+  onContractorChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -11619,15 +12316,14 @@ class _WorkerRow extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-            Row(
+          Row(
             children: [
               Expanded(
                 child: Text(
                   '${worker.name} — ${worker.role}',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(fontWeight: FontWeight.w600),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
                 ),
               ),
               if (canEdit)
@@ -11645,8 +12341,7 @@ class _WorkerRow extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 6),
-          if (canEdit)
-            const SizedBox.shrink(),
+          if (canEdit) const SizedBox.shrink(),
         ],
       ),
     );
@@ -11667,11 +12362,7 @@ class _StatsGrid extends StatelessWidget {
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
       childAspectRatio: 1.15,
-      children: items
-          .map(
-            (item) => _StatTile(data: item),
-          )
-          .toList(),
+      children: items.map((item) => _StatTile(data: item)).toList(),
     );
   }
 }
@@ -11726,8 +12417,10 @@ Future<void> _openRoleEditor(
                     setSheetState(() => selectedRole = value);
                   },
                   decoration: InputDecoration(
-                    prefixIcon:
-                        const Icon(Icons.badge_outlined, color: Color(0xFF6A7C78)),
+                    prefixIcon: const Icon(
+                      Icons.badge_outlined,
+                      color: Color(0xFF6A7C78),
+                    ),
                     filled: true,
                     fillColor: const Color(0xFFF4F1EA),
                     enabledBorder: OutlineInputBorder(
@@ -11843,9 +12536,9 @@ Future<void> _openTeamEditor(
                 const SizedBox(height: 12),
                 Text(
                   'Werkdagen',
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        fontWeight: FontWeight.w600,
-                      ),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 8),
                 Wrap(
@@ -11855,8 +12548,7 @@ Future<void> _openTeamEditor(
                       .map(
                         (day) => FilterChip(
                           label: Text(day['label'] as String),
-                          selected:
-                              selectedDays.contains(day['value'] as int),
+                          selected: selectedDays.contains(day['value'] as int),
                           onSelected: (selected) {
                             setModalState(() {
                               final value = day['value'] as int;
@@ -11970,19 +12662,15 @@ class _StatTile extends StatelessWidget {
               color: const Color(0xFFF4F1EA),
               borderRadius: BorderRadius.circular(12),
             ),
-            child: Icon(
-              data.icon,
-              size: 20,
-              color: const Color(0xFF0B2E2B),
-            ),
+            child: Icon(data.icon, size: 20, color: const Color(0xFF0B2E2B)),
           ),
           const SizedBox(height: 10),
           Text(
             '${data.value}',
             style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                  color: const Color(0xFF0B2E2B),
-                  fontWeight: FontWeight.w700,
-                ),
+              color: const Color(0xFF0B2E2B),
+              fontWeight: FontWeight.w700,
+            ),
           ),
           const SizedBox(height: 4),
           Text(
@@ -11990,9 +12678,9 @@ class _StatTile extends StatelessWidget {
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: const Color(0xFF5A6F6C),
-                  fontWeight: FontWeight.w600,
-                ),
+              color: const Color(0xFF5A6F6C),
+              fontWeight: FontWeight.w600,
+            ),
           ),
         ],
       ),
@@ -12019,9 +12707,9 @@ class _DatePickerRow extends StatelessWidget {
           child: Text(
             label,
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                  color: const Color(0xFF243B3A),
-                ),
+              fontWeight: FontWeight.w600,
+              color: const Color(0xFF243B3A),
+            ),
           ),
         ),
         _InlineButton(
@@ -12056,9 +12744,9 @@ class _DangerButton extends StatelessWidget {
               child: Text(
                 label,
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                      color: Colors.white,
-                    ),
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
               ),
             ),
           ),
@@ -12098,8 +12786,9 @@ class _DocumentRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final statusLabel = entry.isValid ? 'Geldig' : 'Ongeldig';
-    final statusColor =
-        entry.isValid ? const Color(0xFF0B2E2B) : const Color(0xFFB42318);
+    final statusColor = entry.isValid
+        ? const Color(0xFF0B2E2B)
+        : const Color(0xFFB42318);
     final isPreviewable = _isPreviewableFile(entry.file);
     final previewPath = entry.file.path;
     final previewBytes = entry.file.bytes;
@@ -12123,7 +12812,9 @@ class _DocumentRow extends StatelessWidget {
                 decoration: BoxDecoration(
                   color: const Color(0xFFFCE6CC),
                   borderRadius: BorderRadius.circular(12),
-                  image: isPreviewable && (previewPath != null || previewBytes != null)
+                  image:
+                      isPreviewable &&
+                          (previewPath != null || previewBytes != null)
                       ? DecorationImage(
                           image: previewPath != null
                               ? FileImage(File(previewPath))
@@ -12132,10 +12823,14 @@ class _DocumentRow extends StatelessWidget {
                         )
                       : null,
                 ),
-                child: isPreviewable && (previewPath != null || previewBytes != null)
+                child:
+                    isPreviewable &&
+                        (previewPath != null || previewBytes != null)
                     ? null
-                    : const Icon(Icons.description_outlined,
-                        color: Color(0xFF6A4A2D)),
+                    : const Icon(
+                        Icons.description_outlined,
+                        color: Color(0xFF6A4A2D),
+                      ),
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -12145,25 +12840,26 @@ class _DocumentRow extends StatelessWidget {
                     Text(
                       entry.description,
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                            fontWeight: FontWeight.w600,
-                            color: const Color(0xFF243B3A),
-                          ),
+                        fontWeight: FontWeight.w600,
+                        color: const Color(0xFF243B3A),
+                      ),
                     ),
                     const SizedBox(height: 4),
                     Text(
                       'Vervalt op ${_formatDate(entry.expiry)}',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: const Color(0xFF6A7C78)),
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF6A7C78),
+                      ),
                     ),
                   ],
                 ),
               ),
               const SizedBox(width: 8),
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   color: statusColor,
                   borderRadius: BorderRadius.circular(12),
@@ -12171,9 +12867,9 @@ class _DocumentRow extends StatelessWidget {
                 child: Text(
                   statusLabel,
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w600,
-                      ),
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
               const SizedBox(width: 6),
@@ -12201,6 +12897,7 @@ class _EditableInputField extends StatelessWidget {
     required this.controller,
     this.obscure = false,
     this.keyboardType,
+    this.autofillHints,
   });
 
   final String label;
@@ -12209,6 +12906,7 @@ class _EditableInputField extends StatelessWidget {
   final TextEditingController controller;
   final bool obscure;
   final TextInputType? keyboardType;
+  final Iterable<String>? autofillHints;
 
   @override
   Widget build(BuildContext context) {
@@ -12218,31 +12916,47 @@ class _EditableInputField extends StatelessWidget {
         Text(
           label,
           style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
-                color: const Color(0xFF243B3A),
-              ),
+            fontWeight: FontWeight.w600,
+            color: const Color(0xFF243B3A),
+          ),
         ),
         const SizedBox(height: 6),
-        TextField(
-          controller: controller,
-          obscureText: obscure,
-          keyboardType: keyboardType,
-          autocorrect: !obscure,
-          enableSuggestions: !obscure,
-          decoration: InputDecoration(
-            prefixIcon: Icon(icon, color: const Color(0xFF6A7C78)),
-            hintText: hint,
-            filled: true,
-            fillColor: const Color(0xFFF4F1EA),
-            enabledBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(14),
-              borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
-            ),
-            focusedBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(14),
-              borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
-            ),
-          ),
+        ValueListenableBuilder<TextEditingValue>(
+          valueListenable: controller,
+          builder: (context, value, _) {
+            return TextField(
+              controller: controller,
+              obscureText: obscure,
+              keyboardType: keyboardType,
+              autocorrect: !obscure,
+              enableSuggestions: !obscure,
+              autofillHints: autofillHints,
+              decoration: InputDecoration(
+                prefixIcon: Icon(icon, color: const Color(0xFF6A7C78)),
+                suffixIcon: value.text.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(
+                          Icons.close,
+                          size: 18,
+                          color: Color(0xFF6A7C78),
+                        ),
+                        onPressed: controller.clear,
+                      ),
+                hintText: hint,
+                filled: true,
+                fillColor: const Color(0xFFF4F1EA),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
+                ),
+              ),
+            );
+          },
         ),
       ],
     );
@@ -12268,9 +12982,9 @@ class _ReadOnlyField extends StatelessWidget {
         Text(
           label,
           style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
-                color: const Color(0xFF243B3A),
-              ),
+            fontWeight: FontWeight.w600,
+            color: const Color(0xFF243B3A),
+          ),
         ),
         const SizedBox(height: 6),
         Container(
@@ -12287,10 +13001,9 @@ class _ReadOnlyField extends StatelessWidget {
               Expanded(
                 child: Text(
                   value.isEmpty ? '—' : value,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
                 ),
               ),
             ],
@@ -12337,8 +13050,10 @@ class _StatusCard extends StatelessWidget {
             onChanged(value);
           },
           decoration: InputDecoration(
-            prefixIcon:
-                const Icon(Icons.flag_outlined, color: Color(0xFF6A7C78)),
+            prefixIcon: const Icon(
+              Icons.flag_outlined,
+              color: Color(0xFF6A7C78),
+            ),
             filled: true,
             fillColor: const Color(0xFFF4F1EA),
             enabledBorder: OutlineInputBorder(
@@ -12425,9 +13140,9 @@ class _InputField extends StatelessWidget {
         Text(
           label,
           style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
-                color: const Color(0xFF243B3A),
-              ),
+            fontWeight: FontWeight.w600,
+            color: const Color(0xFF243B3A),
+          ),
         ),
         const SizedBox(height: 6),
         TextField(
@@ -12607,8 +13322,7 @@ class _MiniCalendarPicker extends StatelessWidget {
   }) {
     final isWorkingDay = _isWorkingDayForTeam(day);
     final items = isWorkingDay
-        ? (_assignmentsForDay(day)
-          ..sort((a, b) {
+        ? (_assignmentsForDay(day)..sort((a, b) {
             final laneA = laneMap[a] ?? 0;
             final laneB = laneMap[b] ?? 0;
             return laneA.compareTo(laneB);
@@ -12617,8 +13331,9 @@ class _MiniCalendarPicker extends StatelessWidget {
     final dotItems = items.where((assignment) {
       return _isBackorderAssignment(assignment);
     }).toList();
-    final lineItemsAll =
-        items.where((assignment) => !dotItems.contains(assignment)).toList();
+    final lineItemsAll = items
+        .where((assignment) => !dotItems.contains(assignment))
+        .toList();
     final lineItems = lineItemsAll.where((assignment) {
       final lane = laneMap[assignment] ?? 0;
       return lane < _miniMaxLaneShown;
@@ -12637,13 +13352,15 @@ class _MiniCalendarPicker extends StatelessWidget {
             previewStart != null &&
             previewEnd != null &&
             previewStart.isAtSameMomentAs(previewEnd);
-        final previewCoversDay = isWorkingDay &&
+        final previewCoversDay =
+            isWorkingDay &&
             previewStart != null &&
             previewEnd != null &&
             !previewSingleDay &&
             !normalizedDay.isBefore(previewStart) &&
             !normalizedDay.isAfter(previewEnd);
-        final showPreviewDot = isWorkingDay &&
+        final showPreviewDot =
+            isWorkingDay &&
             previewSingleDay &&
             normalizedDay.isAtSameMomentAs(previewStart);
         final hasPreviewRange =
@@ -12660,23 +13377,24 @@ class _MiniCalendarPicker extends StatelessWidget {
             final previewEndDay = previewEnd;
             final aStart = _normalize(assignment.startDate);
             final aEnd = _normalize(assignment.endDate);
-            final overlapsPreview = !previewEndDay.isBefore(aStart) &&
+            final overlapsPreview =
+                !previewEndDay.isBefore(aStart) &&
                 !previewStartDay.isAfter(aEnd);
             if (overlapsPreview) {
               final fallback = List.generate(_miniMaxLaneShown, (i) => i)
                   .firstWhere(
-                (lane) => lane != previewLane && !usedLanes.contains(lane),
-                orElse: () => candidate,
-              );
+                    (lane) => lane != previewLane && !usedLanes.contains(lane),
+                    orElse: () => candidate,
+                  );
               candidate = fallback;
             }
           }
           if (usedLanes.contains(candidate)) {
             final fallback = List.generate(_miniMaxLaneShown, (i) => i)
                 .firstWhere(
-              (lane) => !usedLanes.contains(lane),
-              orElse: () => candidate,
-            );
+                  (lane) => !usedLanes.contains(lane),
+                  orElse: () => candidate,
+                );
             candidate = fallback;
           }
           usedLanes.add(candidate);
@@ -12710,11 +13428,11 @@ class _MiniCalendarPicker extends StatelessWidget {
                 child: Text(
                   '${day.day}',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: isEnabled
-                            ? const Color(0xFF243B3A)
-                            : const Color(0xFFB0B8B6),
-                        fontWeight: FontWeight.w600,
-                      ),
+                    color: isEnabled
+                        ? const Color(0xFF243B3A)
+                        : const Color(0xFFB0B8B6),
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
             ),
@@ -12801,11 +13519,8 @@ class _MiniCalendarPicker extends StatelessWidget {
                 top: linesTop + previewLane * (barHeight + barGap),
                 child: Padding(
                   padding: EdgeInsets.only(
-                    left: normalizedDay.isAtSameMomentAs(previewStart)
-                        ? 3
-                        : 0,
-                    right:
-                        normalizedDay.isAtSameMomentAs(previewEnd) ? 3 : 0,
+                    left: normalizedDay.isAtSameMomentAs(previewStart) ? 3 : 0,
+                    right: normalizedDay.isAtSameMomentAs(previewEnd) ? 3 : 0,
                   ),
                   child: Container(
                     height: barHeight,
@@ -12833,10 +13548,8 @@ class _MiniCalendarPicker extends StatelessWidget {
   Widget build(BuildContext context) {
     final laneMap = _computeLanes(assignments);
     final hasPreview = selectedStart != null && selectedEnd != null;
-    final previewStart =
-        hasPreview ? _normalize(selectedStart!) : null;
-    final previewEnd =
-        hasPreview ? _normalize(selectedEnd!) : null;
+    final previewStart = hasPreview ? _normalize(selectedStart!) : null;
+    final previewEnd = hasPreview ? _normalize(selectedEnd!) : null;
     final previewLane = hasPreview && previewStart != null && previewEnd != null
         ? _previewLane(previewStart, previewEnd, laneMap)
         : null;
@@ -12902,8 +13615,7 @@ class _MiniCalendarPicker extends StatelessWidget {
             previewLane: previewLane,
             isEnabled: true,
           ),
-          defaultBuilder: (context, day, focusedDay) =>
-              _buildDayCell(
+          defaultBuilder: (context, day, focusedDay) => _buildDayCell(
             context: context,
             day: day,
             isSelected: false,
@@ -12988,10 +13700,9 @@ class _FileUploadRow extends StatelessWidget {
               children: [
                 Text(
                   label,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF5A6F6C)),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF5A6F6C),
+                  ),
                 ),
                 if (showFiles && files.isNotEmpty) ...[
                   const SizedBox(height: 6),
@@ -12999,9 +13710,7 @@ class _FileUploadRow extends StatelessWidget {
                     spacing: 6,
                     runSpacing: 6,
                     children: files
-                        .map(
-                          (file) => _FilePill(name: file.name),
-                        )
+                        .map((file) => _FilePill(name: file.name))
                         .toList(),
                   ),
                 ],
@@ -13030,10 +13739,9 @@ class _FilePill extends StatelessWidget {
       ),
       child: Text(
         name,
-        style: Theme.of(context)
-            .textTheme
-            .bodyMedium
-            ?.copyWith(color: const Color(0xFF6A4A2D)),
+        style: Theme.of(
+          context,
+        ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A4A2D)),
       ),
     );
   }
@@ -13060,9 +13768,9 @@ class _ChoiceToggle extends StatelessWidget {
         Text(
           label,
           style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
-                color: const Color(0xFF243B3A),
-              ),
+            fontWeight: FontWeight.w600,
+            color: const Color(0xFF243B3A),
+          ),
         ),
         const SizedBox(height: 6),
         Wrap(
@@ -13074,8 +13782,10 @@ class _ChoiceToggle extends StatelessWidget {
               onTap: () => onSelect(index),
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 200),
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: isSelected ? const Color(0xFF0B2E2B) : Colors.white,
                   borderRadius: BorderRadius.circular(16),
@@ -13088,11 +13798,11 @@ class _ChoiceToggle extends StatelessWidget {
                 child: Text(
                   options[index],
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: isSelected
-                            ? const Color(0xFFFFE9CC)
-                            : const Color(0xFF4B6763),
-                        fontWeight: FontWeight.w600,
-                      ),
+                    color: isSelected
+                        ? const Color(0xFFFFE9CC)
+                        : const Color(0xFF4B6763),
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
             );
@@ -13124,19 +13834,17 @@ class _DropdownField extends StatelessWidget {
         Text(
           label,
           style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
-                color: const Color(0xFF243B3A),
-              ),
+            fontWeight: FontWeight.w600,
+            color: const Color(0xFF243B3A),
+          ),
         ),
         const SizedBox(height: 6),
         DropdownButtonFormField<String>(
           initialValue: value,
           items: items
               .map(
-                (item) => DropdownMenuItem<String>(
-                  value: item,
-                  child: Text(item),
-                ),
+                (item) =>
+                    DropdownMenuItem<String>(value: item, child: Text(item)),
               )
               .toList(),
           onChanged: onChanged,
@@ -13158,44 +13866,8 @@ class _DropdownField extends StatelessWidget {
   }
 }
 
-// ignore: unused_element
-class _InfoPill extends StatelessWidget {
-  const _InfoPill({required this.label, required this.icon});
-
-  final String label;
-  final IconData icon;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: const Color(0xFFFCE6CC),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 16, color: const Color(0xFF6A4A2D)),
-                              const SizedBox(width: 6),
-          Text(
-            label,
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF6A4A2D)),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class _StatusPicker extends StatefulWidget {
-  const _StatusPicker({
-    required this.statuses,
-    required this.selected,
-  });
+  const _StatusPicker({required this.statuses, required this.selected});
 
   final List<String> statuses;
   final String selected;
@@ -13237,11 +13909,11 @@ class _StatusPickerState extends State<_StatusPicker> {
             child: Text(
               status,
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: isSelected
-                        ? const Color(0xFFFFE9CC)
-                        : const Color(0xFF4B6763),
-                    fontWeight: FontWeight.w600,
-                  ),
+                color: isSelected
+                    ? const Color(0xFFFFE9CC)
+                    : const Color(0xFF4B6763),
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
         );
@@ -13280,7 +13952,7 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
     final query = _searchController.text.trim().toLowerCase();
     final customers =
         ProjectStore.projectsByGroup[widget.group]?[widget.status] ??
-            const <String>[];
+        const <String>[];
     if (query.isEmpty) {
       return customers;
     }
@@ -13426,8 +14098,7 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                               Expanded(
                                 child: Text(
                                   widget.status,
-                                  style:
-                                      Theme.of(context).textTheme.titleLarge,
+                                  style: Theme.of(context).textTheme.titleLarge,
                                 ),
                               ),
                               if (!isExternal)
@@ -13435,16 +14106,15 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                                   label: 'Project +',
                                   height: 42,
                                   onTap: () async {
-                                    final result =
-                                        await Navigator.of(context)
-                                            .push<bool>(
-                                      _appPageRoute(
-                                        builder: (_) => AddProjectScreen(
-                                          initialGroup: widget.group,
-                                          initialStatus: widget.status,
-                                        ),
-                                      ),
-                                    );
+                                    final result = await Navigator.of(context)
+                                        .push<bool>(
+                                          _appPageRoute(
+                                            builder: (_) => AddProjectScreen(
+                                              initialGroup: widget.group,
+                                              initialStatus: widget.status,
+                                            ),
+                                          ),
+                                        );
                                     if (result == true) {
                                       setState(() {});
                                     }
@@ -13457,9 +14127,7 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                             alignment: Alignment.centerLeft,
                             child: Text(
                               '${widget.group} · ${ProjectStore.projectsByGroup[widget.group]?[widget.status]?.length ?? 0} projecten',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             ),
                           ),
@@ -13487,31 +14155,34 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                                   padding: const EdgeInsets.only(bottom: 10),
                                   child: _CustomerRow(
                                     name: name,
-                                    phone: ProjectStore.details[name]?.phone ?? '—',
+                                    phone:
+                                        ProjectStore.details[name]?.phone ??
+                                        '—',
                                     group: widget.group,
                                     status: widget.status,
                                     highlight: false,
-                                      onCenterTap: _selectionMode
-                                          ? () => _toggleSelection(name)
-                                          : () async {
-                                              final changed =
-                                                  await Navigator.of(context)
-                                                      .push<bool>(
-                                                _appPageRoute(
-                                                  builder: (_) =>
-                                                      ProjectDetailScreen(
-                                                    customerName: name,
-                                                    group: widget.group,
-                                                    status: widget.status,
+                                    onCenterTap: _selectionMode
+                                        ? () => _toggleSelection(name)
+                                        : () async {
+                                            final changed =
+                                                await Navigator.of(
+                                                  context,
+                                                ).push<bool>(
+                                                  _appPageRoute(
+                                                    builder: (_) =>
+                                                        ProjectDetailScreen(
+                                                          customerName: name,
+                                                          group: widget.group,
+                                                          status: widget.status,
+                                                        ),
                                                   ),
-                                                ),
-                                              );
-                                              setState(() {
-                                                if (changed == true) {
-                                                  _hasChanges = true;
-                                                }
-                                              });
-                                            },
+                                                );
+                                            setState(() {
+                                              if (changed == true) {
+                                                _hasChanges = true;
+                                              }
+                                            });
+                                          },
                                     onIconTap: () {
                                       if (!_selectionMode) {
                                         setState(() {
@@ -13520,27 +14191,28 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                                       }
                                       _toggleSelection(name);
                                     },
-                                      onArrowTap: _selectionMode
-                                          ? null
-                                          : () async {
-                                              final changed =
-                                                  await Navigator.of(context)
-                                                      .push<bool>(
-                                                _appPageRoute(
-                                                  builder: (_) =>
-                                                      ProjectDetailScreen(
-                                                    customerName: name,
-                                                    group: widget.group,
-                                                    status: widget.status,
+                                    onArrowTap: _selectionMode
+                                        ? null
+                                        : () async {
+                                            final changed =
+                                                await Navigator.of(
+                                                  context,
+                                                ).push<bool>(
+                                                  _appPageRoute(
+                                                    builder: (_) =>
+                                                        ProjectDetailScreen(
+                                                          customerName: name,
+                                                          group: widget.group,
+                                                          status: widget.status,
+                                                        ),
                                                   ),
-                                                ),
-                                              );
-                                              setState(() {
-                                                if (changed == true) {
-                                                  _hasChanges = true;
-                                                }
-                                              });
-                                            },
+                                                );
+                                            setState(() {
+                                              if (changed == true) {
+                                                _hasChanges = true;
+                                              }
+                                            });
+                                          },
                                     selected: _selectedCustomers.contains(name),
                                     showSelection: _selectionMode,
                                   ),
@@ -13572,8 +14244,7 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                         if (!isExternal) ...[
                           const SizedBox(height: 10),
                           _DangerButton(
-                            label:
-                                'Verwijderen (${_selectedCustomers.length})',
+                            label: 'Verwijderen (${_selectedCustomers.length})',
                             onTap: () => _deleteSelectedProjects(),
                           ),
                         ],
@@ -13662,7 +14333,9 @@ class _AddProjectScreenState extends State<AddProjectScreen> {
     final desc = _docDescriptionController.text.trim();
     if (desc.isEmpty || _docFile == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Vul een beschrijving in en kies een bestand')),
+        const SnackBar(
+          content: Text('Vul een beschrijving in en kies een bestand'),
+        ),
       );
       return;
     }
@@ -13685,8 +14358,7 @@ class _AddProjectScreenState extends State<AddProjectScreen> {
         _offerQuantities[key] = next;
       }
       if (_offerControllers.containsKey(key)) {
-        _offerControllers[key]!.text =
-            _offerQuantities[key]?.toString() ?? '';
+        _offerControllers[key]!.text = _offerQuantities[key]?.toString() ?? '';
       }
     });
   }
@@ -13700,11 +14372,7 @@ class _AddProjectScreenState extends State<AddProjectScreen> {
       final category = parts.first;
       final item = parts.sublist(1).join('::');
       lines.add(
-        OfferLine(
-          category: category,
-          item: item,
-          quantity: entry.value,
-        ),
+        OfferLine(category: category, item: item, quantity: entry.value),
       );
     }
     return lines;
@@ -13821,8 +14489,11 @@ class _AddProjectScreenState extends State<AddProjectScreen> {
                           _ChoiceToggle(
                             label: 'Type afwerking',
                             options: const ['PVC', 'MDF', 'Pleister'],
-                            selectedIndex:
-                                ['PVC', 'MDF', 'Pleister'].indexOf(_finishType),
+                            selectedIndex: [
+                              'PVC',
+                              'MDF',
+                              'Pleister',
+                            ].indexOf(_finishType),
                             onSelect: (index) => setState(() {
                               _finishType = ['PVC', 'MDF', 'Pleister'][index];
                             }),
@@ -13838,229 +14509,251 @@ class _AddProjectScreenState extends State<AddProjectScreen> {
                       ],
                     ),
                     const SizedBox(height: 16),
-                _InputCard(
-                  title: 'Documenten',
-                  children: [
-                    TextField(
-                      controller: _docDescriptionController,
-                      decoration: InputDecoration(
-                        hintText: 'Beschrijving',
-                        filled: true,
-                        fillColor: const Color(0xFFF4F1EA),
-                        enabledBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    _FileUploadRow(
-                      label: _docFile?.name ?? 'Bestand toevoegen',
-                      buttonLabel: 'Kies bestand',
-                      files: _docFile == null ? const [] : [_docFile!],
-                      onAdd: _pickFile,
-                    ),
-                    const SizedBox(height: 10),
-                    _PrimaryButton(
-                      label: 'Document toevoegen',
-                      onTap: _addDocument,
-                    ),
-                    if (_documents.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      ..._documents.map(
-                        (doc) => Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFF4F1EA),
-                              borderRadius: BorderRadius.circular(12),
-                              border:
-                                  Border.all(color: const Color(0xFFE1DAD0)),
+                    _InputCard(
+                      title: 'Documenten',
+                      children: [
+                        TextField(
+                          controller: _docDescriptionController,
+                          decoration: InputDecoration(
+                            hintText: 'Beschrijving',
+                            filled: true,
+                            fillColor: const Color(0xFFF4F1EA),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              borderSide: const BorderSide(
+                                color: Color(0xFFE1DAD0),
+                              ),
                             ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                            focusedBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              borderSide: const BorderSide(
+                                color: Color(0xFF0B2E2B),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        _FileUploadRow(
+                          label: _docFile?.name ?? 'Bestand toevoegen',
+                          buttonLabel: 'Kies bestand',
+                          files: _docFile == null ? const [] : [_docFile!],
+                          onAdd: _pickFile,
+                        ),
+                        const SizedBox(height: 10),
+                        _PrimaryButton(
+                          label: 'Document toevoegen',
+                          onTap: _addDocument,
+                        ),
+                        if (_documents.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          ..._documents.map(
+                            (doc) => Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Container(
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFF4F1EA),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: const Color(0xFFE1DAD0),
+                                  ),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      doc.description,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodyMedium
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    _FilePill(name: doc.file.name),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    _InputCard(
+                      title: 'Offerte',
+                      children: [
+                        if (OfferCatalogStore.categories.isEmpty)
+                          Text(
+                            'Nog geen offerte-elementen toegevoegd.',
+                            style: Theme.of(context).textTheme.bodyMedium
+                                ?.copyWith(color: const Color(0xFF6A7C78)),
+                          )
+                        else
+                          ...OfferCatalogStore.categories.map(
+                            (category) => ExpansionTile(
+                              tilePadding: EdgeInsets.zero,
+                              childrenPadding: EdgeInsets.zero,
+                              title: Text(
+                                category.name,
+                                style: Theme.of(context).textTheme.bodyMedium
+                                    ?.copyWith(fontWeight: FontWeight.w600),
+                              ),
                               children: [
-                                Text(
-                                  doc.description,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodyMedium
-                                      ?.copyWith(fontWeight: FontWeight.w600),
-                                ),
-                                const SizedBox(height: 6),
-                                _FilePill(name: doc.file.name),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-                const SizedBox(height: 16),
-                _InputCard(
-                  title: 'Offerte',
-                  children: [
-                    if (OfferCatalogStore.categories.isEmpty)
-                      Text(
-                        'Nog geen offerte-elementen toegevoegd.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
-                      )
-                    else
-                      ...OfferCatalogStore.categories.map(
-                        (category) => ExpansionTile(
-                          tilePadding: EdgeInsets.zero,
-                          childrenPadding: EdgeInsets.zero,
-                          title: Text(
-                            category.name,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(fontWeight: FontWeight.w600),
-                          ),
-                          children: [
-                            if (category.items.isEmpty)
-                              Align(
-                                alignment: Alignment.centerLeft,
-                                child: Text(
-                                  'Nog geen elementen toegevoegd.',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodySmall
-                                      ?.copyWith(
-                                        color: const Color(0xFF6A7C78),
-                                      ),
-                                ),
-                              )
-                            else
-                              ...category.items.map(
-                                (item) {
-                                  final key =
-                                      _offerKey(category.name, item.name);
-                                  final qty = _offerQuantities[key] ?? 0;
-                                  return Padding(
-                                    padding: const EdgeInsets.only(bottom: 8),
-                                    child: Row(
-                                      children: [
-                                        Expanded(
-                                          child: Column(
-                                            crossAxisAlignment:
-                                                CrossAxisAlignment.start,
-                                            children: [
-                                              Text(
-                                                item.name,
-                                                style: Theme.of(context)
-                                                    .textTheme
-                                                    .bodyMedium
-                                                    ?.copyWith(
-                                                      fontWeight:
-                                                          FontWeight.w600,
-                                                    ),
-                                              ),
-                                              if (_canSeeOfferPrices(
-                                                CurrentUserStore.role,
-                                              )) ...[
-                                                const SizedBox(height: 4),
+                                if (category.items.isEmpty)
+                                  Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: Text(
+                                      'Nog geen elementen toegevoegd.',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: const Color(0xFF6A7C78),
+                                          ),
+                                    ),
+                                  )
+                                else
+                                  ...category.items.map((item) {
+                                    final key = _offerKey(
+                                      category.name,
+                                      item.name,
+                                    );
+                                    final qty = _offerQuantities[key] ?? 0;
+                                    return Padding(
+                                      padding: const EdgeInsets.only(bottom: 8),
+                                      child: Row(
+                                        children: [
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
                                                 Text(
-                                                  'EUR ${_formatPrice(item.price)} / ${item.unit}',
+                                                  item.name,
                                                   style: Theme.of(context)
                                                       .textTheme
-                                                      .bodySmall
+                                                      .bodyMedium
                                                       ?.copyWith(
-                                                        color: const Color(
-                                                          0xFF6A7C78,
-                                                        ),
+                                                        fontWeight:
+                                                            FontWeight.w600,
                                                       ),
                                                 ),
+                                                if (_canSeeOfferPrices(
+                                                  CurrentUserStore.role,
+                                                )) ...[
+                                                  const SizedBox(height: 4),
+                                                  Text(
+                                                    'EUR ${_formatPrice(item.price)} / ${item.unit}',
+                                                    style: Theme.of(context)
+                                                        .textTheme
+                                                        .bodySmall
+                                                        ?.copyWith(
+                                                          color: const Color(
+                                                            0xFF6A7C78,
+                                                          ),
+                                                        ),
+                                                  ),
+                                                ],
                                               ],
-                                            ],
+                                            ),
                                           ),
-                                        ),
-                                        _offerQtyButton(
-                                          icon: Icons.remove,
-                                          onTap: qty == 0
-                                              ? null
-                                              : () => _updateOfferQuantity(
+                                          _offerQtyButton(
+                                            icon: Icons.remove,
+                                            onTap: qty == 0
+                                                ? null
+                                                : () => _updateOfferQuantity(
                                                     key,
                                                     -1,
                                                   ),
-                                        ),
-                                        const SizedBox(width: 6),
-                                        SizedBox(
-                                          width: 44,
-                                          child: TextField(
-                                            controller:
-                                                _controllerForOffer(key),
-                                            keyboardType: TextInputType.number,
-                                            textAlign: TextAlign.center,
-                                            decoration: InputDecoration(
-                                              isDense: true,
-                                              contentPadding:
-                                                  const EdgeInsets.symmetric(
-                                                vertical: 6,
-                                                horizontal: 6,
-                                              ),
-                                              filled: true,
-                                              fillColor:
-                                                  const Color(0xFFF4F1EA),
-                                              enabledBorder: OutlineInputBorder(
-                                                borderRadius:
-                                                    BorderRadius.circular(10),
-                                                borderSide: const BorderSide(
-                                                  color: Color(0xFFE1DAD0),
-                                                ),
-                                              ),
-                                              focusedBorder: OutlineInputBorder(
-                                                borderRadius:
-                                                    BorderRadius.circular(10),
-                                                borderSide: const BorderSide(
-                                                  color: Color(0xFF0B2E2B),
-                                                ),
-                                              ),
-                                            ),
-                                            onChanged: (value) {
-                                              final parsed =
-                                                  int.tryParse(value.trim());
-                                              setState(() {
-                                                if (parsed == null ||
-                                                    parsed <= 0) {
-                                                  _offerQuantities.remove(key);
-                                                } else {
-                                                  _offerQuantities[key] = parsed;
-                                                }
-                                              });
-                                            },
                                           ),
-                                        ),
-                                        const SizedBox(width: 6),
-                                        _offerQtyButton(
-                                          icon: Icons.add,
-                                          onTap: () =>
-                                              _updateOfferQuantity(key, 1),
-                                        ),
-                                      ],
-                                    ),
-                                  );
-                                },
-                              ),
-                            const SizedBox(height: 8),
-                          ],
-                        ),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                _InputCard(
-                  title: 'Status',
-                  children: [
+                                          const SizedBox(width: 6),
+                                          SizedBox(
+                                            width: 44,
+                                            child: TextField(
+                                              controller: _controllerForOffer(
+                                                key,
+                                              ),
+                                              keyboardType:
+                                                  TextInputType.number,
+                                              textAlign: TextAlign.center,
+                                              decoration: InputDecoration(
+                                                isDense: true,
+                                                contentPadding:
+                                                    const EdgeInsets.symmetric(
+                                                      vertical: 6,
+                                                      horizontal: 6,
+                                                    ),
+                                                filled: true,
+                                                fillColor: const Color(
+                                                  0xFFF4F1EA,
+                                                ),
+                                                enabledBorder:
+                                                    OutlineInputBorder(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            10,
+                                                          ),
+                                                      borderSide:
+                                                          const BorderSide(
+                                                            color: Color(
+                                                              0xFFE1DAD0,
+                                                            ),
+                                                          ),
+                                                    ),
+                                                focusedBorder:
+                                                    OutlineInputBorder(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            10,
+                                                          ),
+                                                      borderSide:
+                                                          const BorderSide(
+                                                            color: Color(
+                                                              0xFF0B2E2B,
+                                                            ),
+                                                          ),
+                                                    ),
+                                              ),
+                                              onChanged: (value) {
+                                                final parsed = int.tryParse(
+                                                  value.trim(),
+                                                );
+                                                setState(() {
+                                                  if (parsed == null ||
+                                                      parsed <= 0) {
+                                                    _offerQuantities.remove(
+                                                      key,
+                                                    );
+                                                  } else {
+                                                    _offerQuantities[key] =
+                                                        parsed;
+                                                  }
+                                                });
+                                              },
+                                            ),
+                                          ),
+                                          const SizedBox(width: 6),
+                                          _offerQtyButton(
+                                            icon: Icons.add,
+                                            onTap: () =>
+                                                _updateOfferQuantity(key, 1),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  }),
+                                const SizedBox(height: 8),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    _InputCard(
+                      title: 'Status',
+                      children: [
                         _ChoiceToggle(
                           label: 'Type',
                           options: _projectGroups,
@@ -14104,16 +14797,18 @@ class _AddProjectScreenState extends State<AddProjectScreen> {
                           return;
                         }
                         final estimatedDays =
-                            int.tryParse(_estimatedDaysController.text.trim()) ??
-                                1;
-                    ProjectStore.addProject(
-                      name: name,
-                      group: _selectedGroup,
-                      status: _selectedStatus,
-                      creator: 'Julie',
-                      offerLines: _buildOfferLines(),
-                      documents: _documents,
-                      details: ProjectDetails(
+                            int.tryParse(
+                              _estimatedDaysController.text.trim(),
+                            ) ??
+                            1;
+                        ProjectStore.addProject(
+                          name: name,
+                          group: _selectedGroup,
+                          status: _selectedStatus,
+                          creator: 'Julie',
+                          offerLines: _buildOfferLines(),
+                          documents: _documents,
+                          details: ProjectDetails(
                             address: _addressController.text.trim().isEmpty
                                 ? '—'
                                 : _addressController.text.trim(),
@@ -14194,9 +14889,7 @@ class ProjectLogScreen extends StatelessWidget {
                             ),
                             Text(
                               projectName,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                               overflow: TextOverflow.ellipsis,
                             ),
@@ -14211,9 +14904,7 @@ class ProjectLogScreen extends StatelessWidget {
                       ? Center(
                           child: Text(
                             'Nog geen logs beschikbaar.',
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
+                            style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         )
@@ -14306,10 +14997,7 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
 
   void _deny(BuildContext context) {
     request.status = 'Geweigerd';
-    ProjectLogStore.add(
-      request.project,
-      'Aanvraag geschatte dagen geweigerd',
-    );
+    ProjectLogStore.add(request.project, 'Aanvraag geschatte dagen geweigerd');
     AppDataStore.scheduleSave();
     onUpdated?.call();
     Navigator.of(context).pop();
@@ -14344,10 +15032,12 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
             newEnd.add(const Duration(days: 1)),
             request.team,
           );
-    final overlap = newEnd != null &&
+    final overlap =
+        newEnd != null &&
         nextAssignment != null &&
-        !_normalizeDateOnly(newEnd)
-            .isBefore(_normalizeDateOnly(nextAssignment.startDate));
+        !_normalizeDateOnly(
+          newEnd,
+        ).isBefore(_normalizeDateOnly(nextAssignment.startDate));
 
     return Scaffold(
       body: Stack(
@@ -14374,9 +15064,7 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                           ),
                           Text(
                             request.project,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
+                            style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(color: const Color(0xFF6A7C78)),
                           ),
                         ],
@@ -14388,10 +15076,7 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                 _InputCard(
                   title: 'Wijziging',
                   children: [
-                    _PlainInfoLine(
-                      label: 'Team',
-                      value: request.team,
-                    ),
+                    _PlainInfoLine(label: 'Team', value: request.team),
                     _PlainInfoLine(
                       label: 'Aangevraagd door',
                       value: request.requester,
@@ -14424,20 +15109,18 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                       const SizedBox(height: 8),
                       Text(
                         'Er komt ${_formatDays(-delta)} vrij vanaf ${_formatDate(freeDay)}.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodySmall
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: const Color(0xFF6A7C78),
+                        ),
                       ),
                     ],
                     if (delta > 0 && newEnd != null) ...[
                       const SizedBox(height: 8),
                       Text(
                         'Er zijn ${_formatDays(delta)} extra nodig tot ${_formatDate(newEnd)}.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodySmall
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: const Color(0xFF6A7C78),
+                        ),
                       ),
                     ],
                     if (overlap) ...[
@@ -14446,10 +15129,9 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                         'Let op: dit overlapt met de volgende planning '
                         '(${_formatDate(nextAssignment.startDate)} - '
                         '${_formatDate(nextAssignment.endDate)}).',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodySmall
-                            ?.copyWith(color: const Color(0xFFB42318)),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: const Color(0xFFB42318),
+                        ),
                       ),
                     ],
                   ],
@@ -14471,9 +15153,7 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                         const SizedBox(width: 6),
                         Text(
                           'Huidige planning',
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall
+                          style: Theme.of(context).textTheme.bodySmall
                               ?.copyWith(color: const Color(0xFF6A7C78)),
                         ),
                         const SizedBox(width: 12),
@@ -14488,9 +15168,7 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                         const SizedBox(width: 6),
                         Text(
                           'Nieuwe planning',
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall
+                          style: Theme.of(context).textTheme.bodySmall
                               ?.copyWith(color: const Color(0xFF6A7C78)),
                         ),
                       ],
@@ -14499,10 +15177,9 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                     if (teamAssignments.isEmpty)
                       Text(
                         'Geen planning gevonden voor dit team.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(color: const Color(0xFF6A7C78)),
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: const Color(0xFF6A7C78),
+                        ),
                       )
                     else
                       _TeamMonthlyScheduleCard(
@@ -14513,8 +15190,8 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                         canEditPlanning: false,
                         onReschedule: (assignment, date) {},
                         availableStarts: (team, assignment, start) => const [],
-                        calculateEndDate:
-                            (team, start, days, isBackorder) => null,
+                        calculateEndDate: (team, start, days, isBackorder) =>
+                            null,
                         showHeader: false,
                         initiallyExpanded: true,
                         previewProject: request.project,
@@ -14655,8 +15332,9 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     final keys = {...prevMap.keys, ...nextMap.keys};
     for (final key in keys) {
       final parts = key.split('::');
-      final label =
-          parts.length >= 2 ? '${parts[0]} - ${parts.sublist(1).join('::')}' : key;
+      final label = parts.length >= 2
+          ? '${parts[0]} - ${parts.sublist(1).join('::')}'
+          : key;
       final prevQty = prevMap[key];
       final nextQty = nextMap[key];
       if (prevQty == null && nextQty != null) {
@@ -14665,10 +15343,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
           'Offerte toegevoegd: $label (x$nextQty)',
         );
       } else if (prevQty != null && nextQty == null) {
-        ProjectLogStore.add(
-          widget.customerName,
-          'Offerte verwijderd: $label',
-        );
+        ProjectLogStore.add(widget.customerName, 'Offerte verwijderd: $label');
       } else if (prevQty != null && nextQty != null && prevQty != nextQty) {
         ProjectLogStore.add(
           widget.customerName,
@@ -14685,7 +15360,9 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     final prevKeys = previous.map(_documentKey).toSet();
     final nextKeys = next.map(_documentKey).toSet();
     final added = next.where((doc) => !prevKeys.contains(_documentKey(doc)));
-    final removed = previous.where((doc) => !nextKeys.contains(_documentKey(doc)));
+    final removed = previous.where(
+      (doc) => !nextKeys.contains(_documentKey(doc)),
+    );
     for (final doc in added) {
       ProjectLogStore.add(
         widget.customerName,
@@ -14705,12 +15382,15 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     final previousOffers =
         ProjectStore.offers[widget.customerName] ?? const <OfferLine>[];
     final previousDocs =
-        ProjectStore.documents[widget.customerName] ?? const <ProjectDocument>[];
+        ProjectStore.documents[widget.customerName] ??
+        const <ProjectDocument>[];
     final parsedDays = int.tryParse(_daysController.text.trim()) ?? 1;
     final currentStatus =
-        ProjectStore.findStatusForProject(widget.customerName) ?? _currentStatus;
-    final normalizedDays =
-        currentStatus == 'Ingepland' ? _clampScheduledDays(parsedDays) : parsedDays;
+        ProjectStore.findStatusForProject(widget.customerName) ??
+        _currentStatus;
+    final normalizedDays = currentStatus == 'Ingepland'
+        ? _clampScheduledDays(parsedDays)
+        : parsedDays;
     final details = ProjectDetails(
       address: _addressController.text.trim(),
       phone: _phoneController.text.trim().isEmpty
@@ -14732,8 +15412,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       );
       if (index != -1) {
         final assignment = ScheduleStore.scheduled[index];
-        if (!assignment.isBackorder &&
-            assignment.group != 'Nabestellingen') {
+        if (!assignment.isBackorder && assignment.group != 'Nabestellingen') {
           final start = _normalizeDateOnly(assignment.startDate);
           final end = _endDateFromWorkingDays(
             start,
@@ -14757,9 +15436,9 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     _logDocumentDiff(previousDocs, docs);
     AppDataStore.scheduleSave();
     setState(() => _isEditingInfo = false);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Gegevens opgeslagen')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Gegevens opgeslagen')));
   }
 
   @override
@@ -14792,15 +15471,15 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
         : _editableStatusStages.first;
     final details = ProjectStore.details[widget.customerName];
     OfferCatalogStore.seedIfEmpty();
-    _beforePhotos =
-        List<PlatformFile>.from(ProjectStore.beforePhotos[widget.customerName] ??
-            const []);
-    _afterPhotos =
-        List<PlatformFile>.from(ProjectStore.afterPhotos[widget.customerName] ??
-            const []);
-    _extraWorks =
-        List<ExtraWorkEntry>.from(ProjectStore.extraWorks[widget.customerName] ??
-            const []);
+    _beforePhotos = List<PlatformFile>.from(
+      ProjectStore.beforePhotos[widget.customerName] ?? const [],
+    );
+    _afterPhotos = List<PlatformFile>.from(
+      ProjectStore.afterPhotos[widget.customerName] ?? const [],
+    );
+    _extraWorks = List<ExtraWorkEntry>.from(
+      ProjectStore.extraWorks[widget.customerName] ?? const [],
+    );
     _isBackorder = ProjectStore.isBackorder[widget.customerName] ?? false;
     _backorderItems
       ..clear()
@@ -14812,8 +15491,9 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     _deliveryController = TextEditingController(text: details?.delivery ?? '');
     _finishController = TextEditingController(text: details?.finish ?? '');
     _notesController = TextEditingController(text: details?.extraNotes ?? '');
-    _daysController =
-        TextEditingController(text: details?.estimatedDays.toString() ?? '');
+    _daysController = TextEditingController(
+      text: details?.estimatedDays.toString() ?? '',
+    );
     _editDocuments
       ..clear()
       ..addAll(ProjectStore.documents[widget.customerName] ?? const []);
@@ -14856,7 +15536,8 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
 
   void _loadOfferQuantities() {
     _offerQuantities.clear();
-    final lines = ProjectStore.offers[widget.customerName] ?? const <OfferLine>[];
+    final lines =
+        ProjectStore.offers[widget.customerName] ?? const <OfferLine>[];
     for (final line in lines) {
       _offerQuantities[_offerKey(line.category, line.item)] = line.quantity;
     }
@@ -14892,11 +15573,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       final category = parts.first;
       final item = parts.sublist(1).join('::');
       lines.add(
-        OfferLine(
-          category: category,
-          item: item,
-          quantity: entry.value,
-        ),
+        OfferLine(category: category, item: item, quantity: entry.value),
       );
     }
     return lines;
@@ -15053,8 +15730,9 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       if (index < 0 || index >= _extraWorks.length) return;
       _lastDeletedExtraWork = _extraWorks.removeAt(index);
       _lastDeletedExtraWorkIndex = index;
-      ProjectStore.extraWorks[widget.customerName] =
-          List<ExtraWorkEntry>.from(_extraWorks);
+      ProjectStore.extraWorks[widget.customerName] = List<ExtraWorkEntry>.from(
+        _extraWorks,
+      );
       if (_editingExtraWorkIndex == index) {
         _editingExtraWorkIndex = null;
         _extraWorkController.clear();
@@ -15079,12 +15757,15 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     if (!mounted) return;
     final entry = _lastDeletedExtraWork;
     if (entry == null) return;
-    final insertAt = (_lastDeletedExtraWorkIndex ?? _extraWorks.length)
-        .clamp(0, _extraWorks.length);
+    final insertAt = (_lastDeletedExtraWorkIndex ?? _extraWorks.length).clamp(
+      0,
+      _extraWorks.length,
+    );
     setState(() {
       _extraWorks.insert(insertAt, entry);
-      ProjectStore.extraWorks[widget.customerName] =
-          List<ExtraWorkEntry>.from(_extraWorks);
+      ProjectStore.extraWorks[widget.customerName] = List<ExtraWorkEntry>.from(
+        _extraWorks,
+      );
       _lastDeletedExtraWork = null;
       _lastDeletedExtraWorkIndex = null;
     });
@@ -15246,9 +15927,9 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       'Aanvraag geschatte dagen: $currentDays → $parsed',
     );
     _daysChangeController.clear();
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Aanvraag verstuurd.')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Aanvraag verstuurd.')));
     setState(() {});
   }
 
@@ -15262,8 +15943,9 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     final canEditCompletion = isExternal && _currentStatus != 'Afgewerkt';
     final canAddComment = CurrentUserStore.role == 'Projectleider';
     final canRequestDaysChange = _isExternalRole(CurrentUserStore.role);
-    final pendingDaysRequest =
-        EstimatedDaysChangeStore.pendingForProject(widget.customerName);
+    final pendingDaysRequest = EstimatedDaysChangeStore.pendingForProject(
+      widget.customerName,
+    );
     return Scaffold(
       body: Stack(
         children: [
@@ -15310,9 +15992,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                           Expanded(
                             child: Text(
                               '${widget.group} · ${widget.status}',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             ),
                           ),
@@ -15350,726 +16030,843 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                         Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                      if (canEditStatus)
-                        _StatusCard(
-                          currentStatus: _currentStatus,
-                          pendingStatus: _pendingStatus,
-                          onChanged: (value) =>
-                              setState(() => _pendingStatus = value),
-                          onSave: () {
-                            setState(() => _currentStatus = _pendingStatus);
-                            ProjectStore.updateStatus(
-                              name: widget.customerName,
-                              group: widget.group,
-                              status: _currentStatus,
-                            );
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Status opgeslagen'),
-                              ),
-                            );
-                            Navigator.of(context).pop(true);
-                          },
-                        )
-                      else
-                        _InfoTextBlock(
-                          title: 'Status',
-                          lines: [
-                            _PlainInfoLine(
-                              label: 'Huidige status',
-                              value: _currentStatus,
-                            ),
-                          ],
-                        ),
-                      const SizedBox(height: 16),
-                      _ProjectInfoCard(
-                        customerName: widget.customerName,
-                        creator:
-                            ProjectStore.creators[widget.customerName] ?? 'Julie',
-                        details: ProjectStore.details[widget.customerName],
-                        isEditing: canEditInfo && _isEditingInfo,
-                        canEdit: canEditInfo,
-                        addressController: _addressController,
-                        phoneController: _phoneController,
-                        deliveryController: _deliveryController,
-                        finishController: _finishController,
-                        notesController: _notesController,
-                        daysController: _daysController,
-                        completionTeam:
-                            ProjectStore.completionTeams[widget.customerName],
-                        onSave: () {
-                          final details = ProjectDetails(
-                            address: _addressController.text.trim(),
-                            phone: _phoneController.text.trim().isEmpty
-                                ? '—'
-                                : _phoneController.text.trim(),
-                            delivery: _deliveryController.text.trim(),
-                            finish: _finishController.text.trim(),
-                            extraNotes: _notesController.text.trim(),
-                            estimatedDays:
-                                int.tryParse(_daysController.text.trim()) ?? 1,
-                          );
-                          ProjectStore.details[widget.customerName] = details;
-                          ProjectStore.offers[widget.customerName] =
-                              _buildOfferLines();
-                          AppDataStore.scheduleSave();
-                          setState(() => _isEditingInfo = false);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Gegevens opgeslagen')),
-                          );
-                        },
-                      ),
-                      if (canRequestDaysChange && !_isBackorder) ...[
-                        const SizedBox(height: 16),
-                        if (pendingDaysRequest != null)
-                          _InfoTextBlock(
-                            title: 'Aanvraag geschatte dagen',
-                            lines: [
-                              _PlainInfoLine(
-                                label: 'Aangevraagd',
-                                value:
-                                    '${pendingDaysRequest.oldDays} → ${pendingDaysRequest.newDays} dagen',
-                              ),
-                              _PlainInfoLine(
-                                label: 'Status',
-                                value: pendingDaysRequest.status,
-                              ),
-                            ],
-                          )
-                        else
-                          _InputCard(
-                            title: 'Geschatte dagen aanpassen',
-                            children: [
-                              _PlainInfoLine(
-                                label: 'Huidig',
-                                value: _formatDays(
-                                  ProjectStore.details[widget.customerName]
-                                          ?.estimatedDays ??
-                                      1,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              TextField(
-                                controller: _daysChangeController,
-                                keyboardType: TextInputType.number,
-                                decoration: InputDecoration(
-                                  hintText: 'Nieuw aantal dagen',
-                                  filled: true,
-                                  fillColor: const Color(0xFFF4F1EA),
-                                  enabledBorder: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(14),
-                                    borderSide:
-                                        const BorderSide(color: Color(0xFFE1DAD0)),
-                                  ),
-                                  focusedBorder: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(14),
-                                    borderSide:
-                                        const BorderSide(color: Color(0xFF0B2E2B)),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 10),
-                              _PrimaryButton(
-                                label: 'Aanvraag versturen',
-                                onTap: _submitEstimatedDaysChange,
-                              ),
-                            ],
-                          ),
-                      ],
-                      if (canEditInfo && _isEditingInfo) ...[
-                        const SizedBox(height: 16),
-                        _InputCard(
-                          title: 'Offerte',
-                          children: [
-                            if (OfferCatalogStore.categories.isEmpty)
-                              Text(
-                                'Nog geen offerte-elementen toegevoegd.',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .bodyMedium
-                                    ?.copyWith(color: const Color(0xFF6A7C78)),
+                            if (canEditStatus)
+                              _StatusCard(
+                                currentStatus: _currentStatus,
+                                pendingStatus: _pendingStatus,
+                                onChanged: (value) =>
+                                    setState(() => _pendingStatus = value),
+                                onSave: () {
+                                  setState(
+                                    () => _currentStatus = _pendingStatus,
+                                  );
+                                  ProjectStore.updateStatus(
+                                    name: widget.customerName,
+                                    group: widget.group,
+                                    status: _currentStatus,
+                                  );
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text('Status opgeslagen'),
+                                    ),
+                                  );
+                                  Navigator.of(context).pop(true);
+                                },
                               )
                             else
-                              ...OfferCatalogStore.categories.map(
-                                (category) => ExpansionTile(
-                                  tilePadding: EdgeInsets.zero,
-                                  childrenPadding: EdgeInsets.zero,
-                                  title: Text(
-                                    category.name,
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(fontWeight: FontWeight.w600),
-                                  ),
-                                  children: [
-                                    if (category.items.isEmpty)
-                                      Align(
-                                        alignment: Alignment.centerLeft,
-                                        child: Text(
-                                          'Nog geen elementen toegevoegd.',
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .bodySmall
-                                              ?.copyWith(
-                                                color: const Color(0xFF6A7C78),
-                                              ),
-                                        ),
-                                      )
-                                    else
-                                      ...category.items.map(
-                                        (item) {
-                                          final key =
-                                              _offerKey(category.name, item.name);
-                                          final qty = _offerQuantities[key] ?? 0;
-                                          return Padding(
-                                            padding:
-                                                const EdgeInsets.only(bottom: 8),
-                                            child: Row(
-                                              children: [
-                                                Expanded(
-                                                  child: Column(
-                                                    crossAxisAlignment:
-                                                        CrossAxisAlignment.start,
-                                                    children: [
-                                                      Text(
-                                                        item.name,
-                                                        style: Theme.of(context)
-                                                            .textTheme
-                                                            .bodyMedium
-                                                            ?.copyWith(
-                                                              fontWeight:
-                                                                  FontWeight.w600,
-                                                            ),
-                                                      ),
-                                                      if (_canSeeOfferPrices(
-                                                        CurrentUserStore.role,
-                                                      )) ...[
-                                                        const SizedBox(height: 4),
-                                                        Text(
-                                                          'EUR ${_formatPrice(item.price)} / ${item.unit}',
-                                                          style: Theme.of(context)
-                                                              .textTheme
-                                                              .bodySmall
-                                                              ?.copyWith(
-                                                                color: const Color(
-                                                                  0xFF6A7C78,
-                                                                ),
-                                                              ),
-                                                        ),
-                                                      ],
-                                                    ],
-                                                  ),
-                                                ),
-                                                _offerQtyButton(
-                                                  icon: Icons.remove,
-                                                  onTap: qty == 0
-                                                      ? null
-                                                      : () => _updateOfferQuantity(
-                                                            key,
-                                                            -1,
-                                                          ),
-                                                ),
-                                                const SizedBox(width: 6),
-                                                SizedBox(
-                                                  width: 44,
-                                                  child: TextField(
-                                                    controller:
-                                                        _controllerForOffer(key),
-                                                    keyboardType:
-                                                        TextInputType.number,
-                                                    textAlign: TextAlign.center,
-                                                    decoration: InputDecoration(
-                                                      isDense: true,
-                                                      contentPadding:
-                                                          const EdgeInsets.symmetric(
-                                                        vertical: 6,
-                                                        horizontal: 6,
-                                                      ),
-                                                      filled: true,
-                                                      fillColor:
-                                                          const Color(0xFFF4F1EA),
-                                                      enabledBorder:
-                                                          OutlineInputBorder(
-                                                        borderRadius:
-                                                            BorderRadius.circular(
-                                                                10),
-                                                        borderSide:
-                                                            const BorderSide(
-                                                          color: Color(0xFFE1DAD0),
-                                                        ),
-                                                      ),
-                                                      focusedBorder:
-                                                          OutlineInputBorder(
-                                                        borderRadius:
-                                                            BorderRadius.circular(
-                                                                10),
-                                                        borderSide:
-                                                            const BorderSide(
-                                                          color: Color(0xFF0B2E2B),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                    onChanged: (value) {
-                                                      final parsed = int.tryParse(
-                                                          value.trim());
-                                                      setState(() {
-                                                        if (parsed == null ||
-                                                            parsed <= 0) {
-                                                          _offerQuantities
-                                                              .remove(key);
-                                                        } else {
-                                                          _offerQuantities[key] =
-                                                              parsed;
-                                                        }
-                                                      });
-                                                    },
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 6),
-                                                _offerQtyButton(
-                                                  icon: Icons.add,
-                                                  onTap: () =>
-                                                      _updateOfferQuantity(
-                                                    key,
-                                                    1,
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          );
-                                        },
-                                      ),
-                                    const SizedBox(height: 8),
-                                  ],
-                                ),
-                              ),
-                          ],
-                        ),
-                      ] else if (ProjectStore.offers[widget.customerName]
-                              ?.isNotEmpty ==
-                          true) ...[
-                        const SizedBox(height: 16),
-                        _OfferOverviewCard(customerName: widget.customerName),
-                      ],
-                      const SizedBox(height: 16),
-                      if (canEditInfo && _isEditingInfo)
-                        _InputCard(
-                          title: 'Documenten',
-                          children: [
-                            TextField(
-                              controller: _docDescriptionController,
-                              decoration: InputDecoration(
-                                hintText: 'Beschrijving',
-                                filled: true,
-                                fillColor: const Color(0xFFF4F1EA),
-                                enabledBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(14),
-                                  borderSide:
-                                      const BorderSide(color: Color(0xFFE1DAD0)),
-                                ),
-                                focusedBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(14),
-                                  borderSide:
-                                      const BorderSide(color: Color(0xFF0B2E2B)),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 10),
-                            _FileUploadRow(
-                              label: _docFile?.name ?? 'Bestand toevoegen',
-                              buttonLabel: 'Kies bestand',
-                              files: _docFile == null ? const [] : [_docFile!],
-                              onAdd: _pickDocumentFile,
-                            ),
-                            const SizedBox(height: 10),
-                            _PrimaryButton(
-                              label: 'Document toevoegen',
-                              onTap: _addDocument,
-                            ),
-                            if (_editDocuments.isNotEmpty) ...[
-                              const SizedBox(height: 12),
-                              ..._editDocuments.map(
-                                (doc) => Padding(
-                                  padding: const EdgeInsets.only(bottom: 8),
-                                  child: Container(
-                                    padding: const EdgeInsets.all(12),
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFFF4F1EA),
-                                      borderRadius: BorderRadius.circular(12),
-                                      border: Border.all(
-                                        color: const Color(0xFFE1DAD0),
-                                      ),
-                                    ),
-                                    child: Row(
-                                      children: [
-                                        Expanded(
-                                          child: Text(
-                                            doc.description,
-                                            style: Theme.of(context)
-                                                .textTheme
-                                                .bodyMedium
-                                                ?.copyWith(
-                                                  fontWeight: FontWeight.w600,
-                                                ),
-                                          ),
-                                        ),
-                                        IconButton(
-                                          icon: const Icon(Icons.delete_outline,
-                                              size: 18),
-                                          color: const Color(0xFFB42318),
-                                          onPressed: () => _removeDocument(doc),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ],
-                        )
-                      else if (ProjectStore.documents[widget.customerName]
-                              ?.isNotEmpty ==
-                          true)
-                        _ProjectDocumentsCard(
-                          customerName: widget.customerName,
-                        ),
-                      if (canEditInfo && _isEditingInfo) ...[
-                        const SizedBox(height: 16),
-                        _DangerButton(
-                          label: 'Project verwijderen',
-                          onTap: () async {
-                            final confirmed = await showDialog<bool>(
-                              context: context,
-                              builder: (dialogContext) => AlertDialog(
-                                title: const Text('Project verwijderen?'),
-                                content: Text(
-                                  'Dit verwijdert ${widget.customerName} definitief.',
-                                ),
-                                actions: [
-                                  TextButton(
-                                    onPressed: () =>
-                                        Navigator.of(dialogContext).pop(false),
-                                    child: const Text('Annuleren'),
-                                  ),
-                                  TextButton(
-                                    onPressed: () =>
-                                        Navigator.of(dialogContext).pop(true),
-                                    child: const Text('Verwijderen'),
+                              _InfoTextBlock(
+                                title: 'Status',
+                                lines: [
+                                  _PlainInfoLine(
+                                    label: 'Huidige status',
+                                    value: _currentStatus,
                                   ),
                                 ],
                               ),
-                            );
-                            if (confirmed != true) return;
-                            ProjectStore.deleteProject(widget.customerName);
-                            if (!context.mounted) return;
-                            Navigator.of(context).pop(true);
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Project verwijderd'),
-                              ),
-                            );
-                          },
-                        ),
-                      ],
-                          ],
-                        )
-                      else if (_tabIndex == 1)
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                      _ProjectSiteFollowUp(
-                        siteTabIndex: _siteTabIndex,
-                        onTabChange: (index) =>
-                            setState(() => _siteTabIndex = index),
-                        beforePhotos: _beforePhotos,
-                        afterPhotos: _afterPhotos,
-                        canEdit: canEditSite,
-                        onAddBefore: _pickBeforePhotos,
-                        onAddAfter: _pickAfterPhotos,
-                        onRemoveBefore: _removeBeforePhoto,
-                        onRemoveAfter: _removeAfterPhoto,
-                      ),
-                      if ((ProjectStore.comments[widget.customerName]?.isNotEmpty ??
-                              false) ||
-                          canAddComment) ...[
-                        const SizedBox(height: 16),
-                        _ProjectCommentsSection(
-                          comments: ProjectStore.comments[widget.customerName] ??
-                              const [],
-                          canAdd: canAddComment,
-                          controller: _commentController,
-                          onAdd: () {
-                            final text = _commentController.text.trim();
-                            if (text.isEmpty) return;
-                            setState(() {
-                              ProjectStore.addComment(widget.customerName, text);
-                              _commentController.clear();
-                            });
-                          },
-                        ),
-                      ],
-                      const SizedBox(height: 16),
-                      _ExtraWorkSection(
-                        canEdit: canEditSite,
-                        isEditingExtraWork: _editingExtraWorkIndex != null,
-                        extraWorks: _extraWorks,
-                        extraWorkController: _extraWorkController,
-                        extraHoursController: _extraHoursController,
-                        extraWorkChargeType: _extraWorkChargeType,
-                        onChargeTypeChanged: (value) => setState(() {
-                          _extraWorkChargeType =
-                              value ?? _extraWorkChargeTypes.first;
-                        }),
-                        extraWorkFiles: _extraWorkFiles,
-                        onRemoveExtraPhoto: (index) => setState(() {
-                          if (index < 0 || index >= _extraWorkFiles.length) {
-                            return;
-                          }
-                          _extraWorkFiles.removeAt(index);
-                        }),
-                        onEditExtraWork: _editExtraWork,
-                        onDeleteExtraWork: _deleteExtraWork,
-                        onPickExtraPhotos: _pickExtraWorkPhotos,
-                        onAddExtraWork: _addExtraWork,
-                        showExtraWorkSection:
-                            _extraWorks.isNotEmpty || canEditSite,
-                      ),
-                      if (_isBackorder ||
-                          ProjectStore.backorderItems[widget.customerName]
-                                  ?.isNotEmpty ==
-                              true ||
-                          canEditCompletion) ...[
-                        const SizedBox(height: 16),
-                        _InputCard(
-                          title: 'Afronding',
-                          children: [
-                            if (canEditCompletion) ...[
-                              _ChoiceToggle(
-                                label: 'Status',
-                                options: const ['Nabestelling', 'Klaar'],
-                                selectedIndex: _isBackorder ? 0 : 1,
-                                onSelect: (index) => setState(() {
-                                  _isBackorder = index == 0;
-                                }),
-                              ),
-                              if (_isBackorder) ...[
-                                const SizedBox(height: 12),
-                                TextField(
-                                  controller: _backorderNoteController,
-                                  maxLines: 3,
-                                  decoration: InputDecoration(
-                                    hintText: 'Beschrijving nabestelling',
-                                    filled: true,
-                                    fillColor: const Color(0xFFF4F1EA),
-                                    enabledBorder: OutlineInputBorder(
-                                      borderRadius: BorderRadius.circular(14),
-                                      borderSide: const BorderSide(
-                                        color: Color(0xFFE1DAD0),
-                                      ),
-                                    ),
-                                    focusedBorder: OutlineInputBorder(
-                                      borderRadius: BorderRadius.circular(14),
-                                      borderSide: const BorderSide(
-                                        color: Color(0xFF0B2E2B),
-                                      ),
-                                    ),
+                            const SizedBox(height: 16),
+                            _ProjectInfoCard(
+                              customerName: widget.customerName,
+                              creator:
+                                  ProjectStore.creators[widget.customerName] ??
+                                  'Julie',
+                              details:
+                                  ProjectStore.details[widget.customerName],
+                              isEditing: canEditInfo && _isEditingInfo,
+                              canEdit: canEditInfo,
+                              addressController: _addressController,
+                              phoneController: _phoneController,
+                              deliveryController: _deliveryController,
+                              finishController: _finishController,
+                              notesController: _notesController,
+                              daysController: _daysController,
+                              completionTeam: ProjectStore
+                                  .completionTeams[widget.customerName],
+                              onSave: () {
+                                final details = ProjectDetails(
+                                  address: _addressController.text.trim(),
+                                  phone: _phoneController.text.trim().isEmpty
+                                      ? '—'
+                                      : _phoneController.text.trim(),
+                                  delivery: _deliveryController.text.trim(),
+                                  finish: _finishController.text.trim(),
+                                  extraNotes: _notesController.text.trim(),
+                                  estimatedDays:
+                                      int.tryParse(
+                                        _daysController.text.trim(),
+                                      ) ??
+                                      1,
+                                );
+                                ProjectStore.details[widget.customerName] =
+                                    details;
+                                ProjectStore.offers[widget.customerName] =
+                                    _buildOfferLines();
+                                AppDataStore.scheduleSave();
+                                setState(() => _isEditingInfo = false);
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Gegevens opgeslagen'),
                                   ),
-                                ),
-                                const SizedBox(height: 12),
-                                _AddItemRow(
-                                  controller: _backorderController,
-                                  onAdd: _addBackorderItem,
-                                ),
-                                const SizedBox(height: 10),
-                                if (_backorderItems.isEmpty)
-                                  Text(
-                                    'Nog geen materialen',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(
-                                          color: const Color(0xFF6A7C78),
-                                        ),
-                                  )
-                                else
-                                  ..._backorderItems.asMap().entries.map(
-                                    (entry) => Padding(
-                                      padding: const EdgeInsets.only(bottom: 8),
-                                      child: _EditableBackorderItemRow(
-                                        label: entry.value,
-                                        onEdit: () =>
-                                            _editBackorderItem(entry.key),
-                                        onDelete: () =>
-                                            _deleteBackorderItem(entry.key),
+                                );
+                              },
+                            ),
+                            if (canRequestDaysChange && !_isBackorder) ...[
+                              const SizedBox(height: 16),
+                              if (pendingDaysRequest != null)
+                                _InfoTextBlock(
+                                  title: 'Aanvraag geschatte dagen',
+                                  lines: [
+                                    _PlainInfoLine(
+                                      label: 'Aangevraagd',
+                                      value:
+                                          '${pendingDaysRequest.oldDays} → ${pendingDaysRequest.newDays} dagen',
+                                    ),
+                                    _PlainInfoLine(
+                                      label: 'Status',
+                                      value: pendingDaysRequest.status,
+                                    ),
+                                  ],
+                                )
+                              else
+                                _InputCard(
+                                  title: 'Geschatte dagen aanpassen',
+                                  children: [
+                                    _PlainInfoLine(
+                                      label: 'Huidig',
+                                      value: _formatDays(
+                                        ProjectStore
+                                                .details[widget.customerName]
+                                                ?.estimatedDays ??
+                                            1,
                                       ),
                                     ),
-                                  ),
-                                const SizedBox(height: 8),
-                                _PrimaryButton(
-                                  label: 'Verzenden',
-                                  onTap: () {
-                                    if (_backorderItems.isEmpty) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                            'Voeg eerst materialen toe.',
+                                    const SizedBox(height: 8),
+                                    TextField(
+                                      controller: _daysChangeController,
+                                      keyboardType: TextInputType.number,
+                                      decoration: InputDecoration(
+                                        hintText: 'Nieuw aantal dagen',
+                                        filled: true,
+                                        fillColor: const Color(0xFFF4F1EA),
+                                        enabledBorder: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            14,
+                                          ),
+                                          borderSide: const BorderSide(
+                                            color: Color(0xFFE1DAD0),
                                           ),
                                         ),
-                                      );
-                                      return;
-                                    }
-                                    if (!_hasBeforeAfterPhotos()) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                            'Voeg foto’s voor en na de werf toe.',
+                                        focusedBorder: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            14,
+                                          ),
+                                          borderSide: const BorderSide(
+                                            color: Color(0xFF0B2E2B),
                                           ),
                                         ),
-                                      );
-                                      return;
-                                    }
-                                    ProjectStore.setBackorder(
-                                      widget.customerName,
-                                      backorder: true,
-                                      items: _backorderItems,
-                                    );
-                                    final note =
-                                        _backorderNoteController.text.trim();
-                                    final previousNote =
-                                        ProjectStore.backorderNotes[widget.customerName] ??
-                                            '';
-                                    if (note.isNotEmpty) {
-                                      ProjectStore.backorderNotes[
-                                          widget.customerName] = note;
-                                    } else {
-                                      ProjectStore.backorderNotes
-                                          .remove(widget.customerName);
-                                    }
-                                    if (note.trim() != previousNote.trim()) {
-                                      final summary = _truncateText(note, 80);
-                                      if (summary.isNotEmpty) {
-                                        ProjectLogStore.add(
-                                          widget.customerName,
-                                          'Beschrijving nabestelling aangepast: $summary',
-                                        );
-                                      }
-                                    }
-                                    final team = _completionTeamForProject();
-                                    if (team.isNotEmpty) {
-                                      ProjectStore.completionTeams[
-                                          widget.customerName] = team;
-                                    }
-                                    ProjectStore.moveToGroupStatus(
-                                      name: widget.customerName,
-                                      group: 'Nabestellingen',
-                                      status: 'In opmaak',
-                                    );
-                                    ProjectLogStore.add(
-                                      widget.customerName,
-                                      'Nabestelling verzonden',
-                                    );
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text('Nabestelling verzonden'),
                                       ),
-                                    );
-                                    Navigator.of(context).pop(true);
-                                  },
+                                    ),
+                                    const SizedBox(height: 10),
+                                    _PrimaryButton(
+                                      label: 'Aanvraag versturen',
+                                      onTap: _submitEstimatedDaysChange,
+                                    ),
+                                  ],
                                 ),
-                              ] else ...[
-                                const SizedBox(height: 12),
-                                _PrimaryButton(
-                                  label: 'Verzenden',
-                                  onTap: () {
-                                    if (!_hasBeforeAfterPhotos()) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                            'Voeg foto’s voor en na de werf toe.',
-                                          ),
-                                        ),
-                                      );
-                                      return;
-                                    }
-                                    ProjectStore.setBackorder(
-                                      widget.customerName,
-                                      backorder: false,
-                                      items: const [],
-                                    );
-                                    ProjectStore.backorderNotes
-                                        .remove(widget.customerName);
-                                    final team = _completionTeamForProject();
-                                    if (team.isNotEmpty) {
-                                      ProjectStore.completionTeams[
-                                          widget.customerName] = team;
-                                    }
-                                    ScheduleStore.scheduled.removeWhere(
-                                      (assignment) =>
-                                          assignment.project ==
-                                          widget.customerName,
-                                    );
-                                    final targetGroup =
-                                        ProjectStore.findGroupForProject(
-                                              widget.customerName,
-                                            ) ??
-                                            widget.group;
-                                    ProjectStore.moveToGroupStatus(
-                                      name: widget.customerName,
-                                      group: targetGroup,
-                                      status: 'Afgewerkt',
-                                    );
-                                    ProjectLogStore.add(
-                                      widget.customerName,
-                                      'Project afgerond',
-                                    );
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text('Project afgerond'),
-                                      ),
-                                    );
-                                    Navigator.of(context).pop(true);
-                                  },
-                                ),
-                              ],
-                            ] else ...[
-                              if (_isBackorder) ...[
-                                const SizedBox(height: 12),
-                                if ((_backorderNoteController.text.trim())
-                                    .isNotEmpty)
-                                  Padding(
-                                    padding: const EdgeInsets.only(bottom: 8),
-                                    child: Text(
-                                      _backorderNoteController.text.trim(),
+                            ],
+                            if (canEditInfo && _isEditingInfo) ...[
+                              const SizedBox(height: 16),
+                              _InputCard(
+                                title: 'Offerte',
+                                children: [
+                                  if (OfferCatalogStore.categories.isEmpty)
+                                    Text(
+                                      'Nog geen offerte-elementen toegevoegd.',
                                       style: Theme.of(context)
                                           .textTheme
                                           .bodyMedium
                                           ?.copyWith(
                                             color: const Color(0xFF6A7C78),
                                           ),
-                                    ),
-                                  ),
-                                if (_backorderItems.isEmpty)
-                                  Text(
-                                    'Nog geen materialen',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(
-                                          color: const Color(0xFF6A7C78),
+                                    )
+                                  else
+                                    ...OfferCatalogStore.categories.map(
+                                      (category) => ExpansionTile(
+                                        tilePadding: EdgeInsets.zero,
+                                        childrenPadding: EdgeInsets.zero,
+                                        title: Text(
+                                          category.name,
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .bodyMedium
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.w600,
+                                              ),
                                         ),
-                                  )
-                                else
-                                  ..._backorderItems.map(
-                                    (item) => Padding(
-                                      padding: const EdgeInsets.only(bottom: 8),
-                                      child: _BackorderItemRow(label: item),
+                                        children: [
+                                          if (category.items.isEmpty)
+                                            Align(
+                                              alignment: Alignment.centerLeft,
+                                              child: Text(
+                                                'Nog geen elementen toegevoegd.',
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .bodySmall
+                                                    ?.copyWith(
+                                                      color: const Color(
+                                                        0xFF6A7C78,
+                                                      ),
+                                                    ),
+                                              ),
+                                            )
+                                          else
+                                            ...category.items.map((item) {
+                                              final key = _offerKey(
+                                                category.name,
+                                                item.name,
+                                              );
+                                              final qty =
+                                                  _offerQuantities[key] ?? 0;
+                                              return Padding(
+                                                padding: const EdgeInsets.only(
+                                                  bottom: 8,
+                                                ),
+                                                child: Row(
+                                                  children: [
+                                                    Expanded(
+                                                      child: Column(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment
+                                                                .start,
+                                                        children: [
+                                                          Text(
+                                                            item.name,
+                                                            style: Theme.of(context)
+                                                                .textTheme
+                                                                .bodyMedium
+                                                                ?.copyWith(
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .w600,
+                                                                ),
+                                                          ),
+                                                          if (_canSeeOfferPrices(
+                                                            CurrentUserStore
+                                                                .role,
+                                                          )) ...[
+                                                            const SizedBox(
+                                                              height: 4,
+                                                            ),
+                                                            Text(
+                                                              'EUR ${_formatPrice(item.price)} / ${item.unit}',
+                                                              style: Theme.of(context)
+                                                                  .textTheme
+                                                                  .bodySmall
+                                                                  ?.copyWith(
+                                                                    color: const Color(
+                                                                      0xFF6A7C78,
+                                                                    ),
+                                                                  ),
+                                                            ),
+                                                          ],
+                                                        ],
+                                                      ),
+                                                    ),
+                                                    _offerQtyButton(
+                                                      icon: Icons.remove,
+                                                      onTap: qty == 0
+                                                          ? null
+                                                          : () =>
+                                                                _updateOfferQuantity(
+                                                                  key,
+                                                                  -1,
+                                                                ),
+                                                    ),
+                                                    const SizedBox(width: 6),
+                                                    SizedBox(
+                                                      width: 44,
+                                                      child: TextField(
+                                                        controller:
+                                                            _controllerForOffer(
+                                                              key,
+                                                            ),
+                                                        keyboardType:
+                                                            TextInputType
+                                                                .number,
+                                                        textAlign:
+                                                            TextAlign.center,
+                                                        decoration: InputDecoration(
+                                                          isDense: true,
+                                                          contentPadding:
+                                                              const EdgeInsets.symmetric(
+                                                                vertical: 6,
+                                                                horizontal: 6,
+                                                              ),
+                                                          filled: true,
+                                                          fillColor:
+                                                              const Color(
+                                                                0xFFF4F1EA,
+                                                              ),
+                                                          enabledBorder: OutlineInputBorder(
+                                                            borderRadius:
+                                                                BorderRadius.circular(
+                                                                  10,
+                                                                ),
+                                                            borderSide:
+                                                                const BorderSide(
+                                                                  color: Color(
+                                                                    0xFFE1DAD0,
+                                                                  ),
+                                                                ),
+                                                          ),
+                                                          focusedBorder: OutlineInputBorder(
+                                                            borderRadius:
+                                                                BorderRadius.circular(
+                                                                  10,
+                                                                ),
+                                                            borderSide:
+                                                                const BorderSide(
+                                                                  color: Color(
+                                                                    0xFF0B2E2B,
+                                                                  ),
+                                                                ),
+                                                          ),
+                                                        ),
+                                                        onChanged: (value) {
+                                                          final parsed =
+                                                              int.tryParse(
+                                                                value.trim(),
+                                                              );
+                                                          setState(() {
+                                                            if (parsed ==
+                                                                    null ||
+                                                                parsed <= 0) {
+                                                              _offerQuantities
+                                                                  .remove(key);
+                                                            } else {
+                                                              _offerQuantities[key] =
+                                                                  parsed;
+                                                            }
+                                                          });
+                                                        },
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 6),
+                                                    _offerQtyButton(
+                                                      icon: Icons.add,
+                                                      onTap: () =>
+                                                          _updateOfferQuantity(
+                                                            key,
+                                                            1,
+                                                          ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              );
+                                            }),
+                                          const SizedBox(height: 8),
+                                        ],
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ] else if (ProjectStore
+                                    .offers[widget.customerName]
+                                    ?.isNotEmpty ==
+                                true) ...[
+                              const SizedBox(height: 16),
+                              _OfferOverviewCard(
+                                customerName: widget.customerName,
+                              ),
+                            ],
+                            const SizedBox(height: 16),
+                            if (canEditInfo && _isEditingInfo)
+                              _InputCard(
+                                title: 'Documenten',
+                                children: [
+                                  TextField(
+                                    controller: _docDescriptionController,
+                                    decoration: InputDecoration(
+                                      hintText: 'Beschrijving',
+                                      filled: true,
+                                      fillColor: const Color(0xFFF4F1EA),
+                                      enabledBorder: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(14),
+                                        borderSide: const BorderSide(
+                                          color: Color(0xFFE1DAD0),
+                                        ),
+                                      ),
+                                      focusedBorder: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(14),
+                                        borderSide: const BorderSide(
+                                          color: Color(0xFF0B2E2B),
+                                        ),
+                                      ),
                                     ),
                                   ),
-                              ],
+                                  const SizedBox(height: 10),
+                                  _FileUploadRow(
+                                    label:
+                                        _docFile?.name ?? 'Bestand toevoegen',
+                                    buttonLabel: 'Kies bestand',
+                                    files: _docFile == null
+                                        ? const []
+                                        : [_docFile!],
+                                    onAdd: _pickDocumentFile,
+                                  ),
+                                  const SizedBox(height: 10),
+                                  _PrimaryButton(
+                                    label: 'Document toevoegen',
+                                    onTap: _addDocument,
+                                  ),
+                                  if (_editDocuments.isNotEmpty) ...[
+                                    const SizedBox(height: 12),
+                                    ..._editDocuments.map(
+                                      (doc) => Padding(
+                                        padding: const EdgeInsets.only(
+                                          bottom: 8,
+                                        ),
+                                        child: Container(
+                                          padding: const EdgeInsets.all(12),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFFF4F1EA),
+                                            borderRadius: BorderRadius.circular(
+                                              12,
+                                            ),
+                                            border: Border.all(
+                                              color: const Color(0xFFE1DAD0),
+                                            ),
+                                          ),
+                                          child: Row(
+                                            children: [
+                                              Expanded(
+                                                child: Text(
+                                                  doc.description,
+                                                  style: Theme.of(context)
+                                                      .textTheme
+                                                      .bodyMedium
+                                                      ?.copyWith(
+                                                        fontWeight:
+                                                            FontWeight.w600,
+                                                      ),
+                                                ),
+                                              ),
+                                              IconButton(
+                                                icon: const Icon(
+                                                  Icons.delete_outline,
+                                                  size: 18,
+                                                ),
+                                                color: const Color(0xFFB42318),
+                                                onPressed: () =>
+                                                    _removeDocument(doc),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              )
+                            else if (ProjectStore
+                                    .documents[widget.customerName]
+                                    ?.isNotEmpty ==
+                                true)
+                              _ProjectDocumentsCard(
+                                customerName: widget.customerName,
+                              ),
+                            if (canEditInfo && _isEditingInfo) ...[
+                              const SizedBox(height: 16),
+                              _DangerButton(
+                                label: 'Project verwijderen',
+                                onTap: () async {
+                                  final confirmed = await showDialog<bool>(
+                                    context: context,
+                                    builder: (dialogContext) => AlertDialog(
+                                      title: const Text('Project verwijderen?'),
+                                      content: Text(
+                                        'Dit verwijdert ${widget.customerName} definitief.',
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () => Navigator.of(
+                                            dialogContext,
+                                          ).pop(false),
+                                          child: const Text('Annuleren'),
+                                        ),
+                                        TextButton(
+                                          onPressed: () => Navigator.of(
+                                            dialogContext,
+                                          ).pop(true),
+                                          child: const Text('Verwijderen'),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                  if (confirmed != true) return;
+                                  ProjectStore.deleteProject(
+                                    widget.customerName,
+                                  );
+                                  if (!context.mounted) return;
+                                  Navigator.of(context).pop(true);
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text('Project verwijderd'),
+                                    ),
+                                  );
+                                },
+                              ),
                             ],
                           ],
-                        ),
-                      ],
+                        )
+                      else if (_tabIndex == 1)
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            _ProjectSiteFollowUp(
+                              siteTabIndex: _siteTabIndex,
+                              onTabChange: (index) =>
+                                  setState(() => _siteTabIndex = index),
+                              beforePhotos: _beforePhotos,
+                              afterPhotos: _afterPhotos,
+                              canEdit: canEditSite,
+                              onAddBefore: _pickBeforePhotos,
+                              onAddAfter: _pickAfterPhotos,
+                              onRemoveBefore: _removeBeforePhoto,
+                              onRemoveAfter: _removeAfterPhoto,
+                            ),
+                            if ((ProjectStore
+                                        .comments[widget.customerName]
+                                        ?.isNotEmpty ??
+                                    false) ||
+                                canAddComment) ...[
+                              const SizedBox(height: 16),
+                              _ProjectCommentsSection(
+                                comments:
+                                    ProjectStore.comments[widget
+                                        .customerName] ??
+                                    const [],
+                                canAdd: canAddComment,
+                                controller: _commentController,
+                                onAdd: () {
+                                  final text = _commentController.text.trim();
+                                  if (text.isEmpty) return;
+                                  setState(() {
+                                    ProjectStore.addComment(
+                                      widget.customerName,
+                                      text,
+                                    );
+                                    _commentController.clear();
+                                  });
+                                },
+                              ),
+                            ],
+                            const SizedBox(height: 16),
+                            _ExtraWorkSection(
+                              canEdit: canEditSite,
+                              isEditingExtraWork:
+                                  _editingExtraWorkIndex != null,
+                              extraWorks: _extraWorks,
+                              extraWorkController: _extraWorkController,
+                              extraHoursController: _extraHoursController,
+                              extraWorkChargeType: _extraWorkChargeType,
+                              onChargeTypeChanged: (value) => setState(() {
+                                _extraWorkChargeType =
+                                    value ?? _extraWorkChargeTypes.first;
+                              }),
+                              extraWorkFiles: _extraWorkFiles,
+                              onRemoveExtraPhoto: (index) => setState(() {
+                                if (index < 0 ||
+                                    index >= _extraWorkFiles.length) {
+                                  return;
+                                }
+                                _extraWorkFiles.removeAt(index);
+                              }),
+                              onEditExtraWork: _editExtraWork,
+                              onDeleteExtraWork: _deleteExtraWork,
+                              onPickExtraPhotos: _pickExtraWorkPhotos,
+                              onAddExtraWork: _addExtraWork,
+                              showExtraWorkSection:
+                                  _extraWorks.isNotEmpty || canEditSite,
+                            ),
+                            if (_isBackorder ||
+                                ProjectStore
+                                        .backorderItems[widget.customerName]
+                                        ?.isNotEmpty ==
+                                    true ||
+                                canEditCompletion) ...[
+                              const SizedBox(height: 16),
+                              _InputCard(
+                                title: 'Afronding',
+                                children: [
+                                  if (canEditCompletion) ...[
+                                    _ChoiceToggle(
+                                      label: 'Status',
+                                      options: const ['Nabestelling', 'Klaar'],
+                                      selectedIndex: _isBackorder ? 0 : 1,
+                                      onSelect: (index) => setState(() {
+                                        _isBackorder = index == 0;
+                                      }),
+                                    ),
+                                    if (_isBackorder) ...[
+                                      const SizedBox(height: 12),
+                                      TextField(
+                                        controller: _backorderNoteController,
+                                        maxLines: 3,
+                                        decoration: InputDecoration(
+                                          hintText: 'Beschrijving nabestelling',
+                                          filled: true,
+                                          fillColor: const Color(0xFFF4F1EA),
+                                          enabledBorder: OutlineInputBorder(
+                                            borderRadius: BorderRadius.circular(
+                                              14,
+                                            ),
+                                            borderSide: const BorderSide(
+                                              color: Color(0xFFE1DAD0),
+                                            ),
+                                          ),
+                                          focusedBorder: OutlineInputBorder(
+                                            borderRadius: BorderRadius.circular(
+                                              14,
+                                            ),
+                                            borderSide: const BorderSide(
+                                              color: Color(0xFF0B2E2B),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 12),
+                                      _AddItemRow(
+                                        controller: _backorderController,
+                                        onAdd: _addBackorderItem,
+                                      ),
+                                      const SizedBox(height: 10),
+                                      if (_backorderItems.isEmpty)
+                                        Text(
+                                          'Nog geen materialen',
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .bodyMedium
+                                              ?.copyWith(
+                                                color: const Color(0xFF6A7C78),
+                                              ),
+                                        )
+                                      else
+                                        ..._backorderItems.asMap().entries.map(
+                                          (entry) => Padding(
+                                            padding: const EdgeInsets.only(
+                                              bottom: 8,
+                                            ),
+                                            child: _EditableBackorderItemRow(
+                                              label: entry.value,
+                                              onEdit: () =>
+                                                  _editBackorderItem(entry.key),
+                                              onDelete: () =>
+                                                  _deleteBackorderItem(
+                                                    entry.key,
+                                                  ),
+                                            ),
+                                          ),
+                                        ),
+                                      const SizedBox(height: 8),
+                                      _PrimaryButton(
+                                        label: 'Verzenden',
+                                        onTap: () {
+                                          if (_backorderItems.isEmpty) {
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Voeg eerst materialen toe.',
+                                                ),
+                                              ),
+                                            );
+                                            return;
+                                          }
+                                          if (!_hasBeforeAfterPhotos()) {
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Voeg foto’s voor en na de werf toe.',
+                                                ),
+                                              ),
+                                            );
+                                            return;
+                                          }
+                                          ProjectStore.setBackorder(
+                                            widget.customerName,
+                                            backorder: true,
+                                            items: _backorderItems,
+                                          );
+                                          final note = _backorderNoteController
+                                              .text
+                                              .trim();
+                                          final previousNote =
+                                              ProjectStore.backorderNotes[widget
+                                                  .customerName] ??
+                                              '';
+                                          if (note.isNotEmpty) {
+                                            ProjectStore.backorderNotes[widget
+                                                    .customerName] =
+                                                note;
+                                          } else {
+                                            ProjectStore.backorderNotes.remove(
+                                              widget.customerName,
+                                            );
+                                          }
+                                          if (note.trim() !=
+                                              previousNote.trim()) {
+                                            final summary = _truncateText(
+                                              note,
+                                              80,
+                                            );
+                                            if (summary.isNotEmpty) {
+                                              ProjectLogStore.add(
+                                                widget.customerName,
+                                                'Beschrijving nabestelling aangepast: $summary',
+                                              );
+                                            }
+                                          }
+                                          final team =
+                                              _completionTeamForProject();
+                                          if (team.isNotEmpty) {
+                                            ProjectStore.completionTeams[widget
+                                                    .customerName] =
+                                                team;
+                                          }
+                                          ProjectStore.moveToGroupStatus(
+                                            name: widget.customerName,
+                                            group: 'Nabestellingen',
+                                            status: 'In opmaak',
+                                          );
+                                          ProjectLogStore.add(
+                                            widget.customerName,
+                                            'Nabestelling verzonden',
+                                          );
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
+                                            const SnackBar(
+                                              content: Text(
+                                                'Nabestelling verzonden',
+                                              ),
+                                            ),
+                                          );
+                                          Navigator.of(context).pop(true);
+                                        },
+                                      ),
+                                    ] else ...[
+                                      const SizedBox(height: 12),
+                                      _PrimaryButton(
+                                        label: 'Verzenden',
+                                        onTap: () {
+                                          if (!_hasBeforeAfterPhotos()) {
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Voeg foto’s voor en na de werf toe.',
+                                                ),
+                                              ),
+                                            );
+                                            return;
+                                          }
+                                          ProjectStore.setBackorder(
+                                            widget.customerName,
+                                            backorder: false,
+                                            items: const [],
+                                          );
+                                          ProjectStore.backorderNotes.remove(
+                                            widget.customerName,
+                                          );
+                                          final team =
+                                              _completionTeamForProject();
+                                          if (team.isNotEmpty) {
+                                            ProjectStore.completionTeams[widget
+                                                    .customerName] =
+                                                team;
+                                          }
+                                          ScheduleStore.scheduled.removeWhere(
+                                            (assignment) =>
+                                                assignment.project ==
+                                                widget.customerName,
+                                          );
+                                          final targetGroup =
+                                              ProjectStore.findGroupForProject(
+                                                widget.customerName,
+                                              ) ??
+                                              widget.group;
+                                          ProjectStore.moveToGroupStatus(
+                                            name: widget.customerName,
+                                            group: targetGroup,
+                                            status: 'Afgewerkt',
+                                          );
+                                          ProjectLogStore.add(
+                                            widget.customerName,
+                                            'Project afgerond',
+                                          );
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
+                                            const SnackBar(
+                                              content: Text('Project afgerond'),
+                                            ),
+                                          );
+                                          Navigator.of(context).pop(true);
+                                        },
+                                      ),
+                                    ],
+                                  ] else ...[
+                                    if (_isBackorder) ...[
+                                      const SizedBox(height: 12),
+                                      if ((_backorderNoteController.text.trim())
+                                          .isNotEmpty)
+                                        Padding(
+                                          padding: const EdgeInsets.only(
+                                            bottom: 8,
+                                          ),
+                                          child: Text(
+                                            _backorderNoteController.text
+                                                .trim(),
+                                            style: Theme.of(context)
+                                                .textTheme
+                                                .bodyMedium
+                                                ?.copyWith(
+                                                  color: const Color(
+                                                    0xFF6A7C78,
+                                                  ),
+                                                ),
+                                          ),
+                                        ),
+                                      if (_backorderItems.isEmpty)
+                                        Text(
+                                          'Nog geen materialen',
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .bodyMedium
+                                              ?.copyWith(
+                                                color: const Color(0xFF6A7C78),
+                                              ),
+                                        )
+                                      else
+                                        ..._backorderItems.map(
+                                          (item) => Padding(
+                                            padding: const EdgeInsets.only(
+                                              bottom: 8,
+                                            ),
+                                            child: _BackorderItemRow(
+                                              label: item,
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ],
+                                ],
+                              ),
+                            ],
                           ],
                         ),
                     ],
@@ -16120,22 +16917,26 @@ class _StatusRow extends StatelessWidget {
                     color: const Color(0xFFFCE6CC),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: const Icon(Icons.folder_open,
-                      color: Color(0xFF6A4A2D)),
+                  child: const Icon(
+                    Icons.folder_open,
+                    color: Color(0xFF6A4A2D),
+                  ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
                     status,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          color: const Color(0xFF243B3A),
-                        ),
+                      fontWeight: FontWeight.w600,
+                      color: const Color(0xFF243B3A),
+                    ),
                   ),
                 ),
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
                   decoration: BoxDecoration(
                     color: const Color(0xFF0B2E2B),
                     borderRadius: BorderRadius.circular(12),
@@ -16143,9 +16944,9 @@ class _StatusRow extends StatelessWidget {
                   child: Text(
                     '$count',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: const Color(0xFFFFE9CC),
-                          fontWeight: FontWeight.w600,
-                        ),
+                      color: const Color(0xFFFFE9CC),
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
                 const SizedBox(width: 6),
@@ -16176,8 +16977,9 @@ class HolidayCalendarScreen extends StatefulWidget {
 }
 
 class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
-  final ValueNotifier<DateTime> _focusedDay =
-      ValueNotifier<DateTime>(DateTime.now());
+  final ValueNotifier<DateTime> _focusedDay = ValueNotifier<DateTime>(
+    DateTime.now(),
+  );
   DateTime? _selectedDay;
 
   int _modeIndex = 0; // 0 = feestdag, 1 = verlof
@@ -16261,13 +17063,13 @@ class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(20, 20, 20, 32),
               children: [
-                      Row(
+                Row(
                   children: [
                     IconButton(
                       onPressed: () => Navigator.of(context).pop(),
                       icon: const Icon(Icons.arrow_back),
                     ),
-                                        const SizedBox(width: 6),
+                    const SizedBox(width: 6),
                     Expanded(
                       child: Text(
                         'Verlof',
@@ -16320,14 +17122,13 @@ class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
                         calendarBuilders: CalendarBuilders(
                           markerBuilder: (context, day, events) {
                             final normalized = _normalizeDate(day);
-                            final isHoliday =
-                                PlanningCalendarStore.holidays.contains(
-                              normalized,
-                            );
+                            final isHoliday = PlanningCalendarStore.holidays
+                                .contains(normalized);
                             final isVacation = widget.readOnly
                                 ? _visibleLeaveRequestsForDay(day).isNotEmpty
-                                : PlanningCalendarStore.vacations
-                                    .contains(normalized);
+                                : PlanningCalendarStore.vacations.contains(
+                                    normalized,
+                                  );
                             if (!isHoliday && !isVacation) {
                               return null;
                             }
@@ -16346,22 +17147,19 @@ class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
                         ),
                         calendarStyle: CalendarStyle(
                           todayDecoration: BoxDecoration(
-                            color:
-                                const Color(0xFFFFA64D).withValues(alpha: 0.3),
+                            color: const Color(
+                              0xFFFFA64D,
+                            ).withValues(alpha: 0.3),
                             shape: BoxShape.circle,
                           ),
                           selectedDecoration: const BoxDecoration(
                             color: Color(0xFF0B2E2B),
                             shape: BoxShape.circle,
                           ),
-                          weekendTextStyle: (Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium ??
-                              const TextStyle(
-                                color: Color(0xFF6A7C78),
-                              )).copyWith(
-                            color: const Color(0xFF6A7C78),
-                          ),
+                          weekendTextStyle:
+                              (Theme.of(context).textTheme.bodyMedium ??
+                                      const TextStyle(color: Color(0xFF6A7C78)))
+                                  .copyWith(color: const Color(0xFF6A7C78)),
                         ),
                         headerStyle: const HeaderStyle(
                           formatButtonVisible: false,
@@ -16375,23 +17173,21 @@ class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
                 Row(
                   children: [
                     const _LegendDot(color: Color(0xFF0B2E2B)),
-                                        const SizedBox(width: 6),
+                    const SizedBox(width: 6),
                     Text(
                       'Feestdag',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: const Color(0xFF5A6F6C)),
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF5A6F6C),
+                      ),
                     ),
                     const SizedBox(width: 16),
                     const _LegendDot(color: Color(0xFFFFA64D)),
-                                        const SizedBox(width: 6),
+                    const SizedBox(width: 6),
                     Text(
                       'Verlof',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: const Color(0xFF5A6F6C)),
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF5A6F6C),
+                      ),
                     ),
                   ],
                 ),
@@ -16405,9 +17201,7 @@ class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
                           .isEmpty)
                         Text(
                           'Geen openstaande aanvragen.',
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodyMedium
+                          style: Theme.of(context).textTheme.bodyMedium
                               ?.copyWith(color: const Color(0xFF6A7C78)),
                         )
                       else
@@ -16456,8 +17250,7 @@ class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
                                               .textTheme
                                               .bodySmall
                                               ?.copyWith(
-                                                color:
-                                                    const Color(0xFF6A7C78),
+                                                color: const Color(0xFF6A7C78),
                                               ),
                                         ),
                                       ],
@@ -16492,12 +17285,14 @@ class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
                 if (!_isEditing)
                   _DayScheduleCard(
                     day: dayForDetails,
-                    isHoliday: PlanningCalendarStore.holidays
-                        .contains(_normalizeDate(dayForDetails)),
+                    isHoliday: PlanningCalendarStore.holidays.contains(
+                      _normalizeDate(dayForDetails),
+                    ),
                     isVacation: widget.readOnly
                         ? visibleLeaveForDay.isNotEmpty
-                        : PlanningCalendarStore.vacations
-                            .contains(_normalizeDate(dayForDetails)),
+                        : PlanningCalendarStore.vacations.contains(
+                            _normalizeDate(dayForDetails),
+                          ),
                     leaveRequests: visibleLeaveForDay,
                   ),
               ],
@@ -16677,15 +17472,18 @@ void _applyEstimatedDaysShift(
   String project,
   int newDays,
 ) {
-  final teamAssignments =
-      scheduled.where((assignment) => assignment.team == team).toList();
+  final teamAssignments = scheduled
+      .where((assignment) => assignment.team == team)
+      .toList();
   final regularItems =
       teamAssignments.where((item) => !item.isBackorder).toList()
         ..sort((a, b) => a.startDate.compareTo(b.startDate));
-  final backorderItems =
-      teamAssignments.where((item) => item.isBackorder).toList();
-  final targetIndex =
-      regularItems.indexWhere((item) => item.project == project);
+  final backorderItems = teamAssignments
+      .where((item) => item.isBackorder)
+      .toList();
+  final targetIndex = regularItems.indexWhere(
+    (item) => item.project == project,
+  );
   if (targetIndex == -1) return;
 
   final updatedRegular = <TeamAssignment>[];
@@ -16705,12 +17503,7 @@ void _applyEstimatedDaysShift(
     final days = i == targetIndex ? newDays : item.estimatedDays;
     final end = _endDateFromWorkingDays(start, days, team);
     updatedRegular.add(
-      _copyAssignment(
-        item,
-        start: start,
-        end: end,
-        estimatedDays: days,
-      ),
+      _copyAssignment(item, start: start, end: end, estimatedDays: days),
     );
   }
 
@@ -16758,26 +17551,25 @@ class _DayScheduleCard extends StatelessWidget {
           if (!isHoliday && !isVacation && leaveRequests.isEmpty)
             Text(
               'Geen feestdag of verlof.',
-              style: Theme.of(context)
-                  .textTheme
-                  .bodyMedium
-                  ?.copyWith(color: const Color(0xFF6A7C78)),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
             ),
           if (isHoliday) ...[
             Text(
               'Feestdag',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 4),
           ],
           if (isVacation && leaveRequests.isEmpty) ...[
             Text(
               'Verlof',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 4),
           ],
@@ -16785,9 +17577,9 @@ class _DayScheduleCard extends StatelessWidget {
             const SizedBox(height: 10),
             Text(
               'Verlof',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 6),
             ...leaveRequests.map(
@@ -16795,10 +17587,9 @@ class _DayScheduleCard extends StatelessWidget {
                 padding: const EdgeInsets.only(bottom: 4),
                 child: Text(
                   request.requester,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodySmall
-                      ?.copyWith(color: const Color(0xFF5A6F6C)),
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFF5A6F6C),
+                  ),
                 ),
               ),
             ),
@@ -16846,10 +17637,7 @@ class LeaveRequestStore {
 }
 
 class InvoiceRecord {
-  InvoiceRecord({
-    this.offerBilled = false,
-    this.extraHoursBilled = 0,
-  });
+  InvoiceRecord({this.offerBilled = false, this.extraHoursBilled = 0});
 
   bool offerBilled;
   double extraHoursBilled;
@@ -16881,15 +17669,17 @@ class _PlanningAssignCard extends StatefulWidget {
     String team,
     DateTime startDate, {
     double? backorderHours,
-  }) onAssign;
+  })
+  onAssign;
   final List<DateTime> Function(String team, int days, bool isBackorder)
-      availableStarts;
+  availableStarts;
   final DateTime? Function(
     String team,
     DateTime start,
     int days,
     bool isBackorder,
-  ) calculateEndDate;
+  )
+  calculateEndDate;
   final List<TeamAssignment> scheduled;
 
   @override
@@ -16976,34 +17766,31 @@ class _PlanningAssignCardState extends State<_PlanningAssignCard> {
               Text(
                 widget.item.name,
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                      color: const Color(0xFF243B3A),
-                    ),
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xFF243B3A),
+                ),
               ),
               const SizedBox(height: 4),
               Text(
                 'Geschat: ${_formatDays(_effectiveDays)}'
                 '${_isBackorder ? ' · Nabestelling' : ''}',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodyMedium
-                    ?.copyWith(color: const Color(0xFF6A7C78)),
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFF6A7C78),
+                ),
               ),
               const SizedBox(height: 4),
               Text(
                 'Tel: ${widget.item.phone}',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodySmall
-                    ?.copyWith(color: const Color(0xFF6A7C78)),
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
               ),
               const SizedBox(height: 4),
               Text(
                 'Adres: ${widget.item.address}',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodySmall
-                    ?.copyWith(color: const Color(0xFF6A7C78)),
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
               ),
             ],
           ),
@@ -17023,8 +17810,9 @@ class _PlanningAssignCardState extends State<_PlanningAssignCard> {
               const SizedBox(height: 10),
               TextField(
                 controller: _hoursController,
-                keyboardType:
-                    const TextInputType.numberWithOptions(decimal: true),
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
                 decoration: InputDecoration(
                   labelText: 'Duur (uren)',
                   filled: true,
@@ -17101,8 +17889,9 @@ class _PlanningAssignCardState extends State<_PlanningAssignCard> {
 
   DateTime _suggestedStartForTeam(String team) {
     final today = _normalizeDate(DateTime.now());
-    final teamAssignments =
-        widget.scheduled.where((assignment) => assignment.team == team).toList();
+    final teamAssignments = widget.scheduled
+        .where((assignment) => assignment.team == team)
+        .toList();
     if (teamAssignments.isEmpty) {
       return _nextWorkingDayForTeam(team, today);
     }
@@ -17114,7 +17903,6 @@ class _PlanningAssignCardState extends State<_PlanningAssignCard> {
     }
     return _nextWorkingDayForTeam(team, candidate);
   }
-
 }
 
 class _ExternalPlanningProjectCard extends StatelessWidget {
@@ -17165,9 +17953,9 @@ class _ExternalPlanningProjectCard extends StatelessWidget {
               Text(
                 assignment.project,
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                      color: const Color(0xFF243B3A),
-                    ),
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xFF243B3A),
+                ),
               ),
               if (isBackorder) ...[
                 const SizedBox(height: 4),
@@ -17175,29 +17963,26 @@ class _ExternalPlanningProjectCard extends StatelessWidget {
                   backorderHours > 0
                       ? 'Nabestelling · ${_formatHours(backorderHours)}'
                       : 'Nabestelling',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodySmall
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
                 ),
               ],
               const SizedBox(height: 4),
               Text(
                 '${assignment.team} · ${_formatDate(assignment.startDate)} - '
                 '${_formatDate(assignment.endDate)}',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodyMedium
-                    ?.copyWith(color: const Color(0xFF6A7C78)),
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFF6A7C78),
+                ),
               ),
               if (canSeeHours && totalHours > 0) ...[
                 const SizedBox(height: 4),
                 Text(
                   'Totaal uren: ${_formatPrice(totalHours)}',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodySmall
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
                 ),
               ],
             ],
@@ -17231,10 +18016,7 @@ class _ExternalPlanningProjectCard extends StatelessWidget {
             const SizedBox(height: 10),
             Align(
               alignment: Alignment.centerRight,
-              child: _InlineButton(
-                label: 'Openen',
-                onTap: onOpen,
-              ),
+              child: _InlineButton(label: 'Openen', onTap: onOpen),
             ),
           ],
         ),
@@ -17262,10 +18044,9 @@ class _InfoLine extends StatelessWidget {
         const SizedBox(width: 6),
         Text(
           '$label: ',
-          style: Theme.of(context)
-              .textTheme
-              .bodySmall
-              ?.copyWith(color: const Color(0xFF6A7C78)),
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
         ),
         Expanded(
           child: Text(
@@ -17281,10 +18062,7 @@ class _InfoLine extends StatelessWidget {
 }
 
 class _InfoTextBlock extends StatelessWidget {
-  const _InfoTextBlock({
-    required this.title,
-    required this.lines,
-  });
+  const _InfoTextBlock({required this.title, required this.lines});
 
   final String title;
   final List<Widget> lines;
@@ -17298,10 +18076,8 @@ class _InfoTextBlock extends StatelessWidget {
       title: title,
       children: [
         ...lines.map(
-          (line) => Padding(
-            padding: const EdgeInsets.only(bottom: 6),
-            child: line,
-          ),
+          (line) =>
+              Padding(padding: const EdgeInsets.only(bottom: 6), child: line),
         ),
       ],
     );
@@ -17309,11 +18085,7 @@ class _InfoTextBlock extends StatelessWidget {
 }
 
 class _PlainInfoLine extends StatelessWidget {
-  const _PlainInfoLine({
-    required this.label,
-    required this.value,
-    this.onTap,
-  });
+  const _PlainInfoLine({required this.label, required this.value, this.onTap});
 
   final String label;
   final String value;
@@ -17326,25 +18098,21 @@ class _PlainInfoLine extends StatelessWidget {
       children: [
         Text(
           '$label: ',
-          style: Theme.of(context)
-              .textTheme
-              .bodySmall
-              ?.copyWith(color: const Color(0xFF6A7C78)),
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
         ),
         Expanded(
           child: onTap == null
-              ? Text(
-                  value,
-                  style: Theme.of(context).textTheme.bodySmall,
-                )
+              ? Text(value, style: Theme.of(context).textTheme.bodySmall)
               : InkWell(
                   onTap: onTap,
                   child: Text(
                     value,
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: const Color(0xFF0B2E2B),
-                          decoration: TextDecoration.underline,
-                        ),
+                      color: const Color(0xFF0B2E2B),
+                      decoration: TextDecoration.underline,
+                    ),
                   ),
                 ),
         ),
@@ -17366,18 +18134,17 @@ class _PlanningOverviewScreen extends StatefulWidget {
   final List<TeamAssignment> assignments;
   final void Function(TeamAssignment assignment) onCancel;
   final bool canEditPlanning;
-  final void Function(TeamAssignment assignment, DateTime newStart) onReschedule;
-  final List<DateTime> Function(
-    String team,
-    int days,
-    bool isBackorder,
-  ) availableStarts;
+  final void Function(TeamAssignment assignment, DateTime newStart)
+  onReschedule;
+  final List<DateTime> Function(String team, int days, bool isBackorder)
+  availableStarts;
   final DateTime? Function(
     String team,
     DateTime start,
     int days,
     bool isBackorder,
-  ) calculateEndDate;
+  )
+  calculateEndDate;
 
   @override
   State<_PlanningOverviewScreen> createState() =>
@@ -17420,7 +18187,7 @@ class _PlanningOverviewScreenState extends State<_PlanningOverviewScreen> {
           group: assignment.group,
           status:
               ProjectStore.findStatusForProject(assignment.project) ??
-                  'Ingepland',
+              'Ingepland',
         ),
       ),
     );
@@ -17470,23 +18237,23 @@ class _PlanningOverviewScreenState extends State<_PlanningOverviewScreen> {
                         ...teams.map(
                           (team) => Padding(
                             padding: const EdgeInsets.only(bottom: 12),
-                      child: _TeamMonthlyScheduleCard(
-                        team: team,
-                        assignments: grouped[team] ?? const [],
-                        onOpen: _openProject,
-                        onCancel: _confirmCancel,
-                        canEditPlanning: widget.canEditPlanning,
-                        showHeader: true,
-                        initiallyExpanded: false,
-                        onReschedule: (assignment, newStart) {
-                          widget.onReschedule(assignment, newStart);
-                          if (mounted) {
-                            setState(() {});
-                          }
-                        },
-                        availableStarts: widget.availableStarts,
-                        calculateEndDate: widget.calculateEndDate,
-                      ),
+                            child: _TeamMonthlyScheduleCard(
+                              team: team,
+                              assignments: grouped[team] ?? const [],
+                              onOpen: _openProject,
+                              onCancel: _confirmCancel,
+                              canEditPlanning: widget.canEditPlanning,
+                              showHeader: true,
+                              initiallyExpanded: false,
+                              onReschedule: (assignment, newStart) {
+                                widget.onReschedule(assignment, newStart);
+                                if (mounted) {
+                                  setState(() {});
+                                }
+                              },
+                              availableStarts: widget.availableStarts,
+                              calculateEndDate: widget.calculateEndDate,
+                            ),
                           ),
                         ),
                     ],
@@ -17525,18 +18292,17 @@ class _TeamMonthlyScheduleCard extends StatefulWidget {
   final void Function(TeamAssignment assignment) onOpen;
   final Future<void> Function(TeamAssignment assignment) onCancel;
   final bool canEditPlanning;
-  final void Function(TeamAssignment assignment, DateTime newStart) onReschedule;
-  final List<DateTime> Function(
-    String team,
-    int days,
-    bool isBackorder,
-  ) availableStarts;
+  final void Function(TeamAssignment assignment, DateTime newStart)
+  onReschedule;
+  final List<DateTime> Function(String team, int days, bool isBackorder)
+  availableStarts;
   final DateTime? Function(
     String team,
     DateTime start,
     int days,
     bool isBackorder,
-  ) calculateEndDate;
+  )
+  calculateEndDate;
   final bool showHeader;
   final bool initiallyExpanded;
   final String? previewProject;
@@ -17578,8 +18344,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
     final days = isBackorder ? 1 : assignment.estimatedDays;
     DateTime startDate = assignment.startDate;
     DateTime focused = startDate;
-    final enabledDays =
-        widget.availableStarts(assignment.team, days, isBackorder).toSet();
+    final enabledDays = widget
+        .availableStarts(assignment.team, days, isBackorder)
+        .toSet();
     await showDialog<void>(
       context: context,
       builder: (context) {
@@ -17718,8 +18485,10 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
         child: widget.showHeader
             ? ExpansionTile(
                 initiallyExpanded: widget.initiallyExpanded,
-                tilePadding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                tilePadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
                 childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
                 title: Text(
                   widget.team,
@@ -17765,107 +18534,108 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
     return Column(
       children: [
         TableCalendar(
-              firstDay: DateTime.utc(2024, 1, 1),
-              lastDay: DateTime.utc(2030, 12, 31),
-              focusedDay: _focusedDay,
-              calendarFormat: CalendarFormat.month,
-              startingDayOfWeek: StartingDayOfWeek.monday,
-              selectedDayPredicate: (day) => isSameDay(_selectedDay, day),
-              onDaySelected: (selectedDay, focusedDay) {
-                setState(() {
-                  _selectedDay = selectedDay;
-                  _focusedDay = focusedDay;
-                });
-              },
-              onPageChanged: (day) => setState(() => _focusedDay = day),
-              headerStyle: const HeaderStyle(
-                formatButtonVisible: false,
-                titleCentered: true,
-              ),
-              calendarStyle: CalendarStyle(
-                cellMargin: EdgeInsets.zero,
-                todayDecoration: BoxDecoration(
-                  color: const Color(0xFFFFA64D).withValues(alpha: 0.3),
-                  shape: BoxShape.circle,
-                ),
-                selectedDecoration: const BoxDecoration(
-                  color: Color(0xFF0B2E2B),
-                  shape: BoxShape.circle,
-                ),
-                weekendTextStyle: (Theme.of(context).textTheme.bodyMedium ??
+          firstDay: DateTime.utc(2024, 1, 1),
+          lastDay: DateTime.utc(2030, 12, 31),
+          focusedDay: _focusedDay,
+          calendarFormat: CalendarFormat.month,
+          startingDayOfWeek: StartingDayOfWeek.monday,
+          selectedDayPredicate: (day) => isSameDay(_selectedDay, day),
+          onDaySelected: (selectedDay, focusedDay) {
+            setState(() {
+              _selectedDay = selectedDay;
+              _focusedDay = focusedDay;
+            });
+          },
+          onPageChanged: (day) => setState(() => _focusedDay = day),
+          headerStyle: const HeaderStyle(
+            formatButtonVisible: false,
+            titleCentered: true,
+          ),
+          calendarStyle: CalendarStyle(
+            cellMargin: EdgeInsets.zero,
+            todayDecoration: BoxDecoration(
+              color: const Color(0xFFFFA64D).withValues(alpha: 0.3),
+              shape: BoxShape.circle,
+            ),
+            selectedDecoration: const BoxDecoration(
+              color: Color(0xFF0B2E2B),
+              shape: BoxShape.circle,
+            ),
+            weekendTextStyle:
+                (Theme.of(context).textTheme.bodyMedium ??
                         const TextStyle(color: Color(0xFF6A7C78)))
                     .copyWith(color: const Color(0xFF6A7C78)),
-              ),
-              calendarBuilders: CalendarBuilders(
-                dowBuilder: (context, day) {
-                  const labels = ['Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za', 'Zo'];
-                  return Center(
-                    child: Text(
-                      labels[day.weekday - 1],
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: const Color(0xFF6A7C78),
-                          ),
-                    ),
-                  );
-                },
-                defaultBuilder: (context, day, focusedDay) {
-                  return _buildDayCell(
-                    context: context,
-                    day: day,
-                    isSelected: isSameDay(_selectedDay, day),
-                    isToday: isSameDay(DateTime.now(), day),
-                    laneMap: laneMap,
-                    previewStart: widget.previewStart,
-                    previewEnd: widget.previewEnd,
-                    previewLane: previewLane,
-                    previewOldStart: widget.previewOldStart,
-                    previewOldEnd: widget.previewOldEnd,
-                  );
-                },
-                todayBuilder: (context, day, focusedDay) {
-                  return _buildDayCell(
-                    context: context,
-                    day: day,
-                    isSelected: isSameDay(_selectedDay, day),
-                    isToday: true,
-                    laneMap: laneMap,
-                    previewStart: widget.previewStart,
-                    previewEnd: widget.previewEnd,
-                    previewLane: previewLane,
-                    previewOldStart: widget.previewOldStart,
-                    previewOldEnd: widget.previewOldEnd,
-                  );
-                },
-                selectedBuilder: (context, day, focusedDay) {
-                  return _buildDayCell(
-                    context: context,
-                    day: day,
-                    isSelected: true,
-                    isToday: isSameDay(DateTime.now(), day),
-                    laneMap: laneMap,
-                    previewStart: widget.previewStart,
-                    previewEnd: widget.previewEnd,
-                    previewLane: previewLane,
-                    previewOldStart: widget.previewOldStart,
-                    previewOldEnd: widget.previewOldEnd,
-                  );
-                },
-                outsideBuilder: (context, day, focusedDay) {
-                  return _buildDayCell(
-                    context: context,
-                    day: day,
-                    isSelected: false,
-                    isToday: false,
-                    laneMap: laneMap,
-                    previewStart: widget.previewStart,
-                    previewEnd: widget.previewEnd,
-                    previewLane: previewLane,
-                    previewOldStart: widget.previewOldStart,
-                    previewOldEnd: widget.previewOldEnd,
-                  );
-                },
-              ),
-            ),
+          ),
+          calendarBuilders: CalendarBuilders(
+            dowBuilder: (context, day) {
+              const labels = ['Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za', 'Zo'];
+              return Center(
+                child: Text(
+                  labels[day.weekday - 1],
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
+                ),
+              );
+            },
+            defaultBuilder: (context, day, focusedDay) {
+              return _buildDayCell(
+                context: context,
+                day: day,
+                isSelected: isSameDay(_selectedDay, day),
+                isToday: isSameDay(DateTime.now(), day),
+                laneMap: laneMap,
+                previewStart: widget.previewStart,
+                previewEnd: widget.previewEnd,
+                previewLane: previewLane,
+                previewOldStart: widget.previewOldStart,
+                previewOldEnd: widget.previewOldEnd,
+              );
+            },
+            todayBuilder: (context, day, focusedDay) {
+              return _buildDayCell(
+                context: context,
+                day: day,
+                isSelected: isSameDay(_selectedDay, day),
+                isToday: true,
+                laneMap: laneMap,
+                previewStart: widget.previewStart,
+                previewEnd: widget.previewEnd,
+                previewLane: previewLane,
+                previewOldStart: widget.previewOldStart,
+                previewOldEnd: widget.previewOldEnd,
+              );
+            },
+            selectedBuilder: (context, day, focusedDay) {
+              return _buildDayCell(
+                context: context,
+                day: day,
+                isSelected: true,
+                isToday: isSameDay(DateTime.now(), day),
+                laneMap: laneMap,
+                previewStart: widget.previewStart,
+                previewEnd: widget.previewEnd,
+                previewLane: previewLane,
+                previewOldStart: widget.previewOldStart,
+                previewOldEnd: widget.previewOldEnd,
+              );
+            },
+            outsideBuilder: (context, day, focusedDay) {
+              return _buildDayCell(
+                context: context,
+                day: day,
+                isSelected: false,
+                isToday: false,
+                laneMap: laneMap,
+                previewStart: widget.previewStart,
+                previewEnd: widget.previewEnd,
+                previewLane: previewLane,
+                previewOldStart: widget.previewOldStart,
+                previewOldEnd: widget.previewOldEnd,
+              );
+            },
+          ),
+        ),
         const SizedBox(height: 12),
         if (hasSelection)
           _InputCard(
@@ -17876,20 +18646,18 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                   isHoliday
                       ? 'Feestdag'
                       : (isVacation
-                          ? 'Verlofdag'
-                          : (isWeekendOff ? 'Weekend' : 'Niet-werkdag')),
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                            ? 'Verlofdag'
+                            : (isWeekendOff ? 'Weekend' : 'Niet-werkdag')),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
                 )
               else if (dayAssignments.isEmpty)
                 Text(
                   'Geen klanten ingepland.',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
                 )
               else if (widget.canEditPlanning)
                 ReorderableListView(
@@ -17921,13 +18689,17 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                             decoration: BoxDecoration(
                               color: const Color(0xFFF4F1EA),
                               borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: const Color(0xFFE1DAD0)),
+                              border: Border.all(
+                                color: const Color(0xFFE1DAD0),
+                              ),
                             ),
                             child: Row(
                               children: [
                                 _LegendDot(
-                                  color: _isBackorderAssignment(
-                                          dayAssignments[index])
+                                  color:
+                                      _isBackorderAssignment(
+                                        dayAssignments[index],
+                                      )
                                       ? _backorderDotColor
                                       : _dotColorForLane(
                                           laneMap[dayAssignments[index]] ?? 0,
@@ -17952,9 +18724,8 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                                           'Onderaannemer')
                                         Text(
                                           ProjectStore
-                                                  .details[
-                                                      dayAssignments[index]
-                                                          .project]
+                                                  .details[dayAssignments[index]
+                                                      .project]
                                                   ?.phone ??
                                               '—',
                                           style: Theme.of(context)
@@ -17971,8 +18742,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                                   icon: const Icon(Icons.edit, size: 18),
                                   color: const Color(0xFF6A7C78),
                                   visualDensity: VisualDensity.compact,
-                                  constraints:
-                                      const BoxConstraints(minWidth: 32),
+                                  constraints: const BoxConstraints(
+                                    minWidth: 32,
+                                  ),
                                   onPressed: () => _showRescheduleDialog(
                                     context,
                                     dayAssignments[index],
@@ -17983,8 +18755,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                                   icon: const Icon(Icons.close, size: 18),
                                   color: const Color(0xFF6A7C78),
                                   visualDensity: VisualDensity.compact,
-                                  constraints:
-                                      const BoxConstraints(minWidth: 32),
+                                  constraints: const BoxConstraints(
+                                    minWidth: 32,
+                                  ),
                                   onPressed: () =>
                                       widget.onCancel(dayAssignments[index]),
                                 ),
@@ -18026,15 +18799,12 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                             _LegendDot(
                               color: _isBackorderAssignment(assignment)
                                   ? _backorderDotColor
-                                  : _dotColorForLane(
-                                      laneMap[assignment] ?? 0,
-                                    ),
+                                  : _dotColorForLane(laneMap[assignment] ?? 0),
                             ),
                             const SizedBox(width: 8),
                             Expanded(
                               child: Column(
-                                crossAxisAlignment:
-                                    CrossAxisAlignment.start,
+                                crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text(
                                     assignment.project,
@@ -18045,8 +18815,7 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                                           color: const Color(0xFF5A6F6C),
                                         ),
                                   ),
-                                  if (CurrentUserStore.role ==
-                                      'Onderaannemer')
+                                  if (CurrentUserStore.role == 'Onderaannemer')
                                     Text(
                                       ProjectStore
                                               .details[assignment.project]
@@ -18073,10 +18842,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
         else
           Text(
             'Selecteer een dag om klanten te zien.',
-            style: Theme.of(context)
-                .textTheme
-                .bodySmall
-                ?.copyWith(color: const Color(0xFF6A7C78)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
           ),
       ],
     );
@@ -18103,22 +18871,24 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
     DateTime day,
     Map<TeamAssignment, int> laneMap,
   ) {
-    final base = _assignmentsForDay(day)
-        .where((assignment) => _isWorkingDayForTeam(day, assignment.team))
-        .toList()
-      ..sort((a, b) {
-        final laneA = laneMap[a] ?? 0;
-        final laneB = laneMap[b] ?? 0;
-        if (laneA != laneB) return laneA.compareTo(laneB);
-        return a.startDate.compareTo(b.startDate);
-      });
+    final base =
+        _assignmentsForDay(day)
+            .where((assignment) => _isWorkingDayForTeam(day, assignment.team))
+            .toList()
+          ..sort((a, b) {
+            final laneA = laneMap[a] ?? 0;
+            final laneB = laneMap[b] ?? 0;
+            if (laneA != laneB) return laneA.compareTo(laneB);
+            return a.startDate.compareTo(b.startDate);
+          });
     final order = PlanningOrderStore.orderFor(widget.team, day);
     if (order.isEmpty) return base;
     final remaining = List<TeamAssignment>.from(base);
     final ordered = <TeamAssignment>[];
     for (final name in order) {
-      final index =
-          remaining.indexWhere((assignment) => assignment.project == name);
+      final index = remaining.indexWhere(
+        (assignment) => assignment.project == name,
+      );
       if (index != -1) {
         ordered.add(remaining.removeAt(index));
       }
@@ -18194,10 +18964,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
     final dotAssignments = displayAssignments
         .where((assignment) => _isBackorderAssignment(assignment))
         .toList();
-    final lineAssignmentsAll =
-        displayAssignments
-            .where((assignment) => !dotAssignments.contains(assignment))
-            .toList();
+    final lineAssignmentsAll = displayAssignments
+        .where((assignment) => !dotAssignments.contains(assignment))
+        .toList();
     final lineAssignments = lineAssignmentsAll.where((assignment) {
       final lane = laneMap[assignment] ?? 0;
       return lane < _maxLaneShown;
@@ -18214,18 +18983,22 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
         final dotRowTop = topStart + dateHeight + 2;
         final linesTop = dotRowTop + 7;
         final normalizedDay = _normalizeDate(day);
-        final previewSingleDay = previewStart != null &&
+        final previewSingleDay =
+            previewStart != null &&
             previewEnd != null &&
             isSameDay(previewStart, previewEnd);
-        final previewCoversDay = previewStart != null &&
+        final previewCoversDay =
+            previewStart != null &&
             previewEnd != null &&
             !previewSingleDay &&
             !normalizedDay.isBefore(_normalizeDate(previewStart)) &&
             !normalizedDay.isAfter(_normalizeDate(previewEnd));
-        final oldSingleDay = previewOldStart != null &&
+        final oldSingleDay =
+            previewOldStart != null &&
             previewOldEnd != null &&
             isSameDay(previewOldStart, previewOldEnd);
-        final oldCoversDay = previewOldStart != null &&
+        final oldCoversDay =
+            previewOldStart != null &&
             previewOldEnd != null &&
             !oldSingleDay &&
             !normalizedDay.isBefore(_normalizeDate(previewOldStart)) &&
@@ -18279,11 +19052,10 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                   '${day.day}',
                   textAlign: TextAlign.center,
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: const Color(0xFF243B3A),
-                        fontWeight:
-                            isSelected ? FontWeight.w600 : FontWeight.w500,
-                        height: 1.0,
-                      ),
+                    color: const Color(0xFF243B3A),
+                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                    height: 1.0,
+                  ),
                 ),
               ),
             ),
@@ -18417,13 +19189,16 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                         dotAssignments.length > 5 ? 5 : dotAssignments.length,
                         (index) {
                           final assignment = dotAssignments[index];
-                          final isBackorder = assignment.isBackorder ||
+                          final isBackorder =
+                              assignment.isBackorder ||
                               assignment.group == 'Nabestellingen';
                           final dotColor = isBackorder
                               ? _backorderDotColor
                               : const Color(0xFF0B2E2B);
                           return Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 1.5),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 1.5,
+                            ),
                             child: Container(
                               width: 5,
                               height: 5,
@@ -18444,8 +19219,10 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                 top: 2,
                 right: 2,
                 child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 4,
+                    vertical: 2,
+                  ),
                   decoration: BoxDecoration(
                     color: const Color(0xFF0B2E2B),
                     borderRadius: BorderRadius.circular(10),
@@ -18469,11 +19246,7 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
 }
 
 class _HatchPainter extends CustomPainter {
-  _HatchPainter({
-    required this.color,
-    this.strokeWidth = 1,
-    this.spacing = 6,
-  });
+  _HatchPainter({required this.color, this.strokeWidth = 1, this.spacing = 6});
 
   final Color color;
   final double strokeWidth;
@@ -18530,19 +19303,20 @@ class _TabToggle extends StatelessWidget {
                 duration: const Duration(milliseconds: 200),
                 padding: const EdgeInsets.symmetric(vertical: 10),
                 decoration: BoxDecoration(
-                  color:
-                      isSelected ? const Color(0xFF0B2E2B) : Colors.transparent,
+                  color: isSelected
+                      ? const Color(0xFF0B2E2B)
+                      : Colors.transparent,
                   borderRadius: BorderRadius.circular(14),
                 ),
                 child: Center(
                   child: Text(
                     labels[index],
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          color: isSelected
-                              ? const Color(0xFFFFE9CC)
-                              : const Color(0xFF4B6763),
-                        ),
+                      fontWeight: FontWeight.w600,
+                      color: isSelected
+                          ? const Color(0xFFFFE9CC)
+                          : const Color(0xFF4B6763),
+                    ),
                   ),
                 ),
               ),
@@ -18589,7 +19363,8 @@ class _ProjectInfoCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final hasCompletionTeam =
         completionTeam != null && completionTeam!.trim().isNotEmpty;
-    final hasDetails = details != null &&
+    final hasDetails =
+        details != null &&
         (details!.address.trim().isNotEmpty ||
             details!.phone.trim().isNotEmpty ||
             details!.delivery.trim().isNotEmpty ||
@@ -18632,9 +19407,7 @@ class _ProjectInfoCard extends StatelessWidget {
           );
         }
         if (details!.finish.trim().isNotEmpty) {
-          lines.add(
-            _PlainInfoLine(label: 'Afwerking', value: details!.finish),
-          );
+          lines.add(_PlainInfoLine(label: 'Afwerking', value: details!.finish));
         }
         if (details!.extraNotes.trim().isNotEmpty) {
           lines.add(
@@ -18650,16 +19423,14 @@ class _ProjectInfoCard extends StatelessWidget {
           );
         }
       }
-      return _InfoTextBlock(
-        title: 'Huidige informatie',
-        lines: lines,
-      );
+      return _InfoTextBlock(title: 'Huidige informatie', lines: lines);
     }
 
     final phoneValue = isEditing && canEdit
         ? phoneController.text.trim()
         : (details?.phone ?? '');
-    final canCall = (CurrentUserStore.role == 'Planner' ||
+    final canCall =
+        (CurrentUserStore.role == 'Planner' ||
             CurrentUserStore.role == 'Beheerder') &&
         phoneValue.trim().isNotEmpty;
     return _InputCard(
@@ -18676,10 +19447,9 @@ class _ProjectInfoCard extends StatelessWidget {
       children: [
         Text(
           'Aangemaakt door: $creator',
-          style: Theme.of(context)
-              .textTheme
-              .bodyMedium
-              ?.copyWith(color: const Color(0xFF6A7C78)),
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
         ),
         const SizedBox(height: 12),
         _ReadOnlyField(
@@ -18804,26 +19574,23 @@ class _ProjectLogEntryCard extends StatelessWidget {
         children: [
           Text(
             entry.message,
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(fontWeight: FontWeight.w600),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 8),
           Text(
             '${entry.user} · ${entry.role}',
-            style: Theme.of(context)
-                .textTheme
-                .bodySmall
-                ?.copyWith(color: const Color(0xFF6A7C78)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
           ),
           const SizedBox(height: 4),
           Text(
             _formatDateTime(entry.timestamp),
-            style: Theme.of(context)
-                .textTheme
-                .bodySmall
-                ?.copyWith(color: const Color(0xFF6A7C78)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
           ),
         ],
       ),
@@ -18856,10 +19623,9 @@ class _OfferOverviewCard extends StatelessWidget {
         children: [
           Text(
             'Geen offerte-elementen toegevoegd.',
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF6A7C78)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
           ),
         ],
       );
@@ -18875,9 +19641,9 @@ class _OfferOverviewCard extends StatelessWidget {
           double categoryHours = 0;
           yield Text(
             entry.key,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
           );
           yield const SizedBox(height: 6);
           yield Container(
@@ -18894,18 +19660,34 @@ class _OfferOverviewCard extends StatelessWidget {
               },
               children: [
                 TableRow(
-                  decoration: const BoxDecoration(
-                    color: Color(0xFFF4F1EA),
-                  ),
+                  decoration: const BoxDecoration(color: Color(0xFFF4F1EA)),
                   children: [
                     _offerCell(context, 'Beschrijving', header: true),
-                    _offerCell(context, 'Aantal', header: true, alignRight: true),
-                    _offerCell(context, 'Uur / aantal', header: true, alignRight: true),
-                    _offerCell(context, 'Totaal', header: true, alignRight: true),
+                    _offerCell(
+                      context,
+                      'Aantal',
+                      header: true,
+                      alignRight: true,
+                    ),
+                    _offerCell(
+                      context,
+                      'Uur / aantal',
+                      header: true,
+                      alignRight: true,
+                    ),
+                    _offerCell(
+                      context,
+                      'Totaal',
+                      header: true,
+                      alignRight: true,
+                    ),
                   ],
                 ),
                 ...entry.value.map((line) {
-                  final item = OfferCatalogStore.findItem(line.category, line.item);
+                  final item = OfferCatalogStore.findItem(
+                    line.category,
+                    line.item,
+                  );
                   final unitHours = item?.hours ?? 0;
                   final lineTotal = unitHours * line.quantity;
                   if (canSeeHours && item?.hours != null) {
@@ -18938,9 +19720,9 @@ class _OfferOverviewCard extends StatelessWidget {
               child: Text(
                 'Totaal: ${_formatPrice(categoryHours)} uur',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      fontWeight: FontWeight.w600,
-                      color: const Color(0xFF243B3A),
-                    ),
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xFF243B3A),
+                ),
               ),
             );
           }
@@ -18950,9 +19732,9 @@ class _OfferOverviewCard extends StatelessWidget {
           const Divider(height: 24),
           Text(
             'Totaal uren: ${_formatPrice(totalHours)}',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
           ),
         ],
       ],
@@ -18974,12 +19756,12 @@ Widget _offerCell(
       maxLines: 2,
       style: header
           ? Theme.of(context).textTheme.bodySmall?.copyWith(
-                fontWeight: FontWeight.w600,
-                color: const Color(0xFF243B3A),
-              )
-          : Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: const Color(0xFF6A7C78),
-              ),
+              fontWeight: FontWeight.w600,
+              color: const Color(0xFF243B3A),
+            )
+          : Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
     ),
   );
 }
@@ -18999,10 +19781,9 @@ class _ProjectDocumentsCard extends StatelessWidget {
         if (documents.isEmpty)
           Text(
             'Geen documenten toegevoegd.',
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF6A7C78)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
           )
         else
           ...documents.map(
@@ -19023,8 +19804,8 @@ class _ProjectDocumentsCard extends StatelessWidget {
                   child: Text(
                     doc.description,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          fontWeight: FontWeight.w600,
-                        ),
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
               ),
@@ -19096,7 +19877,9 @@ Future<void> _openProfileDocument(
 ) async {
   if (!_isPreviewableFile(entry.file)) {
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Geen preview beschikbaar voor dit bestand.')),
+      const SnackBar(
+        content: Text('Geen preview beschikbaar voor dit bestand.'),
+      ),
     );
     return;
   }
@@ -19222,10 +20005,9 @@ class _ExtraWorkSection extends StatelessWidget {
             width: double.infinity,
             child: Text(
               'Nog geen extra werk toegevoegd.',
-              style: Theme.of(context)
-                  .textTheme
-                  .bodyMedium
-                  ?.copyWith(color: const Color(0xFF6A7C78)),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
             ),
           )
         else
@@ -19267,18 +20049,16 @@ class _ExtraWorkSection extends StatelessWidget {
                     const SizedBox(height: 6),
                     Text(
                       'Extra uren: ${_formatPrice(entryPair.value.hours)}',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodySmall
-                          ?.copyWith(color: const Color(0xFF6A7C78)),
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF6A7C78),
+                      ),
                     ),
                     const SizedBox(height: 4),
                     Text(
                       'Type: ${entryPair.value.chargeType}',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodySmall
-                          ?.copyWith(color: const Color(0xFF6A7C78)),
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF6A7C78),
+                      ),
                     ),
                     if (entryPair.value.photos.isNotEmpty) ...[
                       const SizedBox(height: 8),
@@ -19337,12 +20117,7 @@ class _ExtraWorkSection extends StatelessWidget {
             key: ValueKey(extraWorkChargeType),
             initialValue: extraWorkChargeType,
             items: _extraWorkChargeTypes
-                .map(
-                  (type) => DropdownMenuItem(
-                    value: type,
-                    child: Text(type),
-                  ),
-                )
+                .map((type) => DropdownMenuItem(value: type, child: Text(type)))
                 .toList(),
             onChanged: onChargeTypeChanged,
             decoration: InputDecoration(
@@ -19371,18 +20146,16 @@ class _ExtraWorkSection extends StatelessWidget {
             const SizedBox(height: 8),
             _CollapsiblePhotoWrap(
               photos: extraWorkFiles,
-              onOpen: (index) => _openPhotoViewer(
-                context,
-                extraWorkFiles,
-                index,
-              ),
+              onOpen: (index) =>
+                  _openPhotoViewer(context, extraWorkFiles, index),
               onRemove: (index) => onRemoveExtraPhoto(index),
             ),
           ],
           const SizedBox(height: 8),
           _PrimaryButton(
-            label:
-                isEditingExtraWork ? 'Extra werk bijwerken' : 'Extra werk opslaan',
+            label: isEditingExtraWork
+                ? 'Extra werk bijwerken'
+                : 'Extra werk opslaan',
             onTap: onAddExtraWork,
           ),
         ],
@@ -19412,10 +20185,9 @@ class _ProjectCommentsSection extends StatelessWidget {
         if (comments.isEmpty)
           Text(
             'Nog geen opmerkingen.',
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF6A7C78)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
           )
         else
           ...comments.map(
@@ -19465,10 +20237,7 @@ class _ProjectCommentsSection extends StatelessWidget {
 }
 
 class _AddItemRow extends StatelessWidget {
-  const _AddItemRow({
-    required this.controller,
-    required this.onAdd,
-  });
+  const _AddItemRow({required this.controller, required this.onAdd});
 
   final TextEditingController controller;
   final VoidCallback onAdd;
@@ -19523,10 +20292,9 @@ class _BackorderItemRow extends StatelessWidget {
           Expanded(
             child: Text(
               label,
-              style: Theme.of(context)
-                  .textTheme
-                  .bodyMedium
-                  ?.copyWith(color: const Color(0xFF243B3A)),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF243B3A)),
             ),
           ),
         ],
@@ -19558,10 +20326,7 @@ class _EditableBackorderItemRow extends StatelessWidget {
       child: Row(
         children: [
           Expanded(
-            child: Text(
-              label,
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
+            child: Text(label, style: Theme.of(context).textTheme.bodyMedium),
           ),
           IconButton(
             icon: const Icon(Icons.edit_outlined, size: 18),
@@ -19613,17 +20378,15 @@ class _PhotoGridSectionState extends State<_PhotoGridSection> {
                 child: Text(
                   widget.title,
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        fontWeight: FontWeight.w600,
-                        color: const Color(0xFF243B3A),
-                      ),
+                    fontWeight: FontWeight.w600,
+                    color: const Color(0xFF243B3A),
+                  ),
                 ),
               ),
               if (canEdit)
                 IconButton(
                   onPressed: () => setState(() => _isEditing = !_isEditing),
-                  icon: Icon(
-                    _isEditing ? Icons.check : Icons.edit_outlined,
-                  ),
+                  icon: Icon(_isEditing ? Icons.check : Icons.edit_outlined),
                   color: const Color(0xFF6A7C78),
                 ),
               if (widget.onAdd != null)
@@ -19638,18 +20401,17 @@ class _PhotoGridSectionState extends State<_PhotoGridSection> {
           Text(
             widget.title,
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                  color: const Color(0xFF243B3A),
-                ),
+              fontWeight: FontWeight.w600,
+              color: const Color(0xFF243B3A),
+            ),
           ),
         const SizedBox(height: 8),
         if (widget.photos.isEmpty)
           Text(
             'Nog geen foto’s toegevoegd.',
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF6A7C78)),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
           )
         else
           _CollapsiblePhotoWrap(
@@ -19663,11 +20425,7 @@ class _PhotoGridSectionState extends State<_PhotoGridSection> {
 }
 
 class _PhotoThumb extends StatelessWidget {
-  const _PhotoThumb({
-    required this.file,
-    required this.onTap,
-    this.onRemove,
-  });
+  const _PhotoThumb({required this.file, required this.onTap, this.onRemove});
 
   final PlatformFile file;
   final VoidCallback onTap;
@@ -19687,12 +20445,8 @@ class _PhotoThumb extends StatelessWidget {
               width: 64,
               color: const Color(0xFFE6DFD5),
               child: path == null
-                  ? const Icon(Icons.image_outlined,
-                      color: Color(0xFF6A7C78))
-                  : Image.file(
-                      File(path),
-                      fit: BoxFit.cover,
-                    ),
+                  ? const Icon(Icons.image_outlined, color: Color(0xFF6A7C78))
+                  : Image.file(File(path), fit: BoxFit.cover),
             ),
             if (onRemove != null)
               Positioned(
@@ -19755,8 +20509,9 @@ class _CollapsiblePhotoWrapState extends State<_CollapsiblePhotoWrap> {
               _PhotoThumb(
                 file: widget.photos[i],
                 onTap: () => widget.onOpen(i),
-                onRemove:
-                    widget.onRemove == null ? null : () => widget.onRemove!(i),
+                onRemove: widget.onRemove == null
+                    ? null
+                    : () => widget.onRemove!(i),
               ),
             if (showCollapsed)
               _MorePhotosTile(
@@ -19801,9 +20556,9 @@ class _MorePhotosTile extends StatelessWidget {
             child: Text(
               '+$remaining',
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: const Color(0xFF243B3A),
-                  ),
+                fontWeight: FontWeight.w600,
+                color: const Color(0xFF243B3A),
+              ),
             ),
           ),
         ),
@@ -19838,10 +20593,7 @@ void _openPhotoViewer(
                   );
                 }
                 return InteractiveViewer(
-                  child: Image.file(
-                    File(path),
-                    fit: BoxFit.contain,
-                  ),
+                  child: Image.file(File(path), fit: BoxFit.contain),
                 );
               },
             ),
@@ -19858,54 +20610,6 @@ void _openPhotoViewer(
       );
     },
   );
-}
-
-// ignore: unused_element
-class _ReadOnlyNote extends StatelessWidget {
-  const _ReadOnlyNote({required this.title, required this.subtitle});
-
-  final String title;
-  final String subtitle;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF4F1EA),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFFE1DAD0)),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.lock_outline, color: Color(0xFF6A7C78)),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        fontWeight: FontWeight.w600,
-                        color: const Color(0xFF243B3A),
-                      ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  subtitle,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 }
 
 class _GroupToggle extends StatelessWidget {
@@ -19947,13 +20651,12 @@ class _GroupToggle extends StatelessWidget {
                     child: Center(
                       child: Text(
                         labelBuilder?.call(group) ?? group,
-                        style:
-                            Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                  fontWeight: FontWeight.w600,
-                                  color: group == selected
-                                      ? const Color(0xFFFFE9CC)
-                                      : const Color(0xFF4B6763),
-                                ),
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          color: group == selected
+                              ? const Color(0xFFFFE9CC)
+                              : const Color(0xFF4B6763),
+                        ),
                       ),
                     ),
                   ),
@@ -20022,8 +20725,10 @@ class _CustomerRow extends StatelessWidget {
                       color: const Color(0xFFFCE6CC),
                       borderRadius: BorderRadius.circular(12),
                     ),
-                    child: const Icon(Icons.home_work_outlined,
-                        color: Color(0xFF6A4A2D)),
+                    child: const Icon(
+                      Icons.home_work_outlined,
+                      color: Color(0xFF6A4A2D),
+                    ),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -20035,9 +20740,7 @@ class _CustomerRow extends StatelessWidget {
                             name,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
+                            style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(
                                   fontWeight: FontWeight.w600,
                                   color: const Color(0xFF243B3A),
@@ -20051,9 +20754,7 @@ class _CustomerRow extends StatelessWidget {
                               name,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
+                              style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(
                                     fontWeight: FontWeight.w600,
                                     color: const Color(0xFF243B3A),
@@ -20064,9 +20765,7 @@ class _CustomerRow extends StatelessWidget {
                               phone,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
+                              style: Theme.of(context).textTheme.bodySmall
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             ),
                             if (highlight && showStatus) ...[
@@ -20075,9 +20774,7 @@ class _CustomerRow extends StatelessWidget {
                                 '$group · $status',
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .bodyMedium
+                                style: Theme.of(context).textTheme.bodyMedium
                                     ?.copyWith(color: const Color(0xFF6A7C78)),
                               ),
                             ],
@@ -20141,254 +20838,9 @@ class _EmptyStateCard extends StatelessWidget {
           const SizedBox(height: 6),
           Text(
             subtitle,
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF6A7C78)),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ignore: unused_element
-class _OverviewCard extends StatelessWidget {
-  const _OverviewCard({required this.title, required this.value});
-
-  final String title;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: const Color(0xFF0B2E2B),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                title,
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: const Color(0xFFFFE9CC),
-                      fontWeight: FontWeight.w600,
-                    ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                value,
-                style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                      color: const Color(0xFFFFE9CC),
-                    ),
-              ),
-            ],
-          ),
-          Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: const Color(0xFFFFA64D),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: const Icon(Icons.timer, color: Color(0xFF0B2E2B)),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ignore: unused_element
-class _RoleSection extends StatelessWidget {
-  const _RoleSection({
-    required this.title,
-    required this.subtitle,
-    required this.items,
-  });
-
-  final String title;
-  final String subtitle;
-  final List<String> items;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFFE1DAD0)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 4),
-          Text(
-            subtitle,
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFF6A7C78)),
-          ),
-          const SizedBox(height: 10),
-          ...items.map(
-            (item) => Padding(
-              padding: const EdgeInsets.only(bottom: 6),
-              child: Row(
-                children: [
-                  const Icon(Icons.check_circle_outline,
-                      size: 16, color: Color(0xFF0B2E2B)),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      item,
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: const Color(0xFF5A6F6C)),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ignore: unused_element
-class _ShiftCard extends StatelessWidget {
-  const _ShiftCard({
-    required this.time,
-    required this.project,
-    required this.details,
-    required this.status,
-  });
-
-  final String time;
-  final String project;
-  final String details;
-  final String status;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFFE1DAD0)),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 56,
-            height: 56,
-            decoration: BoxDecoration(
-              color: const Color(0xFFF4F1EA),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: const Icon(Icons.work_outline, color: Color(0xFF0B2E2B)),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  time,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  project,
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  details,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
-                ),
-                const SizedBox(height: 10),
-                _InlineButton(label: status),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ignore: unused_element
-class _ProjectCard extends StatelessWidget {
-  const _ProjectCard({
-    required this.title,
-    required this.subtitle,
-    required this.status,
-  });
-
-  final String title;
-  final String subtitle;
-  final String status;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFFE1DAD0)),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, style: Theme.of(context).textTheme.titleLarge),
-                const SizedBox(height: 4),
-                Text(
-                  subtitle,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF0B2E2B),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: Text(
-              status,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: const Color(0xFFFFE9CC),
-                    fontWeight: FontWeight.w600,
-                  ),
-            ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A7C78)),
           ),
         ],
       ),
@@ -20430,10 +20882,7 @@ class _ProfileCard extends StatelessWidget {
             child: photo?.path != null
                 ? ClipRRect(
                     borderRadius: BorderRadius.circular(18),
-                    child: Image.file(
-                      File(photo!.path!),
-                      fit: BoxFit.cover,
-                    ),
+                    child: Image.file(File(photo!.path!), fit: BoxFit.cover),
                   )
                 : const Icon(Icons.person, color: Color(0xFFFFE9CC)),
           ),
@@ -20457,7 +20906,7 @@ class _ProfileCard extends StatelessWidget {
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
-                                            const SizedBox(width: 6),
+                        const SizedBox(width: 6),
                         Icon(
                           Icons.edit_outlined,
                           size: 16,
@@ -20470,10 +20919,9 @@ class _ProfileCard extends StatelessWidget {
                 const SizedBox(height: 4),
                 Text(
                   roleLabel,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(color: const Color(0xFF6A7C78)),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF6A7C78),
+                  ),
                 ),
               ],
             ),
@@ -20486,108 +20934,11 @@ class _ProfileCard extends StatelessWidget {
             ),
             child: Text(
               'Actief',
-              style: Theme.of(context)
-                  .textTheme
-                  .bodyMedium
-                  ?.copyWith(color: const Color(0xFF6A4A2D)),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF6A4A2D)),
             ),
           ),
-        ],
-      ),
-    );
-  }
-}
-
-// ignore: unused_element
-class _SimpleListCard extends StatelessWidget {
-  const _SimpleListCard({required this.title, required this.items});
-
-  final String title;
-  final List<String> items;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFFE1DAD0)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 10),
-          ...items.map(
-            (item) => Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Row(
-                children: [
-                  const Icon(Icons.circle, size: 8, color: Color(0xFF0B2E2B)),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      item,
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: const Color(0xFF5A6F6C)),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ignore: unused_element
-class _ActionCard extends StatelessWidget {
-  const _ActionCard({
-    required this.title,
-    required this.subtitle,
-    required this.buttonLabel,
-    // ignore: unused_element_parameter
-    this.onTap,
-  });
-
-  final String title;
-  final String subtitle;
-  final String buttonLabel;
-  final VoidCallback? onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: const Color(0xFF0B2E2B),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: Theme.of(context)
-                .textTheme
-                .titleLarge
-                ?.copyWith(color: const Color(0xFFFFE9CC)),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            subtitle,
-            style: Theme.of(context)
-                .textTheme
-                .bodyMedium
-                ?.copyWith(color: const Color(0xFFD9C3A0)),
-          ),
-          const SizedBox(height: 12),
-          _PrimaryButton(label: buttonLabel, onTap: onTap),
         ],
       ),
     );
@@ -20612,9 +20963,7 @@ class _PrimaryButton extends StatelessWidget {
     return Container(
       width: fullWidth ? double.infinity : null,
       height: height,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-      ),
+      decoration: BoxDecoration(borderRadius: BorderRadius.circular(14)),
       child: Material(
         color: const Color(0xFFFFA64D),
         borderRadius: BorderRadius.circular(14),
@@ -20627,9 +20976,9 @@ class _PrimaryButton extends StatelessWidget {
               label,
               textAlign: fullWidth ? TextAlign.center : TextAlign.start,
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: const Color(0xFF0B2E2B),
-                  ),
+                fontWeight: FontWeight.w600,
+                color: const Color(0xFF0B2E2B),
+              ),
             ),
           ),
         ),
@@ -20663,9 +21012,9 @@ class _SecondaryButton extends StatelessWidget {
               label,
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: const Color(0xFF0B2E2B),
-                  ),
+                fontWeight: FontWeight.w600,
+                color: const Color(0xFF0B2E2B),
+              ),
             ),
           ),
         ),
@@ -20696,14 +21045,13 @@ class _InlineButton extends StatelessWidget {
             children: [
               if (icon != null) ...[
                 Icon(icon, size: 16, color: const Color(0xFF6A4A2D)),
-                                    const SizedBox(width: 6),
+                const SizedBox(width: 6),
               ],
               Text(
                 label,
-                style: Theme.of(context)
-                    .textTheme
-                    .bodyMedium
-                    ?.copyWith(color: const Color(0xFF6A4A2D)),
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFF6A4A2D),
+                ),
               ),
             ],
           ),
@@ -20732,11 +21080,7 @@ class _CircleIconButton extends StatelessWidget {
           shape: BoxShape.circle,
           border: Border.all(color: const Color(0xFFE1DAD0)),
         ),
-        child: Icon(
-          icon,
-          size: 20,
-          color: const Color(0xFF243B3A),
-        ),
+        child: Icon(icon, size: 20, color: const Color(0xFF243B3A)),
       ),
     );
   }
@@ -20850,12 +21194,12 @@ class _NavItem extends StatelessWidget {
             Text(
               label,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w600,
-                    color: selected
-                        ? const Color(0xFFFFE9CC)
-                        : const Color(0xFF6A7C78),
-                  ),
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                color: selected
+                    ? const Color(0xFFFFE9CC)
+                    : const Color(0xFF6A7C78),
+              ),
             ),
           ],
         ),
@@ -20869,8 +21213,6 @@ class _SoftGradientBackground extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const ColoredBox(
-      color: Color(0xFFF4F1EA),
-    );
+    return const ColoredBox(color: Color(0xFFF4F1EA));
   }
 }
