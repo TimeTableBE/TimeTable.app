@@ -1,6 +1,6 @@
 {
-    "name": "timetable_app",
-    "short_name": "timetable_app",
+    "name": "TimeTabl.eu",
+    "short_name": "TimeTabl.eu",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

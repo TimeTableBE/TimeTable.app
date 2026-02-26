@@ -21,7 +21,7 @@ import 'package:app_links/app_links.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await AppDataStore.init();
-  runApp(const TimeTableApp());
+  runApp(const TimeTablEuApp());
 }
 
 PageRoute<T> _appPageRoute<T>({required WidgetBuilder builder}) {
@@ -31,14 +31,14 @@ PageRoute<T> _appPageRoute<T>({required WidgetBuilder builder}) {
   return MaterialPageRoute<T>(builder: builder);
 }
 
-class TimeTableApp extends StatefulWidget {
-  const TimeTableApp({super.key});
+class TimeTablEuApp extends StatefulWidget {
+  const TimeTablEuApp({super.key});
 
   @override
-  State<TimeTableApp> createState() => _TimeTableAppState();
+  State<TimeTablEuApp> createState() => _TimeTablEuAppState();
 }
 
-class _TimeTableAppState extends State<TimeTableApp>
+class _TimeTablEuAppState extends State<TimeTablEuApp>
     with WidgetsBindingObserver {
   late final AppLinks _appLinks;
   StreamSubscription<Uri>? _linkSubscription;
@@ -55,7 +55,7 @@ class _TimeTableAppState extends State<TimeTableApp>
     if (uri == null) return;
     final scheme = uri.scheme.toLowerCase();
     final host = uri.host.toLowerCase();
-    if (scheme == 'timetableapp' && host == 'reset-password') {
+    if (scheme == 'timetabl.eu' && host == 'reset-password') {
       final token = (uri.queryParameters['token'] ?? '').trim();
       if (token.isNotEmpty) {
         DeepLinkStore.recoveryToken.value = token;
@@ -92,7 +92,7 @@ class _TimeTableAppState extends State<TimeTableApp>
     final baseTextTheme = GoogleFonts.spaceGroteskTextTheme();
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'TimeTable',
+      title: 'TimeTabl.eu',
       theme: ThemeData(
         colorScheme: const ColorScheme.light(
           primary: Color(0xFF0B2E2B),
@@ -663,6 +663,42 @@ class LocalSecretsStore {
 
 class ScheduleStore {
   static final List<TeamAssignment> scheduled = [];
+  static final List<TeamAssignment> completedHistory = [];
+
+  static void archiveProjectAssignments(String projectName, {String? team}) {
+    final removed = <TeamAssignment>[];
+    scheduled.removeWhere((assignment) {
+      if (assignment.project != projectName) return false;
+      if (team != null && assignment.team != team) return false;
+      removed.add(assignment);
+      return true;
+    });
+    for (final assignment in removed) {
+      final exists = completedHistory.any(
+        (item) =>
+            item.project == assignment.project &&
+            item.team == assignment.team &&
+            item.startDate == assignment.startDate &&
+            item.endDate == assignment.endDate &&
+            item.group == assignment.group,
+      );
+      if (!exists) {
+        completedHistory.add(
+          TeamAssignment(
+            project: assignment.project,
+            team: assignment.team,
+            startDate: assignment.startDate,
+            endDate: assignment.endDate,
+            estimatedDays: assignment.estimatedDays,
+            isBackorder: assignment.isBackorder,
+            group: assignment.group,
+            joinedSourceTeam: assignment.joinedSourceTeam,
+          ),
+        );
+      }
+    }
+    AppDataStore.scheduleSave();
+  }
 }
 
 class PlanningOrderStore {
@@ -779,12 +815,7 @@ class HiveRepository implements DataRepository {
 class AppDataStore {
   static const String _fileName = 'timetable_data.json';
   static bool hasStoredData = false;
-  // Alleen activeren met:
-  // --dart-define=WIPE_ON_INIT_FOR_TESTING=true
-  static const bool _wipeOnEveryInitForTesting = bool.fromEnvironment(
-    'WIPE_ON_INIT_FOR_TESTING',
-    defaultValue: false,
-  );
+  static const bool _resetToDemoDataOnEveryStart = true;
   static int _dataWipeVersion = 0;
   static const int _targetDataWipeVersion = 2;
   static int _projectResetVersion = 0;
@@ -800,6 +831,15 @@ class AppDataStore {
   static Future<void> init() async {
     await _primaryRepository.init();
     await _fallbackRepository.init();
+    if (_resetToDemoDataOnEveryStart && _DemoSeedStore.enabled) {
+      _wipeAllBusinessData();
+      await LocalSecretsStore.clearNetlifySession();
+      _DemoSeedStore.seedAll();
+      _dataWipeVersion = _targetDataWipeVersion;
+      _projectResetVersion = 1;
+      await save();
+      return;
+    }
     Map<String, dynamic>? data;
     try {
       data = await _primaryRepository.read();
@@ -818,12 +858,6 @@ class AppDataStore {
       hasStoredData = true;
     }
     OfferCatalogStore.seedIfEmpty();
-    if (_wipeOnEveryInitForTesting) {
-      _wipeAllBusinessData();
-      _dataWipeVersion = _targetDataWipeVersion;
-      await save();
-      return;
-    }
     if (_dataWipeVersion < _targetDataWipeVersion) {
       _wipeAllBusinessData();
       _dataWipeVersion = _targetDataWipeVersion;
@@ -870,6 +904,7 @@ class AppDataStore {
           estimatedDays: clamped,
           isBackorder: assignment.isBackorder,
           group: assignment.group,
+          joinedSourceTeam: assignment.joinedSourceTeam,
         );
         changed = true;
       }
@@ -902,6 +937,7 @@ class AppDataStore {
         ),
       ),
       'creators': Map<String, String>.from(ProjectStore.creators),
+      'projectOwners': Map<String, String>.from(ProjectStore.projectOwners),
       'details': ProjectStore.details.map(
         (name, details) => MapEntry(name, _detailsToJson(details)),
       ),
@@ -923,6 +959,9 @@ class AppDataStore {
       ),
       'backorderHours': Map<String, double>.from(ProjectStore.backorderHours),
       'backorderNotes': Map<String, String>.from(ProjectStore.backorderNotes),
+      'backorderPhotos': ProjectStore.backorderPhotos.map(
+        (name, files) => MapEntry(name, files.map(_fileToJson).toList()),
+      ),
       'isBackorder': Map<String, bool>.from(ProjectStore.isBackorder),
       'offers': ProjectStore.offers.map(
         (name, lines) => MapEntry(name, lines.map(_offerLineToJson).toList()),
@@ -932,6 +971,9 @@ class AppDataStore {
             MapEntry(name, docs.map(_projectDocumentToJson).toList()),
       ),
       'completionTeams': Map<String, String>.from(ProjectStore.completionTeams),
+      'teamCompletionSubmissions': ProjectStore.teamCompletionSubmissions.map(
+        (project, teams) => MapEntry(project, Map<String, bool>.from(teams)),
+      ),
       'workLogs': ProjectStore.workLogs.map(
         (name, entries) => MapEntry(name, entries.map(_workDayToJson).toList()),
       ),
@@ -942,13 +984,22 @@ class AppDataStore {
       'offerRequests': OfferRequestStore.requests
           .map(_offerRequestToJson)
           .toList(),
+      'planningAdjustmentRequests': PlanningAdjustmentRequestStore.requests
+          .map(_planningAdjustmentRequestToJson)
+          .toList(),
       'estimatedDayRequests': EstimatedDaysChangeStore.requests
           .map(_estimatedDaysRequestToJson)
           .toList(),
       'invoiceRecords': InvoiceStore.records.map(
         (project, record) => MapEntry(project, _invoiceRecordToJson(record)),
       ),
+      'invoiceHistory': InvoiceStore.history
+          .map(_invoiceHistoryEntryToJson)
+          .toList(),
       'schedule': ScheduleStore.scheduled.map(_assignmentToJson).toList(),
+      'scheduleHistory': ScheduleStore.completedHistory
+          .map(_assignmentToJson)
+          .toList(),
       'profileDocs': ProfileDocumentStore.documentsByUser.map(
         (name, docs) =>
             MapEntry(name, docs.map(_profileDocumentToJson).toList()),
@@ -987,6 +1038,9 @@ class AppDataStore {
     ProjectStore.creators
       ..clear()
       ..addAll(_stringMap(data['creators']));
+    ProjectStore.projectOwners
+      ..clear()
+      ..addAll(_stringMap(data['projectOwners']));
     ProjectStore.details
       ..clear()
       ..addAll(_detailsMap(data['details']));
@@ -1011,6 +1065,9 @@ class AppDataStore {
     ProjectStore.backorderNotes
       ..clear()
       ..addAll(_stringMap(data['backorderNotes']));
+    ProjectStore.backorderPhotos
+      ..clear()
+      ..addAll(_fileListMap(data['backorderPhotos']));
     ProjectStore.isBackorder
       ..clear()
       ..addAll(_boolMap(data['isBackorder']));
@@ -1023,6 +1080,9 @@ class AppDataStore {
     ProjectStore.completionTeams
       ..clear()
       ..addAll(_stringMap(data['completionTeams']));
+    ProjectStore.teamCompletionSubmissions
+      ..clear()
+      ..addAll(_nestedBoolMap(data['teamCompletionSubmissions']));
     ProjectStore.workLogs
       ..clear()
       ..addAll(_workLogMap(data['workLogs']));
@@ -1032,15 +1092,24 @@ class AppDataStore {
     OfferRequestStore.requests
       ..clear()
       ..addAll(_offerRequestList(data['offerRequests']));
+    PlanningAdjustmentRequestStore.requests
+      ..clear()
+      ..addAll(_planningAdjustmentRequestList(data['planningAdjustmentRequests']));
     EstimatedDaysChangeStore.requests
       ..clear()
       ..addAll(_estimatedDaysRequestList(data['estimatedDayRequests']));
     InvoiceStore.records
       ..clear()
       ..addAll(_invoiceRecordMap(data['invoiceRecords']));
+    InvoiceStore.history
+      ..clear()
+      ..addAll(_invoiceHistoryList(data['invoiceHistory']));
     ScheduleStore.scheduled
       ..clear()
       ..addAll(_scheduleList(data['schedule']));
+    ScheduleStore.completedHistory
+      ..clear()
+      ..addAll(_scheduleList(data['scheduleHistory']));
     ProfileDocumentStore.documentsByUser
       ..clear()
       ..addAll(_profileDocumentMap(data['profileDocs']));
@@ -1076,6 +1145,7 @@ class AppDataStore {
       ..addAll(_companyProfileMap(data['companyProfiles']));
     _dataWipeVersion = (data['dataWipeVersion'] as num?)?.toInt() ?? 0;
     _projectResetVersion = (data['projectResetVersion'] as num?)?.toInt() ?? 0;
+    ProjectStore.ensureProjectOwners();
     ProjectStore.markSeeded();
   }
 
@@ -1125,6 +1195,18 @@ class AppDataStore {
   static Map<String, bool> _boolMap(dynamic value) {
     if (value is! Map) return {};
     return value.map((key, val) => MapEntry(key.toString(), val == true));
+  }
+
+  static Map<String, Map<String, bool>> _nestedBoolMap(dynamic value) {
+    if (value is! Map) return {};
+    final output = <String, Map<String, bool>>{};
+    value.forEach((outerKey, innerValue) {
+      if (innerValue is! Map) return;
+      output[outerKey.toString()] = innerValue.map(
+        (innerKey, innerVal) => MapEntry(innerKey.toString(), innerVal == true),
+      );
+    });
+    return output;
   }
 
   static Map<String, double> _doubleMap(dynamic value) {
@@ -1285,6 +1367,15 @@ class AppDataStore {
     return value.map((e) => _offerRequestFromJson(e as Map? ?? {})).toList();
   }
 
+  static List<PlanningAdjustmentRequest> _planningAdjustmentRequestList(
+    dynamic value,
+  ) {
+    if (value is! List) return <PlanningAdjustmentRequest>[];
+    return value
+        .map((e) => _planningAdjustmentRequestFromJson(e as Map? ?? {}))
+        .toList();
+  }
+
   static List<EstimatedDaysChangeRequest> _estimatedDaysRequestList(
     dynamic value,
   ) {
@@ -1300,6 +1391,13 @@ class AppDataStore {
       (key, val) =>
           MapEntry(key.toString(), _invoiceRecordFromJson(val as Map? ?? {})),
     );
+  }
+
+  static List<InvoiceHistoryEntry> _invoiceHistoryList(dynamic value) {
+    if (value is! List) return <InvoiceHistoryEntry>[];
+    return value
+        .map((e) => _invoiceHistoryEntryFromJson(e as Map? ?? {}))
+        .toList();
   }
 
   static List<OfferCategory> _offerCatalogList(dynamic value) {
@@ -1412,6 +1510,7 @@ class AppDataStore {
   static Map<String, dynamic> _extraWorkToJson(ExtraWorkEntry entry) => {
     'description': entry.description,
     'hours': entry.hours,
+    'materialNote': entry.materialNote,
     'chargeType': entry.chargeType,
     'photos': entry.photos.map(_fileToJson).toList(),
   };
@@ -1419,6 +1518,7 @@ class AppDataStore {
   static ExtraWorkEntry _extraWorkFromJson(Map data) => ExtraWorkEntry(
     description: data['description']?.toString() ?? '',
     hours: (data['hours'] as num?)?.toDouble() ?? 0,
+    materialNote: data['materialNote']?.toString() ?? '',
     chargeType: data['chargeType']?.toString() ?? 'Klant',
     photos:
         (data['photos'] as List?)
@@ -1433,6 +1533,8 @@ class AppDataStore {
     'endMinutes': entry.endMinutes,
     'breakMinutes': entry.breakMinutes,
     'workers': entry.workers,
+    'phase': entry.phase,
+    'backorderNumber': entry.backorderNumber,
   };
 
   static WorkDayEntry _workDayFromJson(Map data) => WorkDayEntry(
@@ -1443,6 +1545,8 @@ class AppDataStore {
     workers:
         (data['workers'] as List?)?.map((e) => e.toString()).toList() ??
         <String>[],
+    phase: data['phase']?.toString() ?? 'project',
+    backorderNumber: (data['backorderNumber'] as num?)?.toInt(),
   );
 
   static Map<String, dynamic> _assignmentToJson(TeamAssignment assignment) => {
@@ -1453,6 +1557,7 @@ class AppDataStore {
     'estimatedDays': assignment.estimatedDays,
     'isBackorder': assignment.isBackorder,
     'group': assignment.group,
+    'joinedSourceTeam': assignment.joinedSourceTeam,
   };
 
   static TeamAssignment _assignmentFromJson(Map data) => TeamAssignment(
@@ -1466,6 +1571,7 @@ class AppDataStore {
     estimatedDays: (data['estimatedDays'] as num?)?.toInt() ?? 1,
     isBackorder: data['isBackorder'] == true,
     group: data['group']?.toString() ?? 'Klanten',
+    joinedSourceTeam: data['joinedSourceTeam']?.toString(),
   );
 
   static Map<String, dynamic> _leaveRequestToJson(LeaveRequest request) => {
@@ -1491,6 +1597,7 @@ class AppDataStore {
     'requester': request.requester,
     'createdAt': request.createdAt.toIso8601String(),
     'note': request.note,
+    'targetOwnerKey': request.targetOwnerKey,
   };
 
   static OfferRequest _offerRequestFromJson(Map data) => OfferRequest(
@@ -1500,7 +1607,35 @@ class AppDataStore {
         DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
         DateTime.now(),
     note: data['note']?.toString() ?? '',
+    targetOwnerKey: data['targetOwnerKey']?.toString() ?? '',
   );
+
+  static Map<String, dynamic> _planningAdjustmentRequestToJson(
+    PlanningAdjustmentRequest request,
+  ) => {
+    'project': request.project,
+    'team': request.team,
+    'requester': request.requester,
+    'requesterRole': request.requesterRole,
+    'createdAt': request.createdAt.toIso8601String(),
+    'targetOwnerKey': request.targetOwnerKey,
+    'note': request.note,
+    'status': request.status,
+  };
+
+  static PlanningAdjustmentRequest _planningAdjustmentRequestFromJson(Map data) =>
+      PlanningAdjustmentRequest(
+        project: data['project']?.toString() ?? '',
+        team: data['team']?.toString() ?? '',
+        requester: data['requester']?.toString() ?? '',
+        requesterRole: data['requesterRole']?.toString() ?? '',
+        createdAt:
+            DateTime.tryParse(data['createdAt']?.toString() ?? '') ??
+            DateTime.now(),
+        targetOwnerKey: data['targetOwnerKey']?.toString() ?? '',
+        note: data['note']?.toString() ?? '',
+        status: data['status']?.toString() ?? 'In afwachting',
+      );
 
   static Map<String, dynamic> _estimatedDaysRequestToJson(
     EstimatedDaysChangeRequest request,
@@ -1538,6 +1673,42 @@ class AppDataStore {
     offerBilled: data['offerBilled'] == true,
     extraHoursBilled: (data['extraHoursBilled'] as num?)?.toDouble() ?? 0,
   );
+
+  static Map<String, dynamic> _invoiceHistoryEntryToJson(
+    InvoiceHistoryEntry entry,
+  ) => {
+    'project': entry.project,
+    'group': entry.group,
+    'status': entry.status,
+    'team': entry.team,
+    'isBackorder': entry.isBackorder,
+    'offerHoursBilled': entry.offerHoursBilled,
+    'extraHoursBilled': entry.extraHoursBilled,
+    'materialNotes': List<String>.from(entry.materialNotes),
+    'approvedBy': entry.approvedBy,
+    'approvedAt': entry.approvedAt.toIso8601String(),
+  };
+
+  static InvoiceHistoryEntry _invoiceHistoryEntryFromJson(Map data) =>
+      InvoiceHistoryEntry(
+        project: data['project']?.toString() ?? '',
+        group: data['group']?.toString() ?? 'Klanten',
+        status: data['status']?.toString() ?? 'Afgewerkt',
+        team: data['team']?.toString() ?? '',
+        isBackorder: data['isBackorder'] == true,
+        offerHoursBilled: (data['offerHoursBilled'] as num?)?.toDouble() ?? 0,
+        extraHoursBilled: (data['extraHoursBilled'] as num?)?.toDouble() ?? 0,
+        materialNotes:
+            (data['materialNotes'] as List?)
+                ?.map((e) => e.toString())
+                .where((e) => e.trim().isNotEmpty)
+                .toList() ??
+            const <String>[],
+        approvedBy: data['approvedBy']?.toString() ?? '',
+        approvedAt:
+            DateTime.tryParse(data['approvedAt']?.toString() ?? '') ??
+            DateTime.now(),
+      );
 
   static Map<String, dynamic> _projectLogEntryToJson(ProjectLogEntry entry) => {
     'timestamp': entry.timestamp.toIso8601String(),
@@ -1719,6 +1890,42 @@ bool _isExternalRole(String role) {
       role == 'Werknemer';
 }
 
+bool _isSubcontractorAdminRole(String role) {
+  return role == 'Onderaannemer' || role == 'Onderaannemer beheerder';
+}
+
+String _normalizeOwnerKey(String value) => value.trim().toLowerCase();
+
+String _ownerKeyForUser({
+  required String role,
+  required String company,
+  required String contractor,
+}) {
+  final normalizedContractor = _normalizeOwnerKey(contractor);
+  final normalizedCompany = _normalizeOwnerKey(company);
+  if ((role == 'Onderaannemer' ||
+          role == 'Onderaannemer beheerder' ||
+          role == 'Werknemer') &&
+      normalizedContractor.isNotEmpty) {
+    return normalizedContractor;
+  }
+  if (normalizedCompany.isNotEmpty) {
+    return normalizedCompany;
+  }
+  if (normalizedContractor.isNotEmpty) {
+    return normalizedContractor;
+  }
+  return _normalizeOwnerKey('Finestone');
+}
+
+String _currentProjectOwnerKey() {
+  return _ownerKeyForUser(
+    role: CurrentUserStore.role,
+    company: CurrentUserStore.company,
+    contractor: CurrentUserStore.contractor,
+  );
+}
+
 bool _canSeeOfferPrices(String role) {
   return role == 'Beheerder' ||
       role == 'Onderaannemer' ||
@@ -1761,6 +1968,871 @@ class TestAccount {
   final String company;
   final String email;
   final String? team;
+}
+
+class _DemoLoginTarget {
+  const _DemoLoginTarget({required this.label, required this.email});
+
+  final String label;
+  final String email;
+}
+
+class _DemoSeedStore {
+  static const bool enabled = true;
+  static const String defaultPassword = 'Welkom123!';
+
+  static const List<_DemoLoginTarget> quickLoginTargets = [
+    _DemoLoginTarget(label: 'Beheerder Nick', email: 'nick@finestone.be'),
+    _DemoLoginTarget(label: 'Planner Julie', email: 'julie@finestone.be'),
+    _DemoLoginTarget(label: 'Administratie Manon', email: 'manon@finestone.be'),
+    _DemoLoginTarget(label: 'Boekhouding Lisa', email: 'lisa@finestone.be'),
+    _DemoLoginTarget(label: 'Verkoper Tuur', email: 'tuur@finestone.be'),
+    _DemoLoginTarget(
+      label: 'Projectleider Thomas',
+      email: 'thomas@finestone.be',
+    ),
+    _DemoLoginTarget(
+      label: 'Onderaannemer Schijnpoort',
+      email: 'schijnpoort@schijnpoort.be',
+    ),
+    _DemoLoginTarget(
+      label: 'Onderaannemer beheerder Igor',
+      email: 'igor@schijnpoort.be',
+    ),
+    _DemoLoginTarget(
+      label: 'Onderaannemer beheerder Victor',
+      email: 'victor@schijnpoort.be',
+    ),
+    _DemoLoginTarget(
+      label: 'Onderaannemer MS Construct',
+      email: 'msconstruct@msconstruct.be',
+    ),
+    _DemoLoginTarget(
+      label: 'Onderaannemer beheerder Maksim',
+      email: 'maksim@msconstruct.be',
+    ),
+    _DemoLoginTarget(
+      label: 'Onderaannemer beheerder Roma',
+      email: 'roma@msconstruct.be',
+    ),
+    _DemoLoginTarget(label: 'Werknemer Ihor', email: 'ihor@schijnpoort.be'),
+    _DemoLoginTarget(label: 'Werknemer Bohdan', email: 'bohdan@schijnpoort.be'),
+    _DemoLoginTarget(label: 'Werknemer Pavlo', email: 'pavlo@schijnpoort.be'),
+    _DemoLoginTarget(label: 'Werknemer Artem', email: 'artem@msconstruct.be'),
+  ];
+
+  static const List<String> _cities = [
+    'Gent',
+    'Brugge',
+    'Kortrijk',
+    'Roeselare',
+    'Oostende',
+    'Waregem',
+    'Deinze',
+    'Aalter',
+    'Eeklo',
+    'Ieper',
+    'Menen',
+    'Aalst',
+    'Dendermonde',
+    'Sint-Niklaas',
+    'Lokeren',
+    'Ninove',
+    'Ronse',
+    'Geraardsbergen',
+  ];
+  static const List<String> _streets = [
+    'Lentestraat',
+    'Stationsstraat',
+    'Kerkstraat',
+    'Molenstraat',
+    'Schoolstraat',
+    'Meersstraat',
+    'Veldstraat',
+    'Burgemeesterstraat',
+    'Parklaan',
+    'Hof ter Leen',
+    'Leopoldlaan',
+    'Dreef',
+    'Overnelleweg',
+    'Brugsesteenweg',
+    'Kortrijksesteenweg',
+  ];
+  static const List<String> _firstNames = [
+    'Johan',
+    'Pieter',
+    'An',
+    'Mieke',
+    'Tom',
+    'Sarah',
+    'Kris',
+    'Nele',
+    'Dirk',
+    'Caroline',
+    'Bram',
+    'Sofie',
+    'Lies',
+    'Frederik',
+    'Koen',
+    'Lotte',
+    'Evy',
+    'Wouter',
+    'Nicolas',
+    'Julie',
+  ];
+  static const List<String> _lastNames = [
+    'Vermeulen',
+    'De Smet',
+    'Vandenberghe',
+    'Van Damme',
+    'Declercq',
+    'Maes',
+    'Claeys',
+    'Desmet',
+    'Van der Velde',
+    'Dewulf',
+    'De Vos',
+    'Vercauteren',
+    'Van Hoof',
+    'Mortier',
+    'Aerts',
+    'Goossens',
+    'Vandamme',
+    'Lemmens',
+    'Peeters',
+    'Jacobs',
+  ];
+
+  static const Map<String, List<String>> _workersByTeam = {
+    'Team 1': ['Ihor', 'Vova', 'Kiryl'],
+    'Team 2': ['Bohdan', 'Vitaly', 'Vitaly Y.'],
+    'Team 3': ['Pavlo', 'Vadym', 'Ruslan'],
+    'Team 4': ['Artem', 'Maks', 'Dmytro'],
+    'Team 5': ['Nazar', 'Oleksii', 'Taras'],
+  };
+
+  static void seedAll() {
+    AuthStore.users.clear();
+    AuthStore.companies.clear();
+    _RoleManagementStore.assignments = [];
+    _RoleManagementStore.teams = [];
+    ProjectStore.clearAllProjects();
+    OfferCatalogStore.seedIfEmpty();
+    _seedCompanyProfiles();
+    _seedRoleAssignmentsAndTeams();
+    _seedAuthUsers();
+    _seedProjects();
+  }
+
+  static void _seedCompanyProfiles() {
+    final now = DateTime.now();
+    AuthStore.companies['finestone'] = CompanyProfile(
+      name: 'Finestone',
+      businessNumber: 'BE0123456789',
+      street: 'Industrieweg',
+      houseNumber: '14',
+      postalCode: '9000',
+      city: 'Gent',
+      adminName: 'Nick',
+      adminEmail: 'nick@finestone.be',
+      createdAt: now,
+    );
+    AuthStore.companies['schijnpoort'] = CompanyProfile(
+      name: 'Schijnpoort',
+      businessNumber: 'BE0987654321',
+      street: 'Noordlaan',
+      houseNumber: '53',
+      postalCode: '8400',
+      city: 'Oostende',
+      adminName: 'Igor',
+      adminEmail: 'igor@schijnpoort.be',
+      createdAt: now,
+    );
+    AuthStore.companies['ms construct'] = CompanyProfile(
+      name: 'MS Construct',
+      businessNumber: 'BE0456123789',
+      street: 'Westlaan',
+      houseNumber: '27',
+      postalCode: '8800',
+      city: 'Roeselare',
+      adminName: 'Maksim',
+      adminEmail: 'maksim@msconstruct.be',
+      createdAt: now,
+    );
+  }
+
+  static void _seedRoleAssignmentsAndTeams() {
+    _RoleManagementStore.assignments = [
+      _RoleAssignment(
+        name: 'Nick',
+        email: 'nick@finestone.be',
+        role: 'Beheerder',
+      ),
+      _RoleAssignment(
+        name: 'Julie',
+        email: 'julie@finestone.be',
+        role: 'Planner',
+      ),
+      _RoleAssignment(
+        name: 'Manon',
+        email: 'manon@finestone.be',
+        role: 'Administratie',
+      ),
+      _RoleAssignment(
+        name: 'Lisa',
+        email: 'lisa@finestone.be',
+        role: 'Boekhouding',
+      ),
+      _RoleAssignment(
+        name: 'Tuur',
+        email: 'tuur@finestone.be',
+        role: 'Verkoper',
+      ),
+      _RoleAssignment(
+        name: 'Thomas',
+        email: 'thomas@finestone.be',
+        role: 'Projectleider',
+      ),
+      _RoleAssignment(
+        name: 'Schijnpoort',
+        email: 'schijnpoort@schijnpoort.be',
+        role: 'Onderaannemer',
+        contractor: 'Schijnpoort',
+      ),
+      _RoleAssignment(
+        name: 'Igor',
+        email: 'igor@schijnpoort.be',
+        role: 'Onderaannemer beheerder',
+        contractor: 'Schijnpoort',
+      ),
+      _RoleAssignment(
+        name: 'Victor',
+        email: 'victor@schijnpoort.be',
+        role: 'Onderaannemer beheerder',
+        contractor: 'Schijnpoort',
+      ),
+      _RoleAssignment(
+        name: 'MS Construct',
+        email: 'msconstruct@msconstruct.be',
+        role: 'Onderaannemer',
+        contractor: 'MS Construct',
+      ),
+      _RoleAssignment(
+        name: 'Maksim',
+        email: 'maksim@msconstruct.be',
+        role: 'Onderaannemer beheerder',
+        contractor: 'MS Construct',
+      ),
+      _RoleAssignment(
+        name: 'Roma',
+        email: 'roma@msconstruct.be',
+        role: 'Onderaannemer beheerder',
+        contractor: 'MS Construct',
+      ),
+      _RoleAssignment(
+        name: 'Ihor',
+        email: 'ihor@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 1',
+      ),
+      _RoleAssignment(
+        name: 'Vova',
+        email: 'vova@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 1',
+      ),
+      _RoleAssignment(
+        name: 'Kiryl',
+        email: 'kiryl@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 1',
+      ),
+      _RoleAssignment(
+        name: 'Bohdan',
+        email: 'bohdan@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 2',
+      ),
+      _RoleAssignment(
+        name: 'Vitaly',
+        email: 'vitaly@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 2',
+      ),
+      _RoleAssignment(
+        name: 'Vitaly Y.',
+        email: 'vitalyy@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 2',
+      ),
+      _RoleAssignment(
+        name: 'Pavlo',
+        email: 'pavlo@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 3',
+      ),
+      _RoleAssignment(
+        name: 'Vadym',
+        email: 'vadym@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 3',
+      ),
+      _RoleAssignment(
+        name: 'Ruslan',
+        email: 'ruslan@schijnpoort.be',
+        role: 'Werknemer',
+        contractor: 'Schijnpoort',
+        team: 'Team 3',
+      ),
+      _RoleAssignment(
+        name: 'Artem',
+        email: 'artem@msconstruct.be',
+        role: 'Werknemer',
+        contractor: 'MS Construct',
+        team: 'Team 4',
+      ),
+      _RoleAssignment(
+        name: 'Maks',
+        email: 'maks@msconstruct.be',
+        role: 'Werknemer',
+        contractor: 'MS Construct',
+        team: 'Team 4',
+      ),
+      _RoleAssignment(
+        name: 'Dmytro',
+        email: 'dmytro@msconstruct.be',
+        role: 'Werknemer',
+        contractor: 'MS Construct',
+        team: 'Team 4',
+      ),
+      _RoleAssignment(
+        name: 'Nazar',
+        email: 'nazar@msconstruct.be',
+        role: 'Werknemer',
+        contractor: 'MS Construct',
+        team: 'Team 5',
+      ),
+      _RoleAssignment(
+        name: 'Oleksii',
+        email: 'oleksii@msconstruct.be',
+        role: 'Werknemer',
+        contractor: 'MS Construct',
+        team: 'Team 5',
+      ),
+      _RoleAssignment(
+        name: 'Taras',
+        email: 'taras@msconstruct.be',
+        role: 'Werknemer',
+        contractor: 'MS Construct',
+        team: 'Team 5',
+      ),
+    ];
+
+    const weekdays = <int>{
+      DateTime.monday,
+      DateTime.tuesday,
+      DateTime.wednesday,
+      DateTime.thursday,
+      DateTime.friday,
+    };
+    _RoleManagementStore.teams = [
+      _TeamAssignment(
+        name: 'Team 1',
+        contractor: 'Schijnpoort',
+        workingDays: weekdays,
+      ),
+      _TeamAssignment(
+        name: 'Team 2',
+        contractor: 'Schijnpoort',
+        workingDays: weekdays,
+      ),
+      _TeamAssignment(
+        name: 'Team 3',
+        contractor: 'Schijnpoort',
+        workingDays: weekdays,
+      ),
+      _TeamAssignment(
+        name: 'Team 4',
+        contractor: 'MS Construct',
+        workingDays: weekdays,
+      ),
+      _TeamAssignment(
+        name: 'Team 5',
+        contractor: 'MS Construct',
+        workingDays: weekdays,
+      ),
+    ];
+  }
+
+  static void _seedAuthUsers() {
+    final all = <Map<String, String>>[
+      {
+        'name': 'Nick',
+        'email': 'nick@finestone.be',
+        'company': 'Finestone',
+        'role': 'Beheerder',
+      },
+      {
+        'name': 'Julie',
+        'email': 'julie@finestone.be',
+        'company': 'Finestone',
+        'role': 'Planner',
+      },
+      {
+        'name': 'Manon',
+        'email': 'manon@finestone.be',
+        'company': 'Finestone',
+        'role': 'Administratie',
+      },
+      {
+        'name': 'Lisa',
+        'email': 'lisa@finestone.be',
+        'company': 'Finestone',
+        'role': 'Boekhouding',
+      },
+      {
+        'name': 'Tuur',
+        'email': 'tuur@finestone.be',
+        'company': 'Finestone',
+        'role': 'Verkoper',
+      },
+      {
+        'name': 'Thomas',
+        'email': 'thomas@finestone.be',
+        'company': 'Finestone',
+        'role': 'Projectleider',
+      },
+      {
+        'name': 'Schijnpoort',
+        'email': 'schijnpoort@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Onderaannemer',
+      },
+      {
+        'name': 'Igor',
+        'email': 'igor@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Onderaannemer beheerder',
+      },
+      {
+        'name': 'Victor',
+        'email': 'victor@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Onderaannemer beheerder',
+      },
+      {
+        'name': 'MS Construct',
+        'email': 'msconstruct@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Onderaannemer',
+      },
+      {
+        'name': 'Maksim',
+        'email': 'maksim@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Onderaannemer beheerder',
+      },
+      {
+        'name': 'Roma',
+        'email': 'roma@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Onderaannemer beheerder',
+      },
+      {
+        'name': 'Ihor',
+        'email': 'ihor@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 1',
+      },
+      {
+        'name': 'Vova',
+        'email': 'vova@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 1',
+      },
+      {
+        'name': 'Kiryl',
+        'email': 'kiryl@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 1',
+      },
+      {
+        'name': 'Bohdan',
+        'email': 'bohdan@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 2',
+      },
+      {
+        'name': 'Vitaly',
+        'email': 'vitaly@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 2',
+      },
+      {
+        'name': 'Vitaly Y.',
+        'email': 'vitalyy@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 2',
+      },
+      {
+        'name': 'Pavlo',
+        'email': 'pavlo@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 3',
+      },
+      {
+        'name': 'Vadym',
+        'email': 'vadym@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 3',
+      },
+      {
+        'name': 'Ruslan',
+        'email': 'ruslan@schijnpoort.be',
+        'company': 'Schijnpoort',
+        'role': 'Werknemer',
+        'team': 'Team 3',
+      },
+      {
+        'name': 'Artem',
+        'email': 'artem@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Werknemer',
+        'team': 'Team 4',
+      },
+      {
+        'name': 'Maks',
+        'email': 'maks@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Werknemer',
+        'team': 'Team 4',
+      },
+      {
+        'name': 'Dmytro',
+        'email': 'dmytro@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Werknemer',
+        'team': 'Team 4',
+      },
+      {
+        'name': 'Nazar',
+        'email': 'nazar@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Werknemer',
+        'team': 'Team 5',
+      },
+      {
+        'name': 'Oleksii',
+        'email': 'oleksii@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Werknemer',
+        'team': 'Team 5',
+      },
+      {
+        'name': 'Taras',
+        'email': 'taras@msconstruct.be',
+        'company': 'MS Construct',
+        'role': 'Werknemer',
+        'team': 'Team 5',
+      },
+    ];
+
+    for (final item in all) {
+      final salt = AuthStore._generateSalt();
+      AuthStore.users.add(
+        AuthUser(
+          name: item['name']!,
+          email: item['email']!,
+          company: item['company']!,
+          passwordHash: AuthStore._hashPassword(defaultPassword, salt),
+          passwordSalt: salt,
+          role: item['role']!,
+          team: item['team'],
+        ),
+      );
+    }
+  }
+
+  static void _seedProjects() {
+    const int totalCustomers = 200;
+    const int totalBackorders = 100;
+    const int finishedCustomers = 70;
+    const int finishedBackorders = 30;
+    final random = Random(20260211);
+    final teamOrder = _workersByTeam.keys.toList();
+    final futureCursor = <String, DateTime>{};
+    final pastCursor = <String, DateTime>{};
+    final today = _normalizeDateOnly(DateTime.now());
+    for (final team in teamOrder) {
+      futureCursor[team] = _nextWorkingDayForTeam(today, team);
+      pastCursor[team] = _nextWorkingDayForTeam(
+        today.subtract(const Duration(days: 200)),
+        team,
+      );
+    }
+
+    int customerIndex = 0;
+    int backorderIndex = 0;
+    int globalIndex = 0;
+
+    for (int i = 0; i < totalCustomers + totalBackorders; i++) {
+      final isBackorder = i % 3 == 2 && backorderIndex < totalBackorders;
+      final group = isBackorder ? 'Nabestellingen' : 'Klanten';
+      if (isBackorder) {
+        backorderIndex += 1;
+      } else {
+        customerIndex += 1;
+      }
+      final finished = isBackorder
+          ? backorderIndex <= finishedBackorders
+          : customerIndex <= finishedCustomers;
+      final team = teamOrder[globalIndex % teamOrder.length];
+      globalIndex += 1;
+
+      final estimatedDays = isBackorder ? 1 : (3 + random.nextInt(5));
+      final start = finished ? pastCursor[team]! : futureCursor[team]!;
+      final end = _endDateFromWorkingDays(start, estimatedDays, team);
+      final nextCursor = _nextWorkingDayForTeam(
+        end.add(const Duration(days: 1)),
+        team,
+      );
+      if (finished) {
+        pastCursor[team] = nextCursor;
+      } else {
+        futureCursor[team] = nextCursor;
+      }
+
+      final customerName = _buildCustomerName(
+        isBackorder ? backorderIndex : customerIndex,
+        isBackorder,
+      );
+      final details = _buildProjectDetails(random, estimatedDays);
+      final offerLines = _buildOfferLines(random, isBackorder);
+      final creator = i % 5 == 0 ? 'Julie' : (i % 7 == 0 ? 'Thomas' : 'Nick');
+
+      ProjectStore
+          .projectsByGroup[group]![finished ? 'Afgewerkt' : 'Ingepland']!
+          .add(customerName);
+      ProjectStore.creators[customerName] = creator;
+      ProjectStore.projectOwners[customerName] = _normalizeOwnerKey('Finestone');
+      ProjectStore.details[customerName] = details;
+      ProjectStore.offers[customerName] = offerLines;
+      ProjectStore.documents[customerName] = [];
+      ProjectStore.isBackorder[customerName] = isBackorder;
+
+      if (isBackorder) {
+        ProjectStore.backorderItems[customerName] = [
+          'Profiel bijsnijden',
+          'Afstelling sluitwerk',
+        ];
+        ProjectStore.backorderHours[customerName] =
+            (random.nextDouble() * 5 + 1.5);
+        ProjectStore.backorderNotes[customerName] =
+            'Nabestelling gepland na oplevering. Extra afregeling nodig.';
+      }
+
+      if (finished) {
+        ProjectStore.completionTeams[customerName] = team;
+        ProjectStore.workLogs[customerName] = _buildWorkLogsForAssignment(
+          start: start,
+          end: end,
+          team: team,
+          random: random,
+        );
+        if (random.nextInt(100) < 35) {
+          ProjectStore.extraWorks[customerName] = [
+            ExtraWorkEntry(
+              description: 'Extra afregeling op vraag klant',
+              photos: const [],
+              hours: (random.nextDouble() * 3 + 0.5),
+              chargeType: random.nextBool() ? 'Klant' : 'Interne fout',
+            ),
+          ];
+        }
+        if (random.nextInt(100) < 30) {
+          ProjectStore.comments[customerName] = [
+            'Opmerking planner: parkeren in de straat is beperkt.',
+            if (random.nextBool())
+              'Opmerking werfleider: extra beschermfolie voorzien.',
+          ];
+        }
+        ScheduleStore.completedHistory.add(
+          TeamAssignment(
+            project: customerName,
+            team: team,
+            startDate: start,
+            endDate: end,
+            estimatedDays: estimatedDays,
+            isBackorder: isBackorder,
+            group: group,
+          ),
+        );
+      }
+
+      if (!finished) {
+        ScheduleStore.scheduled.add(
+          TeamAssignment(
+            project: customerName,
+            team: team,
+            startDate: start,
+            endDate: end,
+            estimatedDays: estimatedDays,
+            isBackorder: isBackorder,
+            group: group,
+          ),
+        );
+      }
+    }
+    _seedTeam5FebruaryHistory(random);
+  }
+
+  static void _seedTeam5FebruaryHistory(Random random) {
+    const team = 'Team 5';
+    final year = DateTime.now().year;
+    final monthStart = DateTime(year, DateTime.february, 1);
+    final monthEnd = DateTime(year, DateTime.february + 1, 0);
+    int index = 1;
+    for (
+      DateTime day = monthStart;
+      !day.isAfter(monthEnd);
+      day = day.add(const Duration(days: 1))
+    ) {
+      if (!_isWorkingDayForTeam(day, team)) continue;
+      final projectName = 'Team 5 februari demo #$index';
+      index += 1;
+      if ((ProjectStore.details[projectName]?.address ?? '').isNotEmpty) {
+        continue;
+      }
+      final details = ProjectDetails(
+        address: 'Stationsstraat ${20 + index}, 9000 Gent',
+        phone:
+            '04${random.nextInt(90) + 10}${random.nextInt(9000000).toString().padLeft(7, '0')}',
+        delivery: 'Rechtstreeks op werf',
+        finish: ['PVC', 'MDF', 'Pleister'][random.nextInt(3)],
+        extraNotes: 'Testproject voor planning historiek Team 5.',
+        estimatedDays: 1,
+      );
+      ProjectStore.projectsByGroup['Klanten']!['Afgewerkt']!.add(projectName);
+      ProjectStore.creators[projectName] = 'Julie';
+      ProjectStore.projectOwners[projectName] = _normalizeOwnerKey('Finestone');
+      ProjectStore.details[projectName] = details;
+      ProjectStore.offers[projectName] = _buildOfferLines(random, false);
+      ProjectStore.documents[projectName] = [];
+      ProjectStore.isBackorder[projectName] = false;
+      ProjectStore.completionTeams[projectName] = team;
+      ProjectStore.workLogs[projectName] = _buildWorkLogsForAssignment(
+        start: day,
+        end: day,
+        team: team,
+        random: random,
+      );
+      ScheduleStore.completedHistory.add(
+        TeamAssignment(
+          project: projectName,
+          team: team,
+          startDate: day,
+          endDate: day,
+          estimatedDays: 1,
+          isBackorder: false,
+          group: 'Klanten',
+        ),
+      );
+    }
+  }
+
+  static String _buildCustomerName(int index, bool isBackorder) {
+    final first = _firstNames[(index - 1) % _firstNames.length];
+    final last =
+        _lastNames[((index - 1) ~/ _firstNames.length) % _lastNames.length];
+    if (isBackorder) {
+      return 'Nabestelling - $first $last #$index';
+    }
+    return '$first $last #$index';
+  }
+
+  static ProjectDetails _buildProjectDetails(Random random, int estimatedDays) {
+    final street = _streets[random.nextInt(_streets.length)];
+    final city = _cities[random.nextInt(_cities.length)];
+    final number = 1 + random.nextInt(149);
+    final postal = 8000 + random.nextInt(2000);
+    final finish = ['PVC', 'MDF', 'Pleister'][random.nextInt(3)];
+    final delivery = random.nextBool()
+        ? 'Loods Oudenburg'
+        : 'Rechtstreeks op werf';
+    return ProjectDetails(
+      address: '$street $number, $postal $city',
+      phone:
+          '04${random.nextInt(90) + 10}${random.nextInt(9000000).toString().padLeft(7, '0')}',
+      delivery: delivery,
+      finish: finish,
+      extraNotes: random.nextBool()
+          ? 'Particuliere klant in ${city.toLowerCase()}.'
+          : 'Plaatsing volgens standaardplanning.',
+      estimatedDays: estimatedDays,
+    );
+  }
+
+  static List<OfferLine> _buildOfferLines(Random random, bool isBackorder) {
+    final output = <OfferLine>[];
+    final categories = OfferCatalogStore.categories;
+    if (categories.isEmpty) return output;
+    final count = isBackorder ? 1 + random.nextInt(2) : 2 + random.nextInt(4);
+    for (int i = 0; i < count; i++) {
+      final category = categories[random.nextInt(categories.length)];
+      if (category.items.isEmpty) continue;
+      final item = category.items[random.nextInt(category.items.length)];
+      output.add(
+        OfferLine(
+          category: category.name,
+          item: item.name,
+          quantity: isBackorder ? 1 + random.nextInt(2) : 1 + random.nextInt(5),
+        ),
+      );
+    }
+    return output;
+  }
+
+  static List<WorkDayEntry> _buildWorkLogsForAssignment({
+    required DateTime start,
+    required DateTime end,
+    required String team,
+    required Random random,
+  }) {
+    final workers = _workersByTeam[team] ?? const <String>[];
+    final logs = <WorkDayEntry>[];
+    var day = _normalizeDateOnly(start);
+    while (!day.isAfter(end)) {
+      if (_isWorkingDayForTeam(day, team)) {
+        logs.add(
+          WorkDayEntry(
+            date: day,
+            startMinutes: 7 * 60 + random.nextInt(31),
+            endMinutes: 16 * 60 + 30 + random.nextInt(31),
+            breakMinutes: 30 + (random.nextBool() ? 15 : 0),
+            workers: List<String>.from(workers),
+          ),
+        );
+      }
+      day = day.add(const Duration(days: 1));
+    }
+    return logs;
+  }
 }
 
 const _projectGroups = ['Klanten', 'Nabestellingen'];
@@ -1832,6 +2904,8 @@ class WorkDayEntry {
     required this.endMinutes,
     required this.breakMinutes,
     required this.workers,
+    this.phase = 'project',
+    this.backorderNumber,
   });
 
   DateTime date;
@@ -1839,6 +2913,8 @@ class WorkDayEntry {
   int endMinutes;
   int breakMinutes;
   List<String> workers;
+  String phase;
+  int? backorderNumber;
 }
 
 class OfferItem {
@@ -2161,6 +3237,7 @@ class ProjectStore {
   };
 
   static final Map<String, String> creators = {};
+  static final Map<String, String> projectOwners = {};
 
   static final Map<String, ProjectDetails> details = {};
 
@@ -2171,10 +3248,12 @@ class ProjectStore {
   static final Map<String, List<String>> backorderItems = {};
   static final Map<String, double> backorderHours = {};
   static final Map<String, String> backorderNotes = {};
+  static final Map<String, List<PlatformFile>> backorderPhotos = {};
   static final Map<String, bool> isBackorder = {};
   static final Map<String, List<OfferLine>> offers = {};
   static final Map<String, List<ProjectDocument>> documents = {};
   static final Map<String, String> completionTeams = {};
+  static final Map<String, Map<String, bool>> teamCompletionSubmissions = {};
   static final Map<String, List<WorkDayEntry>> workLogs = {};
 
   static void clearAllProjects() {
@@ -2184,6 +3263,7 @@ class ProjectStore {
       }
     }
     creators.clear();
+    projectOwners.clear();
     details.clear();
     comments.clear();
     beforePhotos.clear();
@@ -2192,16 +3272,21 @@ class ProjectStore {
     backorderItems.clear();
     backorderHours.clear();
     backorderNotes.clear();
+    backorderPhotos.clear();
     isBackorder.clear();
     offers.clear();
     documents.clear();
     completionTeams.clear();
+    teamCompletionSubmissions.clear();
     workLogs.clear();
     ProjectLogStore.logs.clear();
     InvoiceStore.records.clear();
+    InvoiceStore.history.clear();
     EstimatedDaysChangeStore.requests.clear();
     OfferRequestStore.requests.clear();
+    PlanningAdjustmentRequestStore.requests.clear();
     ScheduleStore.scheduled.clear();
+    ScheduleStore.completedHistory.clear();
   }
 
   static void seedIfEmpty() {
@@ -2218,6 +3303,7 @@ class ProjectStore {
     required String status,
     required ProjectDetails details,
     required String creator,
+    String? ownerKey,
     List<OfferLine> offerLines = const [],
     List<ProjectDocument> documents = const [],
   }) {
@@ -2228,6 +3314,8 @@ class ProjectStore {
     }
     groupMap[status]?.add(name);
     creators[name] = creator;
+    projectOwners[name] =
+        _normalizeOwnerKey(ownerKey ?? _currentProjectOwnerKey());
     ProjectStore.details[name] = details;
     offers[name] = List<OfferLine>.from(offerLines);
     ProjectStore.documents[name] = List<ProjectDocument>.from(documents);
@@ -2246,6 +3334,7 @@ class ProjectStore {
       }
     }
     creators.remove(name);
+    projectOwners.remove(name);
     details.remove(name);
     comments.remove(name);
     beforePhotos.remove(name);
@@ -2254,17 +3343,23 @@ class ProjectStore {
     backorderItems.remove(name);
     backorderHours.remove(name);
     backorderNotes.remove(name);
+    backorderPhotos.remove(name);
     isBackorder.remove(name);
     offers.remove(name);
     documents.remove(name);
     completionTeams.remove(name);
+    teamCompletionSubmissions.remove(name);
     workLogs.remove(name);
     ProjectLogStore.logs.remove(name);
     InvoiceStore.records.remove(name);
+    InvoiceStore.history.removeWhere((entry) => entry.project == name);
     EstimatedDaysChangeStore.requests.removeWhere(
       (request) => request.project == name,
     );
     ScheduleStore.scheduled.removeWhere(
+      (assignment) => assignment.project == name,
+    );
+    ScheduleStore.completedHistory.removeWhere(
       (assignment) => assignment.project == name,
     );
     OfferRequestStore.requests.removeWhere(
@@ -2283,6 +3378,29 @@ class ProjectStore {
           ? 'Opmerking toegevoegd'
           : 'Opmerking toegevoegd: $summary',
     );
+    AppDataStore.scheduleSave();
+  }
+
+  static void registerTeamCompletionSubmission(
+    String projectName,
+    String team, {
+    required bool backorder,
+  }) {
+    final normalizedTeam = team.trim();
+    if (normalizedTeam.isEmpty) return;
+    teamCompletionSubmissions.putIfAbsent(projectName, () => {});
+    teamCompletionSubmissions[projectName]![normalizedTeam] = backorder;
+    AppDataStore.scheduleSave();
+  }
+
+  static bool hasBackorderCompletionSubmission(String projectName) {
+    final entries = teamCompletionSubmissions[projectName];
+    if (entries == null || entries.isEmpty) return false;
+    return entries.values.any((value) => value);
+  }
+
+  static void clearTeamCompletionSubmissions(String projectName) {
+    teamCompletionSubmissions.remove(projectName);
     AppDataStore.scheduleSave();
   }
 
@@ -2323,11 +3441,56 @@ class ProjectStore {
     required List<String> items,
   }) {
     isBackorder[projectName] = backorder;
-    backorderItems[projectName] = List<String>.from(items);
+    if (backorder) {
+      backorderItems[projectName] = List<String>.from(items);
+    } else {
+      backorderItems.remove(projectName);
+    }
     if (!backorder) {
       backorderHours.remove(projectName);
       backorderNotes.remove(projectName);
+      backorderPhotos.remove(projectName);
     }
+    AppDataStore.scheduleSave();
+  }
+
+  static void logBackorderSubmission(
+    String projectName, {
+    required List<String> items,
+    String note = '',
+  }) {
+    final cleanedItems = items
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toList();
+    if (cleanedItems.isEmpty) return;
+    final logs = ProjectLogStore.forProject(projectName);
+    final regex = RegExp(r'^Nabestelling (\d+):');
+    var nextIndex = 1;
+    for (final entry in logs) {
+      final match = regex.firstMatch(entry.message);
+      if (match == null) continue;
+      final parsed = int.tryParse(match.group(1) ?? '');
+      if (parsed != null && parsed >= nextIndex) {
+        nextIndex = parsed + 1;
+      }
+    }
+    ProjectLogStore.add(
+      projectName,
+      'Nabestelling $nextIndex: ${cleanedItems.join(', ')}',
+    );
+    final cleanedNote = note.trim();
+    if (cleanedNote.isNotEmpty) {
+      ProjectLogStore.add(projectName, 'Nabestelling $nextIndex opmerking: $cleanedNote');
+    }
+  }
+
+  static void clearBackorderDraft(String projectName) {
+    isBackorder[projectName] = false;
+    backorderItems.remove(projectName);
+    backorderHours.remove(projectName);
+    backorderNotes.remove(projectName);
+    backorderPhotos.remove(projectName);
     AppDataStore.scheduleSave();
   }
 
@@ -2338,6 +3501,73 @@ class ProjectStore {
       }
     }
     return null;
+  }
+
+  static String ownerKeyForProject(String name) {
+    final explicit = projectOwners[name];
+    if (explicit != null && explicit.trim().isNotEmpty) {
+      return _normalizeOwnerKey(explicit);
+    }
+    final creator = creators[name]?.trim();
+    if (creator != null && creator.isNotEmpty) {
+      final roleEntry = _RoleManagementStore.assignments.firstWhere(
+        (entry) => entry.name == creator,
+        orElse: () => _RoleAssignment(
+          name: '',
+          email: '',
+          role: '',
+        ),
+      );
+      if (roleEntry.name.isNotEmpty) {
+        final company = AuthStore.users
+            .firstWhere(
+              (user) => user.email.toLowerCase() == roleEntry.email.toLowerCase(),
+              orElse: () => const AuthUser(
+                name: '',
+                email: '',
+                company: '',
+                passwordHash: '',
+                passwordSalt: '',
+              ),
+            )
+            .company;
+        return _ownerKeyForUser(
+          role: roleEntry.role,
+          company: company,
+          contractor: roleEntry.contractor ?? '',
+        );
+      }
+    }
+    return _normalizeOwnerKey('Finestone');
+  }
+
+  static bool isOwnedBy(String projectName, String ownerKey) {
+    final normalizedOwner = _normalizeOwnerKey(ownerKey);
+    if (normalizedOwner.isEmpty) return true;
+    return ownerKeyForProject(projectName) == normalizedOwner;
+  }
+
+  static void ensureProjectOwners() {
+    final allProjects = <String>{};
+    for (final groupEntry in projectsByGroup.values) {
+      for (final names in groupEntry.values) {
+        allProjects.addAll(names);
+      }
+    }
+    allProjects.addAll(details.keys);
+    allProjects.addAll(creators.keys);
+
+    final stale = projectOwners.keys.where((name) => !allProjects.contains(name)).toList();
+    for (final key in stale) {
+      projectOwners.remove(key);
+    }
+
+    for (final project in allProjects) {
+      if (_normalizeOwnerKey(projectOwners[project] ?? '').isNotEmpty) {
+        continue;
+      }
+      projectOwners[project] = ownerKeyForProject(project);
+    }
   }
 
   static String? findStatusForProject(String name) {
@@ -2361,6 +3591,10 @@ class ProjectStore {
       entry.value.remove(name);
     }
     groupMap[status]?.add(name);
+    if ((status == 'Ingepland' && group != 'Nabestellingen') ||
+        (status == 'Afgewerkt' && group != 'Nabestellingen')) {
+      clearBackorderDraft(name);
+    }
     if (previousStatus != status) {
       final label = previousStatus == null
           ? 'Status ingesteld op $status'
@@ -2383,6 +3617,10 @@ class ProjectStore {
       }
     }
     projectsByGroup[group]?[status]?.add(name);
+    if ((status == 'Ingepland' && group != 'Nabestellingen') ||
+        (status == 'Afgewerkt' && group != 'Nabestellingen')) {
+      clearBackorderDraft(name);
+    }
     if (previousGroup != group || previousStatus != status) {
       final fromLabel = (previousGroup == null && previousStatus == null)
           ? ''
@@ -2399,12 +3637,14 @@ class OfferRequest {
     required this.requester,
     required this.createdAt,
     this.note = '',
+    this.targetOwnerKey = '',
   });
 
   final String project;
   final String requester;
   final DateTime createdAt;
   final String note;
+  final String targetOwnerKey;
 }
 
 class OfferRequestStore {
@@ -2419,6 +3659,42 @@ class OfferRequestStore {
   static void remove(OfferRequest request) {
     requests.remove(request);
     AppDataStore.scheduleSave();
+  }
+}
+
+class PlanningAdjustmentRequest {
+  PlanningAdjustmentRequest({
+    required this.project,
+    required this.team,
+    required this.requester,
+    required this.requesterRole,
+    required this.createdAt,
+    required this.targetOwnerKey,
+    this.note = '',
+    this.status = 'In afwachting',
+  });
+
+  final String project;
+  final String team;
+  final String requester;
+  final String requesterRole;
+  final DateTime createdAt;
+  final String targetOwnerKey;
+  final String note;
+  String status;
+}
+
+class PlanningAdjustmentRequestStore {
+  static final List<PlanningAdjustmentRequest> requests = [];
+
+  static void add(PlanningAdjustmentRequest request) {
+    requests.insert(0, request);
+    ProjectLogStore.add(request.project, 'Planningsopmerking ingediend');
+    AppDataStore.scheduleSave();
+  }
+
+  static List<PlanningAdjustmentRequest> pending() {
+    return requests.where((request) => request.status == 'In afwachting').toList();
   }
 }
 
@@ -2512,17 +3788,119 @@ class ProjectLogStore {
   }
 }
 
+class _BackorderHistoryItem {
+  const _BackorderHistoryItem({
+    required this.index,
+    required this.materials,
+    required this.timestamp,
+    this.note = '',
+  });
+
+  final int index;
+  final String materials;
+  final DateTime timestamp;
+  final String note;
+}
+
+List<_BackorderHistoryItem> _backorderHistoryForProject(
+  String projectName, {
+  bool hideCurrent = false,
+}) {
+  final entries = ProjectLogStore.forProject(projectName);
+  final orderRegex = RegExp(r'^Nabestelling (\d+):\s*(.*)$');
+  final noteRegex = RegExp(r'^Nabestelling (\d+) opmerking:\s*(.*)$');
+  final map = <int, _BackorderHistoryItem>{};
+  for (final entry in entries) {
+    final orderMatch = orderRegex.firstMatch(entry.message);
+    if (orderMatch != null) {
+      final index = int.tryParse(orderMatch.group(1) ?? '');
+      if (index == null) continue;
+      final materials = (orderMatch.group(2) ?? '').trim();
+      final previous = map[index];
+      map[index] = _BackorderHistoryItem(
+        index: index,
+        materials: materials,
+        timestamp: previous?.timestamp ?? entry.timestamp,
+        note: previous?.note ?? '',
+      );
+      continue;
+    }
+    final noteMatch = noteRegex.firstMatch(entry.message);
+    if (noteMatch == null) continue;
+    final index = int.tryParse(noteMatch.group(1) ?? '');
+    if (index == null) continue;
+    final note = (noteMatch.group(2) ?? '').trim();
+    final previous = map[index];
+    map[index] = _BackorderHistoryItem(
+      index: index,
+      materials: previous?.materials ?? '',
+      timestamp: previous?.timestamp ?? entry.timestamp,
+      note: note,
+    );
+  }
+  final result = map.values.toList()..sort((a, b) => a.index.compareTo(b.index));
+  if (hideCurrent && result.isNotEmpty) {
+    final latest = result.last;
+    final currentMaterials =
+        (ProjectStore.backorderItems[projectName] ?? const <String>[])
+            .map((item) => item.trim())
+            .where((item) => item.isNotEmpty)
+            .join(', ');
+    final currentNote = (ProjectStore.backorderNotes[projectName] ?? '').trim();
+    final sameAsCurrent =
+        latest.materials.trim() == currentMaterials.trim() &&
+        latest.note.trim() == currentNote;
+    if (sameAsCurrent) {
+      result.removeLast();
+    }
+  }
+  return result;
+}
+
+int? _currentBackorderIndexForProject(String projectName) {
+  final history = _backorderHistoryForProject(projectName);
+  if (history.isEmpty) return null;
+  final currentMaterials =
+      (ProjectStore.backorderItems[projectName] ?? const <String>[])
+          .map((item) => item.trim())
+          .where((item) => item.isNotEmpty)
+          .join(', ');
+  final currentNote = (ProjectStore.backorderNotes[projectName] ?? '').trim();
+  final matches = history
+      .where(
+        (item) =>
+            item.materials.trim() == currentMaterials.trim() &&
+            item.note.trim() == currentNote,
+      )
+      .toList()
+    ..sort((a, b) => a.index.compareTo(b.index));
+  if (matches.isNotEmpty) return matches.last.index;
+  return history.last.index;
+}
+
+String _workLogContextLabel(WorkDayEntry entry) {
+  if (entry.phase == 'backorder') {
+    if (entry.backorderNumber != null) {
+      return 'Type: Nabestelling ${entry.backorderNumber}';
+    }
+    return 'Type: Nabestelling';
+  }
+  return 'Type: Project';
+}
+
 class ExtraWorkEntry {
   ExtraWorkEntry({
     required this.description,
     required this.photos,
     required this.hours,
+    this.materialNote = '',
     this.chargeType = 'Klant',
   });
 
   final String description;
   final List<PlatformFile> photos;
   final double hours;
+  final String materialNote;
   final String chargeType;
 }
 
@@ -2566,7 +3944,9 @@ class _InvoiceItem {
     required this.offerHours,
     required this.extraHoursTotal,
     required this.extraHoursDelta,
+    required this.materialNotes,
     required this.includeOffer,
+    required this.arrivedAt,
   });
 
   final String name;
@@ -2577,7 +3957,9 @@ class _InvoiceItem {
   final double offerHours;
   final double extraHoursTotal;
   final double extraHoursDelta;
+  final List<String> materialNotes;
   final bool includeOffer;
+  final DateTime arrivedAt;
 }
 
 class _PlanningItem {
@@ -2596,13 +3978,6 @@ class _PlanningItem {
   final String group;
 }
 
-class _ExternalProjectItem {
-  _ExternalProjectItem({required this.assignment, required this.details});
-
-  final TeamAssignment assignment;
-  final ProjectDetails? details;
-}
-
 class TeamAssignment {
   TeamAssignment({
     required this.project,
@@ -2612,6 +3987,7 @@ class TeamAssignment {
     required this.estimatedDays,
     required this.isBackorder,
     required this.group,
+    this.joinedSourceTeam,
   });
 
   final String project;
@@ -2621,6 +3997,7 @@ class TeamAssignment {
   final int estimatedDays;
   final bool isBackorder;
   final String group;
+  final String? joinedSourceTeam;
 }
 
 class LoginScreen extends StatefulWidget {
@@ -2946,6 +4323,24 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
+  void _quickLogin(_DemoLoginTarget target) {
+    FocusManager.instance.primaryFocus?.unfocus();
+    final user = AuthStore.findByEmail(target.email);
+    if (user == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Testaccount niet gevonden: ${target.email}')),
+      );
+      return;
+    }
+    _emailController.text = target.email;
+    _passwordController.text = _DemoSeedStore.defaultPassword;
+    TextInput.finishAutofillContext(shouldSave: false);
+    final account = AuthStore.toAccount(user);
+    Navigator.of(context).pushReplacement(
+      _appPageRoute(builder: (_) => DashboardScreen(account: account)),
+    );
+  }
+
   Future<void> _resetPassword() async {
     final controller = TextEditingController(
       text: _emailController.text.trim(),
@@ -2998,7 +4393,7 @@ class _LoginScreenState extends State<LoginScreen> {
               padding: const EdgeInsets.fromLTRB(20, 24, 20, 32),
               children: [
                 Text(
-                  'TimeTable',
+                  'TimeTabl.eu',
                   style: Theme.of(context).textTheme.headlineLarge,
                 ),
                 const SizedBox(height: 24),
@@ -3059,6 +4454,33 @@ class _LoginScreenState extends State<LoginScreen> {
                         onTap: _resetPassword,
                       ),
                     ),
+                    if (_DemoSeedStore.enabled) ...[
+                      const SizedBox(height: 12),
+                      const Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          'Snel inloggen met testaccounts',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFF5D736F),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
+                        children: _DemoSeedStore.quickLoginTargets
+                            .map(
+                              (target) => ActionChip(
+                                label: Text(target.label),
+                                onPressed: () => _quickLogin(target),
+                              ),
+                            )
+                            .toList(),
+                      ),
+                    ],
                   ],
                 ),
               ],
@@ -3633,7 +5055,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
-                                'TimeTable',
+                                'TimeTabl.eu',
                                 style: Theme.of(
                                   context,
                                 ).textTheme.headlineLarge,
@@ -3740,6 +5162,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             estimatedDays: item.estimatedDays,
             isBackorder: item.isBackorder,
             group: item.group,
+            joinedSourceTeam: item.joinedSourceTeam,
           ),
         );
         cursor = end.add(const Duration(days: 1));
@@ -3756,6 +5179,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             estimatedDays: item.estimatedDays,
             isBackorder: item.isBackorder,
             group: item.group,
+            joinedSourceTeam: item.joinedSourceTeam,
           ),
         );
       }
@@ -3861,80 +5285,81 @@ class TodayTab extends StatefulWidget {
     BuildContext context,
     List<TeamAssignment> assignments,
   ) async {
-    if (assignments.isEmpty) {
+    final projectAssignments = <String, TeamAssignment>{};
+    for (final assignment in assignments) {
+      projectAssignments.putIfAbsent(assignment.project, () => assignment);
+    }
+    final projectNames = projectAssignments.keys.toList()..sort();
+    if (projectNames.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Geen project vandaag om aan te vragen.')),
       );
       return;
     }
-    String selected = assignments.first.project;
+    var selectedProject = projectNames.first;
     final noteController = TextEditingController();
     await showDialog<void>(
       context: context,
       builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text('Extra offerte aanvragen'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (assignments.length > 1)
-                DropdownButtonFormField<String>(
-                  initialValue: selected,
-                  items: assignments
-                      .map(
-                        (assignment) => DropdownMenuItem(
-                          value: assignment.project,
-                          child: Text(assignment.project),
-                        ),
-                      )
-                      .toList(),
-                  onChanged: (value) {
-                    if (value == null) return;
-                    selected = value;
-                  },
-                  decoration: const InputDecoration(labelText: 'Project'),
-                )
-              else
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    selected,
-                    style: Theme.of(context).textTheme.bodyMedium,
-                  ),
-                ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: noteController,
-                maxLines: 3,
-                decoration: const InputDecoration(
-                  labelText: 'Toelichting (optioneel)',
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Extra offerte aanvragen'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _DropdownField(
+                      label: 'Werf',
+                      value: selectedProject,
+                      items: projectNames,
+                      onChanged: (value) {
+                        if (value == null) return;
+                        setDialogState(() => selectedProject = value);
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: noteController,
+                      maxLines: 3,
+                      decoration: const InputDecoration(
+                        labelText: 'Toelichting (optioneel)',
+                      ),
+                    ),
+                  ],
                 ),
               ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(),
-              child: const Text('Annuleren'),
-            ),
-            TextButton(
-              onPressed: () {
-                OfferRequestStore.add(
-                  OfferRequest(
-                    project: selected,
-                    requester: CurrentUserStore.name,
-                    createdAt: DateTime.now(),
-                    note: noteController.text.trim(),
-                  ),
-                );
-                Navigator.of(dialogContext).pop();
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Offerte-aanvraag verstuurd.')),
-                );
-              },
-              child: const Text('Verzenden'),
-            ),
-          ],
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Annuleren'),
+                ),
+                TextButton(
+                  onPressed: () {
+                    final ownerKey = ProjectStore.ownerKeyForProject(
+                      selectedProject,
+                    );
+                    OfferRequestStore.add(
+                      OfferRequest(
+                        project: selectedProject,
+                        requester: CurrentUserStore.name,
+                        createdAt: DateTime.now(),
+                        note: noteController.text.trim(),
+                        targetOwnerKey: ownerKey,
+                      ),
+                    );
+                    Navigator.of(dialogContext).pop();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Offerte-aanvraag verstuurd.'),
+                      ),
+                    );
+                  },
+                  child: const Text('Verzenden'),
+                ),
+              ],
+            );
+          },
         );
       },
     );
@@ -3977,11 +5402,7 @@ class TodayTab extends StatefulWidget {
                     _InlineButton(
                       label: 'Bel klant',
                       icon: Icons.call_outlined,
-                      onTap: () {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('Bellen naar $phone')),
-                        );
-                      },
+                      onTap: () => _launchPhone(dialogContext, phone),
                     ),
                     const SizedBox(height: 12),
                     TextField(
@@ -4025,9 +5446,21 @@ class TodayTab extends StatefulWidget {
                 ),
                 TextButton(
                   onPressed: () {
-                    final note = noteController.text.trim();
-                    if (note.isNotEmpty) {
-                      ProjectStore.addComment(request.project, note);
+                    final answer = noteController.text.trim();
+                    final question = request.note.trim();
+                    final hasQuestion = question.isNotEmpty;
+                    final hasAnswer = answer.isNotEmpty;
+                    if (hasQuestion || hasAnswer) {
+                      final comment = StringBuffer();
+                      comment.writeln(
+                        'Offerte-vraag (${request.requester}): '
+                        '${hasQuestion ? question : 'Geen extra toelichting.'}',
+                      );
+                      comment.write(
+                        'Antwoord werfleider: '
+                        '${hasAnswer ? answer : 'Geen extra opmerking.'}',
+                      );
+                      ProjectStore.addComment(request.project, comment.toString());
                     }
                     if (createNewOffer) {
                       final baseName = 'Extra offerte - ${request.project}';
@@ -4039,6 +5472,7 @@ class TodayTab extends StatefulWidget {
                         group: 'Klanten',
                         status: 'In opmaak',
                         creator: CurrentUserStore.name,
+                        ownerKey: _currentProjectOwnerKey(),
                         details: ProjectDetails(
                           address: existing?.address ?? '—',
                           phone: existing?.phone ?? '—',
@@ -4078,7 +5512,17 @@ class TodayTab extends StatefulWidget {
     final canApproveDays = _canApproveEstimatedDaysChanges(
       CurrentUserStore.role,
     );
+    final canHandlePlanningRequests = _canHandlePlanningAdjustmentRequests(
+      CurrentUserStore.role,
+    );
     final pendingDayRequests = EstimatedDaysChangeStore.pending();
+    final pendingPlanningRequests = PlanningAdjustmentRequestStore.pending()
+        .where((request) {
+          final targetOwner = _normalizeOwnerKey(request.targetOwnerKey);
+          if (targetOwner.isEmpty) return true;
+          return targetOwner == _currentProjectOwnerKey();
+        })
+        .toList();
     final teams = isExternal ? _teamsForCurrentUser() : const <String>[];
     final matches = _assignmentsForDay(today);
     final visible = isExternal
@@ -4094,6 +5538,27 @@ class TodayTab extends StatefulWidget {
         .length;
     final customersToday = visible.length - backordersToday;
     final grouped = _groupByTeam(today, visible);
+    final visibleOfferRequests = OfferRequestStore.requests.where((request) {
+      final targetOwner = _normalizeOwnerKey(
+        request.targetOwnerKey.isNotEmpty
+            ? request.targetOwnerKey
+            : ProjectStore.ownerKeyForProject(request.project),
+      );
+      if (targetOwner.isEmpty) return true;
+      return targetOwner == _currentProjectOwnerKey();
+    }).toList();
+    final workerOrderedVisible = isWorker
+        ? (() {
+            final ordered = <TeamAssignment>[];
+            for (final team in teams) {
+              final teamAssignments = grouped[team];
+              if (teamAssignments != null) {
+                ordered.addAll(teamAssignments);
+              }
+            }
+            return ordered.isEmpty ? visible : ordered;
+          })()
+        : visible;
     final header = Padding(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
       child: Row(
@@ -4117,7 +5582,7 @@ class TodayTab extends StatefulWidget {
           Expanded(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
-              child: visible.isEmpty
+              child: workerOrderedVisible.isEmpty
                   ? const _EmptyStateCard(
                       title: 'Geen planning vandaag',
                       subtitle: 'Er zijn vandaag geen projecten ingepland.',
@@ -4136,9 +5601,10 @@ class TodayTab extends StatefulWidget {
                           ),
                         Expanded(
                           child: _TodayProjectFullCard(
-                            assignment: visible.first,
+                            assignment: workerOrderedVisible.first,
                             details:
-                                ProjectStore.details[visible.first.project],
+                                ProjectStore.details[
+                                    workerOrderedVisible.first.project],
                             onUpdated: onUpdated,
                           ),
                         ),
@@ -4249,12 +5715,58 @@ class TodayTab extends StatefulWidget {
                   ],
                 ),
               ],
-              if (isProjectLeader && OfferRequestStore.requests.isNotEmpty) ...[
+              if (canHandlePlanningRequests && pendingPlanningRequests.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                _InputCard(
+                  title: 'Planningsopmerkingen',
+                  children: [
+                    ...pendingPlanningRequests.map(
+                      (request) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '${request.project} · ${request.team}',
+                              style: Theme.of(context).textTheme.bodyMedium
+                                  ?.copyWith(fontWeight: FontWeight.w600),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'Door ${request.requester}',
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(color: const Color(0xFF6A7C78)),
+                            ),
+                            if (request.note.trim().isNotEmpty) ...[
+                              const SizedBox(height: 4),
+                              Text(
+                                request.note.trim(),
+                                style: Theme.of(context).textTheme.bodyMedium,
+                              ),
+                            ],
+                            const SizedBox(height: 8),
+                            _InlineButton(
+                              label: 'Markeer als verwerkt',
+                              icon: Icons.check_circle_outline,
+                              onTap: () {
+                                request.status = 'Verwerkt';
+                                AppDataStore.scheduleSave();
+                                onUpdated();
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              if (isProjectLeader && visibleOfferRequests.isNotEmpty) ...[
                 const SizedBox(height: 12),
                 _InputCard(
                   title: 'Offerte-aanvragen',
                   children: [
-                    ...OfferRequestStore.requests.map(
+                    ...visibleOfferRequests.map(
                       (request) => Padding(
                         padding: const EdgeInsets.only(bottom: 10),
                         child: Column(
@@ -4296,11 +5808,7 @@ class TodayTab extends StatefulWidget {
                                             .details[request.project]
                                             ?.phone ??
                                         '—';
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                        content: Text('Bellen naar $phone'),
-                                      ),
-                                    );
+                                    _launchPhone(context, phone);
                                   },
                                 ),
                                 const SizedBox(width: 8),
@@ -4499,6 +6007,8 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
   int? _editingWorkLogIndex;
   final TextEditingController _extraWorkController = TextEditingController();
   final TextEditingController _extraHoursController = TextEditingController();
+  final TextEditingController _extraMaterialController =
+      TextEditingController();
   String _extraWorkChargeType = _extraWorkChargeTypes.first;
   final TextEditingController _commentController = TextEditingController();
   List<PlatformFile> _extraWorkFiles = [];
@@ -4507,12 +6017,25 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
   final TextEditingController _backorderController = TextEditingController();
   final TextEditingController _backorderNoteController =
       TextEditingController();
+  final TextEditingController _backorderEstimateController =
+      TextEditingController();
   final List<String> _backorderItems = [];
+  List<PlatformFile> _backorderFiles = [];
   final TextEditingController _daysChangeController = TextEditingController();
+  final ScrollController _workerTabScrollController = ScrollController();
 
-  @override
-  void initState() {
-    super.initState();
+  void _resetToInfoTop() {
+    _tabIndex = 0;
+    _siteTabIndex = 0;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_workerTabScrollController.hasClients) {
+        _workerTabScrollController.jumpTo(0);
+      }
+    });
+  }
+
+  void _loadProjectState() {
     final name = widget.assignment.project;
     _beforePhotos = List<PlatformFile>.from(
       ProjectStore.beforePhotos[name] ?? const [],
@@ -4526,22 +6049,55 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
     _workLogs = List<WorkDayEntry>.from(
       ProjectStore.workLogs[name] ?? const [],
     );
-    _isBackorder = ProjectStore.isBackorder[name] ?? false;
-    _backorderItems
-      ..clear()
-      ..addAll(ProjectStore.backorderItems[name] ?? const []);
-    _backorderNoteController.text = ProjectStore.backorderNotes[name] ?? '';
+    _isBackorder = false;
+    _workDate = DateTime.now();
+    _workStartMinutes = null;
+    _workEndMinutes = null;
+    _workBreakController.text = '30';
+    _selectedWorkers = [];
+    _editingWorkLogIndex = null;
+    _extraWorkController.clear();
+    _extraHoursController.clear();
+    _extraMaterialController.clear();
+    _extraWorkChargeType = _extraWorkChargeTypes.first;
+    _extraWorkFiles = [];
+    _editingExtraWorkIndex = null;
+    _backorderController.clear();
+    _backorderItems.clear();
+    _backorderNoteController.clear();
+    _backorderEstimateController.clear();
+    _backorderFiles = [];
+    _daysChangeController.clear();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadProjectState();
+    _resetToInfoTop();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TodayProjectFullCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.assignment.project != widget.assignment.project) {
+      _loadProjectState();
+      _resetToInfoTop();
+    }
   }
 
   @override
   void dispose() {
     _extraWorkController.dispose();
     _extraHoursController.dispose();
+    _extraMaterialController.dispose();
     _commentController.dispose();
     _workBreakController.dispose();
     _backorderController.dispose();
     _backorderNoteController.dispose();
+    _backorderEstimateController.dispose();
     _daysChangeController.dispose();
+    _workerTabScrollController.dispose();
     super.dispose();
   }
 
@@ -4572,47 +6128,84 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
     return '${hours.toString().padLeft(2, '0')}:${mins.toString().padLeft(2, '0')}';
   }
 
-  Future<void> _pickWorkDate() async {
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _workDate,
-      firstDate: DateTime(_workDate.year - 1),
-      lastDate: DateTime(_workDate.year + 1),
+  bool _canRegisterHoursForSelectedDate() {
+    final selected = DateTime(_workDate.year, _workDate.month, _workDate.day);
+    final today = DateTime.now();
+    final normalizedToday = DateTime(today.year, today.month, today.day);
+    if (selected != normalizedToday) return false;
+    final start = DateTime(
+      widget.assignment.startDate.year,
+      widget.assignment.startDate.month,
+      widget.assignment.startDate.day,
     );
-    if (picked == null) return;
-    setState(() {
-      _workDate = picked;
-    });
+    final end = DateTime(
+      widget.assignment.endDate.year,
+      widget.assignment.endDate.month,
+      widget.assignment.endDate.day,
+    );
+    return !normalizedToday.isBefore(start) && !normalizedToday.isAfter(end);
   }
 
-  void _saveWorkLog() {
+  bool _saveWorkLog() {
+    if (!_canRegisterHoursForSelectedDate()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Urenregistratie kan enkel voor de planning van vandaag.',
+          ),
+        ),
+      );
+      return false;
+    }
     final start = _workStartMinutes;
     final end = _workEndMinutes;
     if (start == null || end == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Kies een begin- en einduur.')),
       );
-      return;
+      return false;
     }
     if (end <= start) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Einduur moet na beginuur vallen.')),
       );
-      return;
+      return false;
     }
     if (_selectedWorkers.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Selecteer wie er gewerkt heeft.')),
       );
-      return;
+      return false;
     }
     final breakMinutes = int.tryParse(_workBreakController.text.trim()) ?? 0;
+    final isExecutingBackorder =
+        ProjectStore.isBackorder[widget.assignment.project] == true ||
+        widget.assignment.isBackorder ||
+        widget.assignment.group == 'Nabestellingen';
+    final currentBackorderNumber = _currentBackorderIndexForProject(
+      widget.assignment.project,
+    );
+    final draftPhase = isExecutingBackorder ? 'backorder' : 'project';
+    final draftBackorderNumber = isExecutingBackorder
+        ? currentBackorderNumber
+        : null;
+    String phase = draftPhase;
+    int? backorderNumber = draftBackorderNumber;
+    if (_editingWorkLogIndex != null &&
+        _editingWorkLogIndex! >= 0 &&
+        _editingWorkLogIndex! < _workLogs.length) {
+      final existing = _workLogs[_editingWorkLogIndex!];
+      phase = existing.phase;
+      backorderNumber = existing.backorderNumber;
+    }
     final entry = WorkDayEntry(
       date: DateTime(_workDate.year, _workDate.month, _workDate.day),
       startMinutes: start,
       endMinutes: end,
       breakMinutes: breakMinutes,
       workers: List<String>.from(_selectedWorkers),
+      phase: phase,
+      backorderNumber: backorderNumber,
     );
     setState(() {
       if (_editingWorkLogIndex != null &&
@@ -4629,19 +6222,171 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       _workBreakController.text = '30';
       _selectedWorkers = [];
     });
+    return true;
   }
 
-  void _editWorkLog(int index) {
-    if (index < 0 || index >= _workLogs.length) return;
-    final entry = _workLogs[index];
-    setState(() {
-      _editingWorkLogIndex = index;
+  Future<void> _openWorkLogDialog({int? editIndex}) async {
+    final isEditing =
+        editIndex != null && editIndex >= 0 && editIndex < _workLogs.length;
+    if (isEditing) {
+      final entry = _workLogs[editIndex];
+      _editingWorkLogIndex = editIndex;
       _workDate = entry.date;
       _workStartMinutes = entry.startMinutes;
       _workEndMinutes = entry.endMinutes;
       _workBreakController.text = entry.breakMinutes.toString();
       _selectedWorkers = List<String>.from(entry.workers);
-    });
+    } else {
+      _editingWorkLogIndex = null;
+      _workDate = DateTime.now();
+      _workStartMinutes = null;
+      _workEndMinutes = null;
+      _workBreakController.text = '30';
+      _selectedWorkers = [];
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            return AlertDialog(
+              title: Text(isEditing ? 'Uren bewerken' : 'Uren toevoegen'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _InlineButton(
+                      label: _formatDate(_workDate),
+                      icon: Icons.calendar_today,
+                      onTap: () async {
+                        final picked = await showDatePicker(
+                          context: dialogContext,
+                          initialDate: _workDate,
+                          firstDate: DateTime(_workDate.year - 1),
+                          lastDate: DateTime(_workDate.year + 1),
+                        );
+                        if (picked == null) return;
+                        setDialogState(() {
+                          _workDate = picked;
+                        });
+                      },
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _InlineButton(
+                            label: _workStartMinutes == null
+                                ? 'Beginuur'
+                                : _formatMinutes(_workStartMinutes!),
+                            icon: Icons.schedule,
+                            onTap: () async {
+                              final picked = await showTimePicker(
+                                context: dialogContext,
+                                initialTime: TimeOfDay.now(),
+                              );
+                              if (picked == null) return;
+                              setDialogState(() {
+                                _workStartMinutes = _minutesFromTimeOfDay(
+                                  picked,
+                                );
+                              });
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _InlineButton(
+                            label: _workEndMinutes == null
+                                ? 'Einduur'
+                                : _formatMinutes(_workEndMinutes!),
+                            icon: Icons.schedule,
+                            onTap: () async {
+                              final picked = await showTimePicker(
+                                context: dialogContext,
+                                initialTime: TimeOfDay.now(),
+                              );
+                              if (picked == null) return;
+                              setDialogState(() {
+                                _workEndMinutes = _minutesFromTimeOfDay(
+                                  picked,
+                                );
+                              });
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: _workBreakController,
+                      keyboardType: TextInputType.number,
+                      decoration: InputDecoration(
+                        labelText: 'Pauze (minuten)',
+                        filled: true,
+                        fillColor: const Color(0xFFF4F1EA),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _teamWorkers().map((name) {
+                        final selected = _selectedWorkers.contains(name);
+                        return FilterChip(
+                          label: Text(name),
+                          selected: selected,
+                          onSelected: (value) {
+                            setDialogState(() {
+                              if (value) {
+                                _selectedWorkers.add(name);
+                              } else {
+                                _selectedWorkers.remove(name);
+                              }
+                            });
+                          },
+                        );
+                      }).toList(),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    _editingWorkLogIndex = null;
+                    Navigator.of(dialogContext).pop();
+                  },
+                  child: const Text('Annuleren'),
+                ),
+                TextButton(
+                  onPressed: () {
+                    final saved = _saveWorkLog();
+                    if (saved) {
+                      Navigator.of(dialogContext).pop();
+                    }
+                  },
+                  child: const Text('Opslaan'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _editWorkLog(int index) {
+    _openWorkLogDialog(editIndex: index);
   }
 
   void _deleteWorkLog(int index) {
@@ -4722,6 +6467,18 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
     });
   }
 
+  Future<void> _pickBackorderPhotos() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      type: FileType.image,
+      withData: true,
+    );
+    if (result == null) return;
+    setState(() {
+      _backorderFiles.addAll(result.files);
+    });
+  }
+
   void _addExtraWork() {
     final description = _extraWorkController.text.trim();
     if (description.isEmpty || _extraWorkFiles.isEmpty) {
@@ -4731,10 +6488,12 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       return;
     }
     final hours = double.tryParse(_extraHoursController.text.trim()) ?? 0;
+    final material = _extraMaterialController.text.trim();
     final entry = ExtraWorkEntry(
       description: description,
       photos: List<PlatformFile>.from(_extraWorkFiles),
       hours: hours,
+      materialNote: material,
       chargeType: _extraWorkChargeType,
     );
     setState(() {
@@ -4757,6 +6516,7 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       }
       _extraWorkController.clear();
       _extraHoursController.clear();
+      _extraMaterialController.clear();
       _extraWorkChargeType = _extraWorkChargeTypes.first;
       _extraWorkFiles = [];
       _editingExtraWorkIndex = null;
@@ -4770,6 +6530,7 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       _editingExtraWorkIndex = index;
       _extraWorkController.text = entry.description;
       _extraHoursController.text = _formatPrice(entry.hours);
+      _extraMaterialController.text = entry.materialNote;
       _extraWorkFiles = List<PlatformFile>.from(entry.photos);
       _extraWorkChargeType = entry.chargeType;
     });
@@ -4785,6 +6546,7 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
         _editingExtraWorkIndex = null;
         _extraWorkController.clear();
         _extraHoursController.clear();
+        _extraMaterialController.clear();
         _extraWorkChargeType = _extraWorkChargeTypes.first;
         _extraWorkFiles = [];
       }
@@ -4805,15 +6567,6 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
       _backorderItems.add(text);
       _backorderController.clear();
     });
-    ProjectStore.setBackorder(
-      widget.assignment.project,
-      backorder: true,
-      items: _backorderItems,
-    );
-    ProjectLogStore.add(
-      widget.assignment.project,
-      'Nabestelling item toegevoegd: ${_truncateText(text, 60)}',
-    );
   }
 
   void _editBackorderItem(int index) {
@@ -4823,31 +6576,13 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
     setState(() {
       _backorderItems.removeAt(index);
     });
-    ProjectStore.setBackorder(
-      widget.assignment.project,
-      backorder: true,
-      items: _backorderItems,
-    );
-    ProjectLogStore.add(
-      widget.assignment.project,
-      'Nabestelling item verwijderd: ${_truncateText(removed, 60)}',
-    );
   }
 
   void _deleteBackorderItem(int index) {
     if (index < 0 || index >= _backorderItems.length) return;
     setState(() {
-      final removed = _backorderItems.removeAt(index);
-      ProjectLogStore.add(
-        widget.assignment.project,
-        'Nabestelling item verwijderd: ${_truncateText(removed, 60)}',
-      );
+      _backorderItems.removeAt(index);
     });
-    ProjectStore.setBackorder(
-      widget.assignment.project,
-      backorder: true,
-      items: _backorderItems,
-    );
   }
 
   void _submitEstimatedDaysChange() {
@@ -4897,19 +6632,24 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
   Widget build(BuildContext context) {
     final isWorker = CurrentUserStore.role == 'Werknemer';
     final details = widget.details;
-    final backorderHours =
-        ProjectStore.backorderHours[widget.assignment.project] ?? 0;
+    final hasCurrentBackorder =
+        ProjectStore.isBackorder[widget.assignment.project] == true;
     final pendingDaysRequest = EstimatedDaysChangeStore.pendingForProject(
       widget.assignment.project,
     );
     final infoContent = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (hasCurrentBackorder) ...[
+          _BackorderDetailsSection(
+            projectName: widget.assignment.project,
+            title: 'Nabestelling (uitvoering)',
+          ),
+          const SizedBox(height: 12),
+        ],
         _InfoTextBlock(
           title: 'Informatie',
           lines: [
-            if (_isBackorder)
-              const _PlainInfoLine(label: 'Type', value: 'Nabestelling'),
             _PlainInfoLine(
               label: 'Klantnaam',
               value: widget.assignment.project,
@@ -4927,27 +6667,16 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
               _PlainInfoLine(label: 'Afwerking', value: details!.finish),
             if (details?.extraNotes.trim().isNotEmpty == true)
               _PlainInfoLine(label: 'Extra notes', value: details!.extraNotes),
-            if (_isBackorder && backorderHours > 0)
-              _PlainInfoLine(
-                label: 'Duur',
-                value: _formatHours(backorderHours),
-              ),
-            if ((ProjectStore.backorderNotes[widget.assignment.project] ?? '')
-                .trim()
-                .isNotEmpty)
-              _PlainInfoLine(
-                label: 'Beschrijving nabestelling',
-                value: ProjectStore.backorderNotes[widget.assignment.project]!
-                    .trim(),
-              ),
             if (details != null)
               _PlainInfoLine(
                 label: 'Geschatte dagen',
-                value: _formatDays(_isBackorder ? 1 : details.estimatedDays),
+                value: _formatDays(
+                  hasCurrentBackorder ? 1 : details.estimatedDays,
+                ),
               ),
           ],
         ),
-        if (!_isBackorder) ...[
+        if (!hasCurrentBackorder) ...[
           const SizedBox(height: 12),
           if (pendingDaysRequest != null)
             _InfoTextBlock(
@@ -5035,49 +6764,56 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
             onAdd: () {},
           ),
         ],
-        if (isWorker) ...[
-          const SizedBox(height: 12),
-          _InputCard(
-            title: 'Urenregistratie',
-            children: [
-              if (_workLogs.isEmpty)
-                Text(
-                  'Nog geen uren geregistreerd.',
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: const Color(0xFF6A7C78),
-                  ),
-                )
-              else
-                ..._workLogs.asMap().entries.map((entry) {
-                  final item = entry.value;
-                  final range =
-                      '${_formatDate(item.date)} · ${_formatMinutes(item.startMinutes)} - ${_formatMinutes(item.endMinutes)}';
-                  final breakText = item.breakMinutes > 0
-                      ? ' · pauze ${item.breakMinutes} min'
-                      : '';
-                  final workersText = item.workers.join(', ');
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                '$range$breakText',
-                                style: Theme.of(context).textTheme.bodyMedium
-                                    ?.copyWith(fontWeight: FontWeight.w600),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                workersText,
-                                style: Theme.of(context).textTheme.bodySmall
-                                    ?.copyWith(color: const Color(0xFF6A7C78)),
-                              ),
-                            ],
-                          ),
+        const SizedBox(height: 12),
+        _InputCard(
+          title: 'Urenregistratie',
+          children: [
+            if (_workLogs.isEmpty)
+              Text(
+                'Nog geen uren geregistreerd.',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFF6A7C78),
+                ),
+              )
+            else
+              ..._workLogs.asMap().entries.map((entry) {
+                final item = entry.value;
+                final range =
+                    '${_formatDate(item.date)} · ${_formatMinutes(item.startMinutes)} - ${_formatMinutes(item.endMinutes)}';
+                final breakText = item.breakMinutes > 0
+                    ? ' · pauze ${item.breakMinutes} min'
+                    : '';
+                final workersText = item.workers.join(', ');
+                final contextText = _workLogContextLabel(item);
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '$range$breakText',
+                              style: Theme.of(context).textTheme.bodyMedium
+                                  ?.copyWith(fontWeight: FontWeight.w600),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              workersText,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(color: const Color(0xFF6A7C78)),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              contextText,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(color: const Color(0xFF6A7C78)),
+                            ),
+                          ],
                         ),
+                      ),
+                      if (isWorker) ...[
                         IconButton(
                           icon: const Icon(Icons.edit_outlined),
                           onPressed: () => _editWorkLog(entry.key),
@@ -5087,176 +6823,21 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
                           onPressed: () => _deleteWorkLog(entry.key),
                         ),
                       ],
-                    ),
-                  );
-                }),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  _InlineButton(
-                    label: _formatDate(_workDate),
-                    icon: Icons.calendar_today,
-                    onTap: _pickWorkDate,
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  _InlineButton(
-                    label: _workStartMinutes == null || _workEndMinutes == null
-                        ? 'Uren instellen'
-                        : '${_formatMinutes(_workStartMinutes!)} - ${_formatMinutes(_workEndMinutes!)}',
-                    icon: Icons.schedule,
-                    onTap: () async {
-                      int? tempStart = _workStartMinutes;
-                      int? tempEnd = _workEndMinutes;
-                      final tempBreakController = TextEditingController(
-                        text: _workBreakController.text,
-                      );
-                      await showDialog<void>(
-                        context: context,
-                        builder: (dialogContext) {
-                          return StatefulBuilder(
-                            builder: (dialogContext, setDialogState) {
-                              return AlertDialog(
-                                title: const Text('Uren instellen'),
-                                content: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Row(
-                                      children: [
-                                        Expanded(
-                                          child: _InlineButton(
-                                            label: tempStart == null
-                                                ? 'Beginuur'
-                                                : _formatMinutes(tempStart!),
-                                            icon: Icons.schedule,
-                                            onTap: () async {
-                                              final picked =
-                                                  await showTimePicker(
-                                                    context: dialogContext,
-                                                    initialTime:
-                                                        TimeOfDay.now(),
-                                                  );
-                                              if (picked == null) return;
-                                              setDialogState(() {
-                                                tempStart =
-                                                    _minutesFromTimeOfDay(
-                                                      picked,
-                                                    );
-                                              });
-                                            },
-                                          ),
-                                        ),
-                                        const SizedBox(width: 8),
-                                        Expanded(
-                                          child: _InlineButton(
-                                            label: tempEnd == null
-                                                ? 'Einduur'
-                                                : _formatMinutes(tempEnd!),
-                                            icon: Icons.schedule,
-                                            onTap: () async {
-                                              final picked =
-                                                  await showTimePicker(
-                                                    context: dialogContext,
-                                                    initialTime:
-                                                        TimeOfDay.now(),
-                                                  );
-                                              if (picked == null) return;
-                                              setDialogState(() {
-                                                tempEnd = _minutesFromTimeOfDay(
-                                                  picked,
-                                                );
-                                              });
-                                            },
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                    const SizedBox(height: 12),
-                                    TextField(
-                                      controller: tempBreakController,
-                                      keyboardType: TextInputType.number,
-                                      decoration: InputDecoration(
-                                        labelText: 'Pauze (minuten)',
-                                        filled: true,
-                                        fillColor: const Color(0xFFF4F1EA),
-                                        enabledBorder: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            14,
-                                          ),
-                                          borderSide: const BorderSide(
-                                            color: Color(0xFFE1DAD0),
-                                          ),
-                                        ),
-                                        focusedBorder: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            14,
-                                          ),
-                                          borderSide: const BorderSide(
-                                            color: Color(0xFF0B2E2B),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                actions: [
-                                  TextButton(
-                                    onPressed: () =>
-                                        Navigator.of(dialogContext).pop(),
-                                    child: const Text('Annuleren'),
-                                  ),
-                                  TextButton(
-                                    onPressed: () {
-                                      setState(() {
-                                        _workStartMinutes = tempStart;
-                                        _workEndMinutes = tempEnd;
-                                        _workBreakController.text =
-                                            tempBreakController.text;
-                                      });
-                                      Navigator.of(dialogContext).pop();
-                                    },
-                                    child: const Text('Opslaan'),
-                                  ),
-                                ],
-                              );
-                            },
-                          );
-                        },
-                      );
-                    },
-                  ),
-                ],
+                );
+              }),
+            if (isWorker)
+              Align(
+                alignment: Alignment.centerRight,
+                child: IconButton(
+                  icon: const Icon(Icons.add_circle_outline),
+                  tooltip: 'Uren toevoegen',
+                  onPressed: () => _openWorkLogDialog(),
+                ),
               ),
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: _teamWorkers().map((name) {
-                  final selected = _selectedWorkers.contains(name);
-                  return FilterChip(
-                    label: Text(name),
-                    selected: selected,
-                    onSelected: (value) {
-                      setState(() {
-                        if (value) {
-                          _selectedWorkers.add(name);
-                        } else {
-                          _selectedWorkers.remove(name);
-                        }
-                      });
-                    },
-                  );
-                }).toList(),
-              ),
-              const SizedBox(height: 12),
-              _PrimaryButton(
-                label: _editingWorkLogIndex == null
-                    ? 'Uren toevoegen'
-                    : 'Uren opslaan',
-                onTap: _saveWorkLog,
-              ),
-            ],
-          ),
-        ],
+          ],
+        ),
         const SizedBox(height: 12),
         _ExtraWorkSection(
           canEdit: true,
@@ -5264,6 +6845,7 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
           extraWorks: _extraWorks,
           extraWorkController: _extraWorkController,
           extraHoursController: _extraHoursController,
+          extraMaterialController: _extraMaterialController,
           extraWorkChargeType: _extraWorkChargeType,
           onChargeTypeChanged: (value) => setState(() {
             _extraWorkChargeType = value ?? _extraWorkChargeTypes.first;
@@ -5279,6 +6861,8 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
           onAddExtraWork: _addExtraWork,
           showExtraWorkSection: true,
         ),
+        const SizedBox(height: 12),
+        _BackorderHistorySection(projectName: widget.assignment.project),
         const SizedBox(height: 12),
         _InputCard(
           title: 'Afronding',
@@ -5298,6 +6882,24 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
                 maxLines: 3,
                 decoration: InputDecoration(
                   hintText: 'Beschrijving nabestelling',
+                  filled: true,
+                  fillColor: const Color(0xFFF4F1EA),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _backorderEstimateController,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(
+                  hintText: 'Schatting totale uren',
                   filled: true,
                   fillColor: const Color(0xFFF4F1EA),
                   enabledBorder: OutlineInputBorder(
@@ -5334,6 +6936,26 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
                     ),
                   ),
                 ),
+              const SizedBox(height: 8),
+              _FileUploadRow(
+                label: 'Foto’s nabestelling',
+                buttonLabel: 'Kies foto’s',
+                files: _backorderFiles,
+                onAdd: _pickBackorderPhotos,
+                showFiles: false,
+              ),
+              if (_backorderFiles.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                _CollapsiblePhotoWrap(
+                  photos: _backorderFiles,
+                  onOpen: (index) =>
+                      _openPhotoViewer(context, _backorderFiles, index),
+                  onRemove: (index) => setState(() {
+                    if (index < 0 || index >= _backorderFiles.length) return;
+                    _backorderFiles.removeAt(index);
+                  }),
+                ),
+              ],
             ],
             const SizedBox(height: 12),
             _PrimaryButton(
@@ -5353,12 +6975,48 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
                   );
                   return;
                 }
+                if (_isBackorder &&
+                    _backorderNoteController.text.trim().isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Beschrijving nabestelling is verplicht.',
+                      ),
+                    ),
+                  );
+                  return;
+                }
+                final estimatedHours =
+                    double.tryParse(_backorderEstimateController.text.trim()) ??
+                    0;
+                if (_isBackorder && estimatedHours <= 0) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Vul een schatting van de uren in.'),
+                    ),
+                  );
+                  return;
+                }
+                if (_isBackorder && _backorderFiles.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Voeg minstens 1 foto toe bij nabestelling.',
+                      ),
+                    ),
+                  );
+                  return;
+                }
                 ProjectStore.setBackorder(
                   widget.assignment.project,
                   backorder: _isBackorder,
                   items: _isBackorder ? _backorderItems : const [],
                 );
                 if (_isBackorder) {
+                  ProjectStore.backorderHours[widget.assignment.project] =
+                      estimatedHours;
+                  ProjectStore.backorderPhotos[widget.assignment.project] =
+                      List<PlatformFile>.from(_backorderFiles);
                   final note = _backorderNoteController.text.trim();
                   final previousNote =
                       ProjectStore.backorderNotes[widget.assignment.project] ??
@@ -5380,16 +7038,25 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
                       );
                     }
                   }
+                  ProjectStore.logBackorderSubmission(
+                    widget.assignment.project,
+                    items: _backorderItems,
+                    note: note,
+                  );
                 } else {
                   ProjectStore.backorderNotes.remove(widget.assignment.project);
                 }
-                ProjectStore.completionTeams[widget.assignment.project] =
-                    widget.assignment.team;
-                ScheduleStore.scheduled.removeWhere(
-                  (assignment) =>
-                      assignment.project == widget.assignment.project,
-                );
                 if (_isBackorder) {
+                  ProjectStore.registerTeamCompletionSubmission(
+                    widget.assignment.project,
+                    widget.assignment.team,
+                    backorder: true,
+                  );
+                  ProjectStore.completionTeams[widget.assignment.project] =
+                      widget.assignment.team;
+                  ScheduleStore.archiveProjectAssignments(
+                    widget.assignment.project,
+                  );
                   ProjectStore.moveToGroupStatus(
                     name: widget.assignment.project,
                     group: 'Nabestellingen',
@@ -5397,31 +7064,88 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
                   );
                   ProjectLogStore.add(
                     widget.assignment.project,
-                    'Nabestelling verzonden',
+                    'Nabestelling verzonden (${widget.assignment.team})',
+                  );
+                  ProjectStore.clearTeamCompletionSubmissions(
+                    widget.assignment.project,
                   );
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(content: Text('Nabestelling verzonden')),
                   );
                 } else {
-                  final targetGroup =
-                      ProjectStore.findGroupForProject(
-                        widget.assignment.project,
-                      ) ??
-                      widget.assignment.group;
-                  ProjectStore.moveToGroupStatus(
-                    name: widget.assignment.project,
-                    group: targetGroup,
-                    status: 'Afgewerkt',
-                  );
-                  ProjectLogStore.add(
+                  ProjectStore.registerTeamCompletionSubmission(
                     widget.assignment.project,
-                    'Project afgerond',
+                    widget.assignment.team,
+                    backorder: false,
                   );
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Project afgerond')),
+                  ScheduleStore.archiveProjectAssignments(
+                    widget.assignment.project,
+                    team: widget.assignment.team,
                   );
+                  final remainingTeams = ScheduleStore.scheduled
+                      .where(
+                        (assignment) =>
+                            assignment.project == widget.assignment.project,
+                      )
+                      .map((assignment) => assignment.team)
+                      .toSet();
+                  if (remainingTeams.isNotEmpty) {
+                    final pending = remainingTeams.toList()..sort();
+                    ProjectLogStore.add(
+                      widget.assignment.project,
+                      'Team ${widget.assignment.team} heeft verzonden als klaar. Wacht op: ${pending.join(', ')}',
+                    );
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          'Klaar voor ${widget.assignment.team}. Wachten op: ${pending.join(', ')}',
+                        ),
+                      ),
+                    );
+                  } else if (ProjectStore.hasBackorderCompletionSubmission(
+                    widget.assignment.project,
+                  )) {
+                    ProjectStore.moveToGroupStatus(
+                      name: widget.assignment.project,
+                      group: 'Nabestellingen',
+                      status: 'In opmaak',
+                    );
+                    ProjectLogStore.add(
+                      widget.assignment.project,
+                      'Nabestelling verzonden',
+                    );
+                    ProjectStore.clearTeamCompletionSubmissions(
+                      widget.assignment.project,
+                    );
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Nabestelling verzonden')),
+                    );
+                  } else {
+                    final targetGroup =
+                        ProjectStore.findGroupForProject(
+                          widget.assignment.project,
+                        ) ??
+                        widget.assignment.group;
+                    ProjectStore.moveToGroupStatus(
+                      name: widget.assignment.project,
+                      group: targetGroup,
+                      status: 'Afgewerkt',
+                    );
+                    ProjectLogStore.add(
+                      widget.assignment.project,
+                      'Project afgerond',
+                    );
+                    ProjectStore.clearTeamCompletionSubmissions(
+                      widget.assignment.project,
+                    );
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Project afgerond')),
+                    );
+                  }
                 }
-                setState(() {});
+                setState(() {
+                  _resetToInfoTop();
+                });
                 widget.onUpdated?.call();
               },
             ),
@@ -5443,6 +7167,7 @@ class _TodayProjectFullCardState extends State<_TodayProjectFullCard> {
           const SizedBox(height: 12),
           Expanded(
             child: SingleChildScrollView(
+              controller: _workerTabScrollController,
               physics: const ClampingScrollPhysics(),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -5477,6 +7202,14 @@ class _PlanningTabState extends State<PlanningTab> {
     return teams.isEmpty ? ['Team 1'] : teams;
   }
 
+  List<String> get _planningTeams {
+    if (_isSubcontractorAdminRole(CurrentUserStore.role)) {
+      final ownTeams = _teamsForCurrentUser();
+      if (ownTeams.isNotEmpty) return ownTeams;
+    }
+    return _teams;
+  }
+
   String _selectedPlanningGroup = _projectGroups.first;
   final TextEditingController _planningSearchController =
       TextEditingController();
@@ -5494,10 +7227,12 @@ class _PlanningTabState extends State<PlanningTab> {
   }
 
   List<_PlanningItem> get _deliveredNew {
+    final ownerKey = _currentProjectOwnerKey();
     final items =
         ProjectStore.projectsByGroup['Klanten']?['Geleverd'] ??
         const <String>[];
     return items
+        .where((name) => ProjectStore.isOwnedBy(name, ownerKey))
         .map(
           (name) => _PlanningItem(
             name: name,
@@ -5511,10 +7246,12 @@ class _PlanningTabState extends State<PlanningTab> {
   }
 
   List<_PlanningItem> get _deliveredBackorder {
+    final ownerKey = _currentProjectOwnerKey();
     final items =
         ProjectStore.projectsByGroup['Nabestellingen']?['Geleverd'] ??
         const <String>[];
     return items
+        .where((name) => ProjectStore.isOwnedBy(name, ownerKey))
         .map(
           (name) => _PlanningItem(
             name: name,
@@ -5566,7 +7303,37 @@ class _PlanningTabState extends State<PlanningTab> {
     return count;
   }
 
-  bool _canScheduleOnDay(String team, DateTime day, bool isBackorder) {
+  bool _isBlockedByOtherOwner(
+    String team,
+    DateTime day, {
+    String? projectName,
+  }) {
+    final normalizedDay = _normalizeDate(day);
+    final myOwner = _currentProjectOwnerKey();
+    if (myOwner.isEmpty) return false;
+    for (final assignment in widget.scheduled) {
+      if (assignment.team != team) continue;
+      if (projectName != null && assignment.project == projectName) continue;
+      final start = _normalizeDate(assignment.startDate);
+      final end = _normalizeDate(assignment.endDate);
+      if (normalizedDay.isBefore(start) || normalizedDay.isAfter(end)) continue;
+      final assignmentOwner = ProjectStore.ownerKeyForProject(assignment.project);
+      if (assignmentOwner.isNotEmpty && assignmentOwner != myOwner) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _canScheduleOnDay(
+    String team,
+    DateTime day,
+    bool isBackorder, {
+    String? projectName,
+  }) {
+    if (_isBlockedByOtherOwner(team, day, projectName: projectName)) {
+      return false;
+    }
     final projects = _countProjectsOnDay(team, day);
     final backorders = _countBackordersOnDay(team, day);
     if (isBackorder) {
@@ -5615,13 +7382,20 @@ class _PlanningTabState extends State<PlanningTab> {
     String team,
     DateTime start,
     DateTime end,
-    bool isBackorder,
-  ) {
+    bool isBackorder, [
+    String? projectName,
+  ]) {
     var day = _normalizeDate(start);
     final last = _normalizeDate(end);
     while (!day.isAfter(last)) {
       if (_isWorkingDay(day, team)) {
-        if (!_canScheduleOnDay(team, day, isBackorder)) {
+        if (
+            !_canScheduleOnDay(
+              team,
+              day,
+              isBackorder,
+              projectName: projectName,
+            )) {
           return false;
         }
       }
@@ -5637,33 +7411,11 @@ class _PlanningTabState extends State<PlanningTab> {
       final candidate = today.add(Duration(days: i));
       if (!_isWorkingDay(candidate, team)) continue;
       final end = _calculateEndDate(team, candidate, days, isBackorder);
-      if (end != null) {
+      if (end != null && _canScheduleRange(team, candidate, end, isBackorder)) {
         starts.add(candidate);
       }
     }
     return starts;
-  }
-
-  List<_ExternalProjectItem> _externalProjectsForGroupName(
-    List<TeamAssignment> assignments,
-    String group,
-  ) {
-    final filtered = <_ExternalProjectItem>[];
-    for (final assignment in assignments) {
-      final assignmentGroup =
-          ProjectStore.findGroupForProject(assignment.project) ?? 'Klanten';
-      if (assignmentGroup != group) continue;
-      filtered.add(
-        _ExternalProjectItem(
-          assignment: assignment,
-          details: ProjectStore.details[assignment.project],
-        ),
-      );
-    }
-    filtered.sort(
-      (a, b) => a.assignment.startDate.compareTo(b.assignment.startDate),
-    );
-    return filtered;
   }
 
   void _assignItem(
@@ -5689,6 +7441,7 @@ class _PlanningTabState extends State<PlanningTab> {
       startDate,
       endDate,
       item.group == 'Nabestellingen',
+      item.name,
     )) {
       return;
     }
@@ -5745,71 +7498,189 @@ class _PlanningTabState extends State<PlanningTab> {
   }
 
   void _rescheduleAssignment(TeamAssignment assignment, DateTime newStart) {
-    final isBackorder = assignment.group == 'Nabestellingen';
-    final days = isBackorder ? 1 : assignment.estimatedDays;
-    final endDate = _calculateEndDate(
-      assignment.team,
-      newStart,
-      days,
-      isBackorder,
-    );
-    if (endDate == null) return;
-    if (!_canScheduleRange(assignment.team, newStart, endDate, isBackorder)) {
-      return;
+    final originalStart = _normalizeDate(assignment.startDate);
+    final originalEnd = _normalizeDate(assignment.endDate);
+    final linkedAssignments = widget.scheduled.where((item) {
+      final sameRange =
+          item.project == assignment.project &&
+          _normalizeDate(item.startDate) == originalStart &&
+          _normalizeDate(item.endDate) == originalEnd;
+      if (!sameRange) return false;
+      if (assignment.joinedSourceTeam != null) {
+        return item.team == assignment.team &&
+            item.joinedSourceTeam == assignment.joinedSourceTeam;
+      }
+      return item.joinedSourceTeam == null;
+    }).toList();
+    if (linkedAssignments.isEmpty) return;
+
+    final updates = <TeamAssignment>[];
+    for (final item in linkedAssignments) {
+      final isBackorder = item.group == 'Nabestellingen';
+      final days = isBackorder ? 1 : item.estimatedDays;
+      final endDate = _calculateEndDate(item.team, newStart, days, isBackorder);
+      if (endDate == null) return;
+      if (
+          !_canScheduleRange(
+            item.team,
+            newStart,
+            endDate,
+            isBackorder,
+            item.project,
+          )) {
+        return;
+      }
+      updates.add(
+        TeamAssignment(
+          project: item.project,
+          team: item.team,
+          startDate: _normalizeDate(newStart),
+          endDate: endDate,
+          estimatedDays: item.estimatedDays,
+          isBackorder: item.isBackorder,
+          group: item.group,
+          joinedSourceTeam: item.joinedSourceTeam,
+        ),
+      );
     }
-    final updated = TeamAssignment(
-      project: assignment.project,
-      team: assignment.team,
-      startDate: _normalizeDate(newStart),
-      endDate: endDate,
-      estimatedDays: assignment.estimatedDays,
-      isBackorder: assignment.isBackorder,
-      group: assignment.group,
-    );
+
     var didUpdate = false;
-    final index = widget.scheduled.indexWhere(
-      (item) =>
-          item.project == assignment.project &&
-          item.team == assignment.team &&
-          item.startDate == assignment.startDate &&
-          item.endDate == assignment.endDate,
-    );
-    if (index != -1) {
-      widget.scheduled[index] = updated;
-      didUpdate = true;
-    }
-    final storeIndex = ScheduleStore.scheduled.indexWhere(
-      (item) =>
-          item.project == assignment.project &&
-          item.team == assignment.team &&
-          item.startDate == assignment.startDate &&
-          item.endDate == assignment.endDate,
-    );
-    if (storeIndex != -1) {
-      ScheduleStore.scheduled[storeIndex] = updated;
-      didUpdate = true;
+    for (final updated in updates) {
+      final index = widget.scheduled.indexWhere(
+        (item) =>
+            item.project == updated.project &&
+            item.team == updated.team &&
+            _normalizeDate(item.startDate) == originalStart &&
+            _normalizeDate(item.endDate) == originalEnd,
+      );
+      if (index != -1) {
+        widget.scheduled[index] = updated;
+        didUpdate = true;
+      }
+      final storeIndex = ScheduleStore.scheduled.indexWhere(
+        (item) =>
+            item.project == updated.project &&
+            item.team == updated.team &&
+            _normalizeDate(item.startDate) == originalStart &&
+            _normalizeDate(item.endDate) == originalEnd,
+      );
+      if (storeIndex != -1) {
+        ScheduleStore.scheduled[storeIndex] = updated;
+        didUpdate = true;
+      }
     }
     if (!didUpdate) return;
+
+    if (assignment.joinedSourceTeam == null) {
+      bool overlaps(TeamAssignment source, TeamAssignment joined) {
+        final sourceStart = _normalizeDate(source.startDate);
+        final sourceEnd = _normalizeDate(source.endDate);
+        final joinedStart = _normalizeDate(joined.startDate);
+        final joinedEnd = _normalizeDate(joined.endDate);
+        return !joinedEnd.isBefore(sourceStart) && !joinedStart.isAfter(sourceEnd);
+      }
+
+      final sources = updates.where((item) => item.joinedSourceTeam == null);
+      final toRemove = <TeamAssignment>[];
+      for (final source in sources) {
+        for (final item in widget.scheduled) {
+          if (item.project != source.project) continue;
+          if (item.joinedSourceTeam != source.team) continue;
+          if (!overlaps(source, item)) {
+            final exists = toRemove.any(
+              (candidate) =>
+                  candidate.project == item.project &&
+                  candidate.team == item.team &&
+                  _normalizeDate(candidate.startDate) ==
+                      _normalizeDate(item.startDate) &&
+                  _normalizeDate(candidate.endDate) ==
+                      _normalizeDate(item.endDate) &&
+                  candidate.joinedSourceTeam == item.joinedSourceTeam,
+            );
+            if (!exists) {
+              toRemove.add(item);
+            }
+          }
+        }
+      }
+
+      if (toRemove.isNotEmpty) {
+        bool matchesRemoval(TeamAssignment item) {
+          return toRemove.any(
+            (candidate) =>
+                candidate.project == item.project &&
+                candidate.team == item.team &&
+                _normalizeDate(candidate.startDate) ==
+                    _normalizeDate(item.startDate) &&
+                _normalizeDate(candidate.endDate) ==
+                    _normalizeDate(item.endDate) &&
+                candidate.joinedSourceTeam == item.joinedSourceTeam,
+          );
+        }
+
+        widget.scheduled.removeWhere(matchesRemoval);
+        ScheduleStore.scheduled.removeWhere(matchesRemoval);
+      }
+    }
+
     setState(() {});
     ProjectLogStore.add(
       assignment.project,
-      'Planning aangepast: ${_formatDate(newStart)} - ${_formatDate(endDate)}',
+      'Planning aangepast: ${_formatDate(newStart)}',
     );
     AppDataStore.scheduleSave();
     widget.onScheduleChanged?.call();
   }
 
   void _cancelAssignment(TeamAssignment assignment) {
+    bool sameEntry(TeamAssignment item, TeamAssignment target) {
+      return item.project == target.project &&
+          item.team == target.team &&
+          item.startDate == target.startDate &&
+          item.endDate == target.endDate &&
+          item.group == target.group &&
+          item.joinedSourceTeam == target.joinedSourceTeam;
+    }
+
+    if (assignment.joinedSourceTeam != null) {
+      setState(() {
+        widget.scheduled.removeWhere((item) => sameEntry(item, assignment));
+      });
+      ProjectLogStore.add(
+        assignment.project,
+        'Aansluitend team ${assignment.team} verwijderd',
+      );
+      widget.onScheduleChanged?.call();
+      return;
+    }
+
+    final removed = <TeamAssignment>[];
     setState(() {
-      widget.scheduled.remove(assignment);
-      // Lists are derived from ProjectStore now.
+      widget.scheduled.removeWhere((item) {
+        final isMain = sameEntry(item, assignment);
+        final isLinked =
+            item.project == assignment.project &&
+            item.joinedSourceTeam == assignment.team;
+        if (isMain || isLinked) {
+          removed.add(item);
+          return true;
+        }
+        return false;
+      });
     });
+    if (removed.isEmpty) return;
+
     ProjectLogStore.add(assignment.project, 'Planning geannuleerd');
-    ProjectStore.updateStatus(
-      name: assignment.project,
-      group: assignment.group,
-      status: 'Geleverd',
+    final stillPlanned = widget.scheduled.any(
+      (item) => item.project == assignment.project,
     );
+    if (!stillPlanned) {
+      ProjectStore.updateStatus(
+        name: assignment.project,
+        group: assignment.group,
+        status: 'Geleverd',
+      );
+    }
     widget.onScheduleChanged?.call();
   }
 
@@ -5817,25 +7688,28 @@ class _PlanningTabState extends State<PlanningTab> {
   Widget build(BuildContext context) {
     final isExternal = _isExternalRole(CurrentUserStore.role);
     final isWorker = CurrentUserStore.role == 'Werknemer';
+    final isSubcontractorAdmin = _isSubcontractorAdminRole(CurrentUserStore.role);
     final isProjectLeader = CurrentUserStore.role == 'Projectleider';
-    final onlyScheduledView = isExternal || isProjectLeader;
+    final canPlanDelivered = !isProjectLeader && (!isExternal || isSubcontractorAdmin);
+    final onlyScheduledView = !canPlanDelivered;
     final visibleTeams = isProjectLeader ? _teams : _teamsForCurrentUser();
+    final combinedAssignments = <TeamAssignment>[
+      ...widget.scheduled,
+      ...ScheduleStore.completedHistory,
+    ];
     final visibleScheduled = (isExternal && !isProjectLeader)
-        ? widget.scheduled
+        ? combinedAssignments
               .where((assignment) => visibleTeams.contains(assignment.team))
               .toList()
-        : widget.scheduled;
+        : combinedAssignments;
     final overviewAssignments = isProjectLeader
-        ? widget.scheduled
-        : (isExternal ? visibleScheduled : widget.scheduled);
+        ? combinedAssignments
+        : (isExternal ? visibleScheduled : combinedAssignments);
     final filteredDeliveredNew = _deliveredNew
         .where((item) => _matchesPlanningSearch(item.name))
         .toList();
     final filteredDeliveredBackorder = _deliveredBackorder
         .where((item) => _matchesPlanningSearch(item.name))
-        .toList();
-    final filteredExternalScheduled = visibleScheduled
-        .where((assignment) => _matchesPlanningSearch(assignment.project))
         .toList();
     final overviewGrouped = <String, List<TeamAssignment>>{};
     for (final item in overviewAssignments) {
@@ -5877,7 +7751,7 @@ class _PlanningTabState extends State<PlanningTab> {
                           onTap: () => Navigator.of(context).push(
                             _appPageRoute(
                               builder: (_) => _PlanningOverviewScreen(
-                                assignments: widget.scheduled,
+                                assignments: overviewAssignments,
                                 onCancel: _cancelAssignment,
                                 canEditPlanning:
                                     CurrentUserStore.role == 'Planner' ||
@@ -5896,21 +7770,19 @@ class _PlanningTabState extends State<PlanningTab> {
               if (!isWorker) ...[
                 const SizedBox(height: 12),
                 if (!onlyScheduledView) ...[
-                  _GroupToggle(
-                    groups: _projectGroups,
-                    selected: _selectedPlanningGroup,
-                    onSelect: (group) => setState(() {
-                      _selectedPlanningGroup = group;
-                    }),
-                    labelBuilder: !isExternal
-                        ? (group) {
-                            final count = group == 'Klanten'
-                                ? _deliveredNew.length
-                                : _deliveredBackorder.length;
-                            return '$group ($count)';
-                          }
-                        : null,
-                  ),
+                    _GroupToggle(
+                      groups: _projectGroups,
+                      selected: _selectedPlanningGroup,
+                      onSelect: (group) => setState(() {
+                        _selectedPlanningGroup = group;
+                      }),
+                      labelBuilder: (group) {
+                        final count = group == 'Klanten'
+                            ? _deliveredNew.length
+                            : _deliveredBackorder.length;
+                        return '$group ($count)';
+                      },
+                    ),
                   const SizedBox(height: 12),
                   _SearchField(
                     controller: _planningSearchController,
@@ -5941,6 +7813,7 @@ class _PlanningTabState extends State<PlanningTab> {
                       child: _TeamMonthlyScheduleCard(
                         team: team,
                         assignments: overviewGrouped[team] ?? const [],
+                        allAssignments: overviewAssignments,
                         onOpen: (assignment) {
                           Navigator.of(context).push(
                             _appPageRoute(
@@ -5968,7 +7841,7 @@ class _PlanningTabState extends State<PlanningTab> {
                   ),
               ] else ...[
                 const SizedBox(height: 12),
-                if (!isExternal && !isProjectLeader) ...[
+                if (canPlanDelivered) ...[
                   if (_selectedPlanningGroup == 'Klanten') ...[
                     ...filteredDeliveredNew.map(
                       (item) => Padding(
@@ -5976,7 +7849,7 @@ class _PlanningTabState extends State<PlanningTab> {
                         child: _PlanningAssignCard(
                           key: ValueKey(item.name),
                           item: item,
-                          teams: _teams,
+                          teams: _planningTeams,
                           onAssign: _assignItem,
                           availableStarts: _availableStartDates,
                           calculateEndDate: _calculateEndDate,
@@ -5996,7 +7869,7 @@ class _PlanningTabState extends State<PlanningTab> {
                         child: _PlanningAssignCard(
                           key: ValueKey(item.name),
                           item: item,
-                          teams: _teams,
+                          teams: _planningTeams,
                           onAssign: _assignItem,
                           availableStarts: _availableStartDates,
                           calculateEndDate: _calculateEndDate,
@@ -6010,49 +7883,6 @@ class _PlanningTabState extends State<PlanningTab> {
                         subtitle: 'Geen geleverde nabestellingen.',
                       ),
                   ],
-                ],
-                if (onlyScheduledView) ...[
-                  ..._externalProjectsForGroupName(
-                    filteredExternalScheduled,
-                    _selectedPlanningGroup,
-                  ).map(
-                    (item) => Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: _ExternalPlanningProjectCard(
-                        assignment: item.assignment,
-                        details: item.details,
-                        onOpen: () async {
-                          final changed = await Navigator.of(context)
-                              .push<bool>(
-                                _appPageRoute(
-                                  builder: (_) => ProjectDetailScreen(
-                                    customerName: item.assignment.project,
-                                    group: item.assignment.group,
-                                    status:
-                                        ProjectStore.findStatusForProject(
-                                          item.assignment.project,
-                                        ) ??
-                                        'Ingepland',
-                                  ),
-                                ),
-                              );
-                          if (changed == true) {
-                            setState(() {});
-                          }
-                        },
-                      ),
-                    ),
-                  ),
-                  if (_externalProjectsForGroupName(
-                    visibleScheduled,
-                    _selectedPlanningGroup,
-                  ).isEmpty)
-                    _EmptyStateCard(
-                      title: 'Geen projecten ingepland',
-                      subtitle: _selectedPlanningGroup == 'Klanten'
-                          ? 'Nog geen ingeplande projecten voor klanten.'
-                          : 'Nog geen ingeplande projecten voor nabestellingen.',
-                    ),
                 ],
               ],
             ],
@@ -8736,48 +10566,113 @@ class _ProjectsTabState extends State<ProjectsTab> {
     super.dispose();
   }
 
+  bool get _isSubcontractorAdmin =>
+      _isSubcontractorAdminRole(CurrentUserStore.role);
+
+  bool get _usesCompanyProjectWorkspace {
+    final isExternal = _isExternalRole(CurrentUserStore.role);
+    return !isExternal || _isSubcontractorAdmin;
+  }
+
+  String get _ownerKey => _currentProjectOwnerKey();
+
+  bool _isOwnedProject(String projectName) {
+    return ProjectStore.isOwnedBy(projectName, _ownerKey);
+  }
+
+  bool _usesTeamVisibilityForStatus(String status) {
+    return _isSubcontractorAdmin &&
+        (status == 'Ingepland' || status == 'Afgewerkt');
+  }
+
+  bool _isProjectInMyTeams(String projectName) {
+    final teams = _teamsForCurrentUser().toSet();
+    if (teams.isEmpty) return false;
+    if (ScheduleStore.scheduled.any(
+      (assignment) =>
+          assignment.project == projectName && teams.contains(assignment.team),
+    )) {
+      return true;
+    }
+    if (ScheduleStore.completedHistory.any(
+      (assignment) =>
+          assignment.project == projectName && teams.contains(assignment.team),
+    )) {
+      return true;
+    }
+    final completionTeam = ProjectStore.completionTeams[projectName];
+    return completionTeam != null && teams.contains(completionTeam);
+  }
+
+  Iterable<String> _workspaceProjectsForStatus(String group, String status) {
+    final projects = ProjectStore.projectsByGroup[group]?[status] ?? const <String>[];
+    if (_usesTeamVisibilityForStatus(status)) {
+      return projects.where(_isProjectInMyTeams);
+    }
+    return projects.where(_isOwnedProject);
+  }
+
+  List<_ProjectResult> _ownedProjectsForSelection() {
+    return _workspaceProjectsForStatus(_selectedGroup, _selectedStatus)
+        .map(
+          (name) => _ProjectResult(
+            name: name,
+            group: _selectedGroup,
+            status: _selectedStatus,
+          ),
+        )
+        .toList()
+      ..sort((a, b) => a.name.compareTo(b.name));
+  }
+
+  List<_ProjectResult> _ownedProjectsAll() {
+    final results = <_ProjectResult>[];
+    for (final groupEntry in ProjectStore.projectsByGroup.entries) {
+      for (final statusEntry in groupEntry.value.entries) {
+        for (final name
+            in _workspaceProjectsForStatus(groupEntry.key, statusEntry.key)) {
+          results.add(
+            _ProjectResult(
+              name: name,
+              group: groupEntry.key,
+              status: statusEntry.key,
+            ),
+          );
+        }
+      }
+    }
+    return results;
+  }
+
+  int _ownedCountFor(String group, String status) {
+    return _workspaceProjectsForStatus(group, status).length;
+  }
+
   List<_ProjectResult> _filteredCustomers() {
     final isExternal = _isExternalRole(CurrentUserStore.role);
     final visibleProjects = isExternal ? _visibleProjects() : null;
     final query = _searchController.text.trim().toLowerCase();
     if (query.isEmpty) {
+      if (_usesCompanyProjectWorkspace) {
+        return _ownedProjectsForSelection();
+      }
       if (isExternal) {
         return visibleProjects ?? const <_ProjectResult>[];
       }
-      final customers =
-          ProjectStore.projectsByGroup[_selectedGroup]?[_selectedStatus] ?? [];
-      return customers
-          .map(
-            (name) => _ProjectResult(
-              name: name,
-              group: _selectedGroup,
-              status: _selectedStatus,
-            ),
-          )
-          .toList();
+      return const <_ProjectResult>[];
     }
 
     final results = <_ProjectResult>[];
-    if (isExternal) {
-      for (final item in visibleProjects ?? const <_ProjectResult>[]) {
+    if (_usesCompanyProjectWorkspace) {
+      for (final item in _ownedProjectsAll()) {
         if (item.name.toLowerCase().contains(query)) {
           results.add(item);
         }
       }
-    } else {
-      for (final groupEntry in ProjectStore.projectsByGroup.entries) {
-        for (final statusEntry in groupEntry.value.entries) {
-          for (final name in statusEntry.value) {
-            if (name.toLowerCase().contains(query)) {
-              results.add(
-                _ProjectResult(
-                  name: name,
-                  group: groupEntry.key,
-                  status: statusEntry.key,
-                ),
-              );
-            }
-          }
+    } else if (isExternal) {
+      for (final item in visibleProjects ?? const <_ProjectResult>[]) {
+        if (item.name.toLowerCase().contains(query)) {
+          results.add(item);
         }
       }
     }
@@ -8818,17 +10713,14 @@ class _ProjectsTabState extends State<ProjectsTab> {
     final isSearching = _searchController.text.trim().isNotEmpty;
     final isExternal = _isExternalRole(CurrentUserStore.role);
     final isWorker = CurrentUserStore.role == 'Werknemer';
-    final isSubcontractor =
-        CurrentUserStore.role == 'Onderaannemer' ||
-        CurrentUserStore.role == 'Onderaannemer beheerder';
-    final canInvoice =
-        CurrentUserStore.role == 'Onderaannemer' ||
-        CurrentUserStore.role == 'Onderaannemer beheerder';
-    final hasProjectAction = !isExternal || canInvoice;
+    final isSubcontractor = _isSubcontractorAdmin;
+    final usesCompanyWorkspace = _usesCompanyProjectWorkspace;
+    final canInvoice = isSubcontractor;
+    final hasProjectAction = usesCompanyWorkspace || canInvoice;
     final filteredResults = isSearching
         ? _filteredCustomers()
         : const <_ProjectResult>[];
-    final groupedResults = !isExternal
+    final groupedResults = usesCompanyWorkspace
         ? const <_ProjectResult>[]
         : _visibleByGroup(_selectedGroup);
     return Column(
@@ -8839,9 +10731,28 @@ class _ProjectsTabState extends State<ProjectsTab> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _SectionHeader(
-                title: isExternal ? 'Afgewerkte projecten' : 'Projecten',
-                subtitle: '',
+              Row(
+                children: [
+                  Expanded(
+                    child: _SectionHeader(
+                      title: usesCompanyWorkspace
+                          ? 'Projecten'
+                          : 'Afgewerkte projecten',
+                      subtitle: '',
+                    ),
+                  ),
+                  if (canInvoice)
+                    _SecondaryButton(
+                      label: 'Facturatie',
+                      onTap: () => Navigator.of(context).push(
+                        _appPageRoute(
+                          builder: (_) => _InvoiceScreen(
+                            teamNames: _teamsForCurrentUser(),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
               const SizedBox(height: 12),
               Row(
@@ -8855,7 +10766,7 @@ class _ProjectsTabState extends State<ProjectsTab> {
                   ),
                   if (hasProjectAction) ...[
                     const SizedBox(width: 12),
-                    if (!isExternal)
+                    if (usesCompanyWorkspace)
                       _PrimaryButton(
                         label: 'Project +',
                         height: 42,
@@ -8872,17 +10783,6 @@ class _ProjectsTabState extends State<ProjectsTab> {
                             setState(() {});
                           }
                         },
-                      ),
-                    if (isExternal && canInvoice)
-                      _SecondaryButton(
-                        label: 'Facturatie',
-                        onTap: () => Navigator.of(context).push(
-                          _appPageRoute(
-                            builder: (_) => _InvoiceScreen(
-                              teamNames: _teamsForCurrentUser(),
-                            ),
-                          ),
-                        ),
                       ),
                   ],
                 ],
@@ -8960,7 +10860,7 @@ class _ProjectsTabState extends State<ProjectsTab> {
                     );
                   },
                 )
-              else if (!isExternal)
+              else if (usesCompanyWorkspace)
                 ListView.builder(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
@@ -8971,17 +10871,21 @@ class _ProjectsTabState extends State<ProjectsTab> {
                       padding: const EdgeInsets.only(bottom: 10),
                       child: _StatusRow(
                         status: status,
-                        count:
-                            ProjectStore
-                                .projectsByGroup[_selectedGroup]?[status]
-                                ?.length ??
-                            0,
+                        count: _ownedCountFor(_selectedGroup, status),
                         onTap: () => Navigator.of(context)
                             .push(
                               _appPageRoute(
                                 builder: (_) => StatusDetailScreen(
                                   group: _selectedGroup,
                                   status: status,
+                                  ownerKey: _usesTeamVisibilityForStatus(status)
+                                      ? null
+                                      : _ownerKey,
+                                  visibleTeams: _usesTeamVisibilityForStatus(
+                                    status,
+                                  )
+                                      ? _teamsForCurrentUser()
+                                      : null,
                                 ),
                               ),
                             )
@@ -9078,6 +10982,30 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
     return total;
   }
 
+  double _workLogHoursForProject(String name) {
+    final logs = ProjectStore.workLogs[name] ?? const <WorkDayEntry>[];
+    double total = 0;
+    for (final log in logs) {
+      final minutes = log.endMinutes - log.startMinutes - log.breakMinutes;
+      if (minutes <= 0) continue;
+      final workerCount = log.workers.isEmpty ? 1 : log.workers.length;
+      total += (minutes / 60) * workerCount;
+    }
+    return total;
+  }
+
+  List<String> _materialNotesForProject(String name) {
+    final entries = ProjectStore.extraWorks[name] ?? const <ExtraWorkEntry>[];
+    final notes = <String>[];
+    for (final entry in entries) {
+      final note = entry.materialNote.trim();
+      if (note.isNotEmpty) {
+        notes.add(note);
+      }
+    }
+    return notes;
+  }
+
   double _offerHoursForProject(List<OfferLine> lines) {
     double total = 0;
     for (final line in lines) {
@@ -9100,6 +11028,17 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
     return total;
   }
 
+  DateTime _arrivalTimeForInvoice(String project) {
+    final logs = ProjectLogStore.forProject(project);
+    for (final entry in logs.reversed) {
+      if (entry.message == 'Project afgerond' ||
+          entry.message == 'Nabestelling verzonden') {
+        return entry.timestamp;
+      }
+    }
+    return DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
   List<_InvoiceItem> _buildItems() {
     OfferCatalogStore.seedIfEmpty();
     final projects = <String>{};
@@ -9118,13 +11057,16 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
       final record = InvoiceStore.recordFor(name);
       final offerLines = ProjectStore.offers[name] ?? const <OfferLine>[];
       final offerHours = _offerHoursForProject(offerLines);
-      final extraHoursTotal = _extraHoursForProject(name);
+      final extraHoursTotal = isBackorder
+          ? _workLogHoursForProject(name)
+          : _extraHoursForProject(name);
+      final materialNotes = _materialNotesForProject(name);
       final extraHoursDelta = (extraHoursTotal - record.extraHoursBilled)
           .clamp(0, double.infinity)
           .toDouble();
-      final includeOffer = !record.offerBilled;
+      final includeOffer = !isBackorder && !record.offerBilled;
       final invoiceHours = (includeOffer ? offerHours : 0) + extraHoursDelta;
-      if (invoiceHours <= 0) {
+      if (invoiceHours <= 0 && materialNotes.isEmpty) {
         continue;
       }
       items.add(
@@ -9137,11 +11079,17 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
           offerHours: offerHours,
           extraHoursTotal: extraHoursTotal,
           extraHoursDelta: extraHoursDelta,
+          materialNotes: materialNotes,
           includeOffer: includeOffer,
+          arrivedAt: _arrivalTimeForInvoice(name),
         ),
       );
     }
-    items.sort((a, b) => a.name.compareTo(b.name));
+    items.sort((a, b) {
+      final byTime = b.arrivedAt.compareTo(a.arrivedAt);
+      if (byTime != 0) return byTime;
+      return a.name.compareTo(b.name);
+    });
     return items;
   }
 
@@ -9151,11 +11099,54 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
       record.offerBilled = true;
     }
     record.extraHoursBilled = item.extraHoursTotal;
-    AppDataStore.scheduleSave();
+    final completedTeam =
+        ProjectStore.completionTeams[item.name] ?? CurrentUserStore.team;
+    InvoiceStore.addHistory(
+      InvoiceHistoryEntry(
+        project: item.name,
+        group: item.group,
+        status: item.status,
+        team: completedTeam,
+        isBackorder: item.isBackorder,
+        offerHoursBilled: item.includeOffer ? item.offerHours : 0,
+        extraHoursBilled: item.extraHoursDelta,
+        materialNotes: item.materialNotes,
+        approvedBy: CurrentUserStore.name,
+        approvedAt: DateTime.now(),
+      ),
+    );
     setState(() {});
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Facturatie goedgekeurd')));
+  }
+
+  Future<void> _openProject(String projectName) async {
+    final group = ProjectStore.findGroupForProject(projectName) ?? 'Klanten';
+    final status =
+        ProjectStore.findStatusForProject(projectName) ?? 'Afgewerkt';
+    await Navigator.of(context).push<bool>(
+      _appPageRoute(
+        builder: (_) => ProjectDetailScreen(
+          customerName: projectName,
+          group: group,
+          status: status,
+        ),
+      ),
+    );
+    setState(() {});
+  }
+
+  Future<void> _openHistory() async {
+    await Navigator.of(context).push<void>(
+      _appPageRoute(
+        builder: (_) => _InvoiceHistoryScreen(
+          teamNames: widget.teamNames,
+          onOpenProject: _openProject,
+        ),
+      ),
+    );
+    setState(() {});
   }
 
   @override
@@ -9181,6 +11172,12 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                     Text(
                       'Facturatie',
                       style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const Spacer(),
+                    _InlineButton(
+                      label: 'Historiek',
+                      icon: Icons.history,
+                      onTap: _openHistory,
                     ),
                   ],
                 ),
@@ -9426,6 +11423,222 @@ class _InvoiceScreenState extends State<_InvoiceScreen> {
                                   style: Theme.of(context).textTheme.bodyMedium
                                       ?.copyWith(fontWeight: FontWeight.w600),
                                 ),
+                              ),
+                              if (item.materialNotes.isNotEmpty) ...[
+                                const SizedBox(height: 4),
+                                Align(
+                                  alignment: Alignment.centerRight,
+                                  child: Text(
+                                    'Extra materiaal: ${item.materialNotes.join(', ')}',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                    textAlign: TextAlign.right,
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 10),
+                              _InlineButton(
+                                label: 'Project bekijken',
+                                icon: Icons.open_in_new,
+                                onTap: () => _openProject(item.name),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  }),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InvoiceHistoryScreen extends StatelessWidget {
+  const _InvoiceHistoryScreen({
+    required this.teamNames,
+    required this.onOpenProject,
+  });
+
+  final List<String> teamNames;
+  final Future<void> Function(String projectName) onOpenProject;
+
+  List<InvoiceHistoryEntry> _entries() {
+    final all = List<InvoiceHistoryEntry>.from(InvoiceStore.history);
+    if (teamNames.isEmpty) {
+      all.sort((a, b) => b.approvedAt.compareTo(a.approvedAt));
+      return all;
+    }
+    final filtered = all.where((entry) {
+      if (entry.team.isNotEmpty && teamNames.contains(entry.team)) {
+        return true;
+      }
+      final completionTeam = ProjectStore.completionTeams[entry.project];
+      return completionTeam != null && teamNames.contains(completionTeam);
+    }).toList();
+    filtered.sort((a, b) => b.approvedAt.compareTo(a.approvedAt));
+    return filtered;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final entries = _entries();
+    return Scaffold(
+      body: Stack(
+        children: [
+          const _SoftGradientBackground(),
+          SafeArea(
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 32),
+              children: [
+                Row(
+                  children: [
+                    IconButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      icon: const Icon(Icons.arrow_back),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Facturatie historiek',
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                if (entries.isEmpty)
+                  const _EmptyStateCard(
+                    title: 'Geen historiek',
+                    subtitle:
+                        'Hier verschijnen goedgekeurde facturaties.',
+                  )
+                else
+                  ...entries.map((entry) {
+                    final totalHours =
+                        entry.offerHoursBilled + entry.extraHoursBilled;
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: const Color(0xFFE1DAD0)),
+                        ),
+                        child: Theme(
+                          data: Theme.of(
+                            context,
+                          ).copyWith(dividerColor: Colors.transparent),
+                          child: ExpansionTile(
+                            tilePadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 8,
+                            ),
+                            childrenPadding: const EdgeInsets.fromLTRB(
+                              16,
+                              0,
+                              16,
+                              16,
+                            ),
+                            title: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  entry.project,
+                                  style: Theme.of(context).textTheme.bodyMedium
+                                      ?.copyWith(fontWeight: FontWeight.w600),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '${entry.group} · ${entry.isBackorder ? 'Nabestelling' : entry.status}',
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: const Color(0xFF6A7C78),
+                                      ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Goedgekeurd op ${_formatDateTime(entry.approvedAt)}',
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: const Color(0xFF6A7C78),
+                                      ),
+                                ),
+                              ],
+                            ),
+                            children: [
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Text(
+                                  'Aanbestedingsuren: ${_formatPrice(entry.offerHoursBilled)}',
+                                  style: Theme.of(context).textTheme.bodyMedium,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Text(
+                                  'Extra uren: ${_formatPrice(entry.extraHoursBilled)}',
+                                  style: Theme.of(context).textTheme.bodyMedium,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              if (entry.materialNotes.isNotEmpty) ...[
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    'Extra materiaal: ${entry.materialNotes.join(', ')}',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                              ],
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Text(
+                                  'Totaal uren: ${_formatPrice(totalHours)}',
+                                  style: Theme.of(context).textTheme.bodyMedium
+                                      ?.copyWith(fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              if (entry.team.isNotEmpty) ...[
+                                const SizedBox(height: 4),
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    'Team: ${entry.team}',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodySmall
+                                        ?.copyWith(
+                                          color: const Color(0xFF6A7C78),
+                                        ),
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 4),
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Text(
+                                  'Goedgekeurd door: ${entry.approvedBy}',
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: const Color(0xFF6A7C78),
+                                      ),
+                                ),
+                              ),
+                              const SizedBox(height: 10),
+                              _InlineButton(
+                                label: 'Project bekijken',
+                                icon: Icons.open_in_new,
+                                onTap: () => onOpenProject(entry.project),
                               ),
                             ],
                           ),
@@ -10991,6 +13204,7 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
             estimatedDays: assignment.estimatedDays,
             isBackorder: assignment.isBackorder,
             group: assignment.group,
+            joinedSourceTeam: assignment.joinedSourceTeam,
           );
         }
       }
@@ -11015,6 +13229,7 @@ class _RolesManagementScreenState extends State<_RolesManagementScreen> {
               estimatedDays: item.estimatedDays,
               isBackorder: item.isBackorder,
               group: item.group,
+              joinedSourceTeam: item.joinedSourceTeam,
             ),
           );
           cursor = end.add(const Duration(days: 1));
@@ -14042,6 +16257,12 @@ class _DropdownField extends StatelessWidget {
   final List<String> items;
   final ValueChanged<String?> onChanged;
 
+  String _shortLabel(String value, {int maxChars = 44}) {
+    final text = value.trim();
+    if (text.length <= maxChars) return text;
+    return '${text.substring(0, maxChars - 3)}...';
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -14056,13 +16277,36 @@ class _DropdownField extends StatelessWidget {
         ),
         const SizedBox(height: 6),
         DropdownButtonFormField<String>(
+          isExpanded: true,
           initialValue: value,
           items: items
               .map(
-                (item) =>
-                    DropdownMenuItem<String>(value: item, child: Text(item)),
+                (item) => DropdownMenuItem<String>(
+                  value: item,
+                  child: Text(
+                    _shortLabel(item),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    softWrap: false,
+                  ),
+                ),
               )
               .toList(),
+          selectedItemBuilder: (context) {
+            return items
+                .map(
+                  (item) => Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      _shortLabel(item),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      softWrap: false,
+                    ),
+                  ),
+                )
+                .toList();
+          },
           onChanged: onChanged,
           decoration: InputDecoration(
             filled: true,
@@ -14143,10 +16387,14 @@ class StatusDetailScreen extends StatefulWidget {
     super.key,
     required this.group,
     required this.status,
+    this.ownerKey,
+    this.visibleTeams,
   });
 
   final String group;
   final String status;
+  final String? ownerKey;
+  final List<String>? visibleTeams;
 
   @override
   State<StatusDetailScreen> createState() => _StatusDetailScreenState();
@@ -14164,17 +16412,57 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
     super.dispose();
   }
 
+  bool _isInVisibleTeams(String projectName) {
+    final visibleTeams = widget.visibleTeams;
+    if (visibleTeams == null || visibleTeams.isEmpty) return true;
+    final teamSet = visibleTeams.toSet();
+    if (ScheduleStore.scheduled.any(
+      (assignment) =>
+          assignment.project == projectName && teamSet.contains(assignment.team),
+    )) {
+      return true;
+    }
+    if (ScheduleStore.completedHistory.any(
+      (assignment) =>
+          assignment.project == projectName && teamSet.contains(assignment.team),
+    )) {
+      return true;
+    }
+    final completionTeam = ProjectStore.completionTeams[projectName];
+    return completionTeam != null && teamSet.contains(completionTeam);
+  }
+
   List<String> _filteredCustomers() {
     final query = _searchController.text.trim().toLowerCase();
-    final customers =
-        ProjectStore.projectsByGroup[widget.group]?[widget.status] ??
-        const <String>[];
+    final ownerKey = _normalizeOwnerKey(widget.ownerKey ?? '');
+    final customers = (ProjectStore.projectsByGroup[widget.group]?[widget.status] ??
+            const <String>[])
+        .where((name) {
+          if (!_isInVisibleTeams(name)) return false;
+          if (ownerKey.isEmpty) return true;
+          return ProjectStore.isOwnedBy(name, ownerKey);
+        })
+        .toList();
     if (query.isEmpty) {
       return customers;
     }
     return customers
         .where((name) => name.toLowerCase().contains(query))
         .toList();
+  }
+
+  int _statusCount() {
+    final ownerKey = _normalizeOwnerKey(widget.ownerKey ?? '');
+    final customers =
+        ProjectStore.projectsByGroup[widget.group]?[widget.status] ??
+        const <String>[];
+    return customers
+        .where((name) {
+          if (!_isInVisibleTeams(name)) return false;
+          if (ownerKey.isEmpty) return true;
+          return ProjectStore.isOwnedBy(name, ownerKey);
+        })
+        .length;
   }
 
   void _toggleSelection(String name) {
@@ -14277,7 +16565,9 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
   @override
   Widget build(BuildContext context) {
     final customers = _filteredCustomers();
-    final isExternal = _isExternalRole(CurrentUserStore.role);
+    final usesCompanyWorkspace =
+        !_isExternalRole(CurrentUserStore.role) ||
+        _isSubcontractorAdminRole(CurrentUserStore.role);
     return Scaffold(
       body: Stack(
         children: [
@@ -14317,7 +16607,7 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                                   style: Theme.of(context).textTheme.titleLarge,
                                 ),
                               ),
-                              if (!isExternal)
+                              if (usesCompanyWorkspace)
                                 _PrimaryButton(
                                   label: 'Project +',
                                   height: 42,
@@ -14342,7 +16632,7 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                           Align(
                             alignment: Alignment.centerLeft,
                             child: Text(
-                              '${widget.group} · ${ProjectStore.projectsByGroup[widget.group]?[widget.status]?.length ?? 0} projecten',
+                              '${widget.group} · ${_statusCount()} projecten',
                               style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(color: const Color(0xFF6A7C78)),
                             ),
@@ -14457,7 +16747,7 @@ class _StatusDetailScreenState extends State<StatusDetailScreen> {
                               : _showBulkStatusPicker,
                           fullWidth: true,
                         ),
-                        if (!isExternal) ...[
+                        if (usesCompanyWorkspace) ...[
                           const SizedBox(height: 10),
                           _DangerButton(
                             label: 'Verwijderen (${_selectedCustomers.length})',
@@ -14886,7 +17176,7 @@ class _AddProjectScreenState extends State<AddProjectScreen> {
                                           ),
                                           const SizedBox(width: 6),
                                           SizedBox(
-                                            width: 44,
+                                            width: 56,
                                             child: TextField(
                                               controller: _controllerForOffer(
                                                 key,
@@ -15021,7 +17311,8 @@ class _AddProjectScreenState extends State<AddProjectScreen> {
                           name: name,
                           group: _selectedGroup,
                           status: _selectedStatus,
-                          creator: 'Julie',
+                          creator: CurrentUserStore.name,
+                          ownerKey: _currentProjectOwnerKey(),
                           offerLines: _buildOfferLines(),
                           documents: _documents,
                           details: ProjectDetails(
@@ -15401,6 +17692,7 @@ class EstimatedDaysChangeDetailScreen extends StatelessWidget {
                       _TeamMonthlyScheduleCard(
                         team: request.team,
                         assignments: teamAssignments,
+                        allAssignments: teamAssignments,
                         onOpen: (assignment) {},
                         onCancel: (assignment) async {},
                         canEditPlanning: false,
@@ -15456,6 +17748,8 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
   late List<ExtraWorkEntry> _extraWorks;
   final TextEditingController _extraWorkController = TextEditingController();
   final TextEditingController _extraHoursController = TextEditingController();
+  final TextEditingController _extraMaterialController =
+      TextEditingController();
   String _extraWorkChargeType = _extraWorkChargeTypes.first;
   List<PlatformFile> _extraWorkFiles = [];
   int? _editingExtraWorkIndex;
@@ -15466,7 +17760,10 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
   final TextEditingController _backorderController = TextEditingController();
   final TextEditingController _backorderNoteController =
       TextEditingController();
+  final TextEditingController _backorderEstimateController =
+      TextEditingController();
   final List<String> _backorderItems = [];
+  List<PlatformFile> _backorderFiles = [];
   late String _currentStatus;
   bool _isEditingInfo = false;
   late String _pendingStatus;
@@ -15483,6 +17780,13 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       TextEditingController();
   PlatformFile? _docFile;
   final TextEditingController _daysChangeController = TextEditingController();
+  DateTime _workDate = DateTime.now();
+  int? _workStartMinutes;
+  int? _workEndMinutes;
+  final TextEditingController _workBreakController = TextEditingController(
+    text: '30',
+  );
+  List<String> _selectedWorkers = [];
 
   String _documentKey(ProjectDocument doc) =>
       '${doc.description}::${doc.file.name}';
@@ -15643,6 +17947,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
             estimatedDays: _clampScheduledDays(normalizedDays),
             isBackorder: assignment.isBackorder,
             group: assignment.group,
+            joinedSourceTeam: assignment.joinedSourceTeam,
           );
         }
       }
@@ -15661,9 +17966,12 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
   void dispose() {
     _backorderController.dispose();
     _backorderNoteController.dispose();
+    _backorderEstimateController.dispose();
+    _workBreakController.dispose();
     _commentController.dispose();
     _extraWorkController.dispose();
     _extraHoursController.dispose();
+    _extraMaterialController.dispose();
     _addressController.dispose();
     _phoneController.dispose();
     _deliveryController.dispose();
@@ -15696,12 +18004,11 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     _extraWorks = List<ExtraWorkEntry>.from(
       ProjectStore.extraWorks[widget.customerName] ?? const [],
     );
-    _isBackorder = ProjectStore.isBackorder[widget.customerName] ?? false;
-    _backorderItems
-      ..clear()
-      ..addAll(ProjectStore.backorderItems[widget.customerName] ?? const []);
-    _backorderNoteController.text =
-        ProjectStore.backorderNotes[widget.customerName] ?? '';
+    _isBackorder = false;
+    _backorderItems.clear();
+    _backorderNoteController.clear();
+    _backorderEstimateController.clear();
+    _backorderFiles = [];
     _addressController = TextEditingController(text: details?.address ?? '');
     _phoneController = TextEditingController(text: details?.phone ?? '');
     _deliveryController = TextEditingController(text: details?.delivery ?? '');
@@ -15888,6 +18195,18 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
     });
   }
 
+  Future<void> _pickBackorderPhotos() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      type: FileType.image,
+      withData: true,
+    );
+    if (result == null) return;
+    setState(() {
+      _backorderFiles.addAll(result.files);
+    });
+  }
+
   void _addExtraWork() {
     final description = _extraWorkController.text.trim();
     if (description.isEmpty || _extraWorkFiles.isEmpty) {
@@ -15897,10 +18216,12 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       return;
     }
     final hours = double.tryParse(_extraHoursController.text.trim()) ?? 0;
+    final material = _extraMaterialController.text.trim();
     final entry = ExtraWorkEntry(
       description: description,
       photos: List<PlatformFile>.from(_extraWorkFiles),
       hours: hours,
+      materialNote: material,
       chargeType: _extraWorkChargeType,
     );
     setState(() {
@@ -15923,6 +18244,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       }
       _extraWorkController.clear();
       _extraHoursController.clear();
+      _extraMaterialController.clear();
       _extraWorkChargeType = _extraWorkChargeTypes.first;
       _extraWorkFiles = [];
       _editingExtraWorkIndex = null;
@@ -15936,6 +18258,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       _editingExtraWorkIndex = index;
       _extraWorkController.text = entry.description;
       _extraHoursController.text = _formatPrice(entry.hours);
+      _extraMaterialController.text = entry.materialNote;
       _extraWorkFiles = List<PlatformFile>.from(entry.photos);
       _extraWorkChargeType = entry.chargeType;
     });
@@ -15953,6 +18276,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
         _editingExtraWorkIndex = null;
         _extraWorkController.clear();
         _extraHoursController.clear();
+        _extraMaterialController.clear();
         _extraWorkChargeType = _extraWorkChargeTypes.first;
         _extraWorkFiles = [];
       }
@@ -16042,15 +18366,6 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       _backorderItems.add(text);
       _backorderController.clear();
     });
-    ProjectStore.setBackorder(
-      widget.customerName,
-      backorder: true,
-      items: _backorderItems,
-    );
-    ProjectLogStore.add(
-      widget.customerName,
-      'Nabestelling item toegevoegd: ${_truncateText(text, 60)}',
-    );
   }
 
   bool _hasBeforeAfterPhotos() {
@@ -16061,45 +18376,17 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
 
   void _editBackorderItem(int index) {
     if (index < 0 || index >= _backorderItems.length) return;
-    final removed = _backorderItems[index];
-    _backorderController.text = removed;
+    _backorderController.text = _backorderItems[index];
     setState(() {
       _backorderItems.removeAt(index);
     });
-    ProjectStore.setBackorder(
-      widget.customerName,
-      backorder: true,
-      items: _backorderItems,
-    );
-    ProjectLogStore.add(
-      widget.customerName,
-      'Nabestelling item verwijderd: ${_truncateText(removed, 60)}',
-    );
   }
 
   void _deleteBackorderItem(int index) {
     if (index < 0 || index >= _backorderItems.length) return;
     setState(() {
-      final removed = _backorderItems.removeAt(index);
-      ProjectLogStore.add(
-        widget.customerName,
-        'Nabestelling item verwijderd: ${_truncateText(removed, 60)}',
-      );
+      _backorderItems.removeAt(index);
     });
-    ProjectStore.setBackorder(
-      widget.customerName,
-      backorder: true,
-      items: _backorderItems,
-    );
-  }
-
-  String _completionTeamForProject() {
-    final matches = ScheduleStore.scheduled
-        .where((assignment) => assignment.project == widget.customerName)
-        .toList();
-    if (matches.isEmpty) return '';
-    matches.sort((a, b) => b.endDate.compareTo(a.endDate));
-    return matches.first.team;
   }
 
   String _teamForProject() {
@@ -16109,6 +18396,264 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
       }
     }
     return CurrentUserStore.team;
+  }
+
+  int? _minutesFromTimeOfDay(TimeOfDay? time) {
+    if (time == null) return null;
+    return time.hour * 60 + time.minute;
+  }
+
+  bool _canRegisterHoursInProjectDetail() {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final myTeam = CurrentUserStore.team.trim();
+    return ScheduleStore.scheduled.any((assignment) {
+      if (assignment.project != widget.customerName) return false;
+      if (myTeam.isNotEmpty && assignment.team != myTeam) return false;
+      final start = DateTime(
+        assignment.startDate.year,
+        assignment.startDate.month,
+        assignment.startDate.day,
+      );
+      final end = DateTime(
+        assignment.endDate.year,
+        assignment.endDate.month,
+        assignment.endDate.day,
+      );
+      return !today.isBefore(start) && !today.isAfter(end);
+    });
+  }
+
+  List<String> _teamWorkersForCurrentProject() {
+    _RoleManagementStore.seedIfEmpty();
+    final normalizedDay = DateTime(_workDate.year, _workDate.month, _workDate.day);
+    final activeTeamsForProject = ScheduleStore.scheduled
+        .where((item) {
+          if (item.project != widget.customerName) return false;
+          final start = DateTime(
+            item.startDate.year,
+            item.startDate.month,
+            item.startDate.day,
+          );
+          final end = DateTime(item.endDate.year, item.endDate.month, item.endDate.day);
+          return !normalizedDay.isBefore(start) && !normalizedDay.isAfter(end);
+        })
+        .map((item) => item.team)
+        .toSet();
+
+    final fallbackTeam = _teamForProject();
+    if (activeTeamsForProject.isEmpty && fallbackTeam.isNotEmpty) {
+      activeTeamsForProject.add(fallbackTeam);
+    }
+
+    final workers = _RoleManagementStore.assignments
+        .where(
+          (assignment) =>
+              assignment.role == 'Werknemer' &&
+              activeTeamsForProject.contains(assignment.team),
+        )
+        .map((assignment) => assignment.name.trim())
+        .where((name) => name.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort();
+
+    if (CurrentUserStore.role == 'Onderaannemer beheerder') {
+      final managerName = CurrentUserStore.name.trim();
+      if (managerName.isNotEmpty && !workers.contains(managerName)) {
+        workers.insert(0, managerName);
+      }
+    }
+
+    if (workers.isNotEmpty) return workers;
+    final currentName = CurrentUserStore.name.trim();
+    return currentName.isEmpty ? const [] : [currentName];
+  }
+
+  bool _saveWorkLogFromDialog() {
+    if (!_canRegisterHoursInProjectDetail()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Urenregistratie kan enkel voor de planning van vandaag.'),
+        ),
+      );
+      return false;
+    }
+    final start = _workStartMinutes;
+    final end = _workEndMinutes;
+    if (start == null || end == null || end <= start) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Vul een geldig begin- en einduur in.')),
+      );
+      return false;
+    }
+    if (_selectedWorkers.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Selecteer wie er gewerkt heeft.')),
+      );
+      return false;
+    }
+    final breakMinutes = int.tryParse(_workBreakController.text.trim()) ?? 0;
+    final isBackorder =
+        ProjectStore.isBackorder[widget.customerName] == true ||
+        (ProjectStore.findGroupForProject(widget.customerName) == 'Nabestellingen');
+    final backorderNumber = isBackorder
+        ? _currentBackorderIndexForProject(widget.customerName)
+        : null;
+    final entry = WorkDayEntry(
+      date: DateTime(_workDate.year, _workDate.month, _workDate.day),
+      startMinutes: start,
+      endMinutes: end,
+      breakMinutes: breakMinutes,
+      workers: List<String>.from(_selectedWorkers),
+      phase: isBackorder ? 'backorder' : 'project',
+      backorderNumber: backorderNumber,
+    );
+    final currentLogs = List<WorkDayEntry>.from(
+      ProjectStore.workLogs[widget.customerName] ?? const <WorkDayEntry>[],
+    )..add(entry);
+    ProjectStore.setWorkLog(widget.customerName, currentLogs);
+    setState(() {});
+    return true;
+  }
+
+  Future<void> _openProjectWorkLogDialog() async {
+    _workDate = DateTime.now();
+    _workStartMinutes = null;
+    _workEndMinutes = null;
+    _workBreakController.text = '30';
+    _selectedWorkers = [];
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            final workers = _teamWorkersForCurrentProject();
+            return AlertDialog(
+              title: const Text('Uren toevoegen'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _InlineButton(
+                      label: _formatDate(_workDate),
+                      icon: Icons.calendar_today,
+                      onTap: () async {
+                        final picked = await showDatePicker(
+                          context: dialogContext,
+                          initialDate: _workDate,
+                          firstDate: DateTime(_workDate.year - 1),
+                          lastDate: DateTime(_workDate.year + 1),
+                        );
+                        if (picked == null) return;
+                        setDialogState(() => _workDate = picked);
+                      },
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _InlineButton(
+                            label: _workStartMinutes == null
+                                ? 'Beginuur'
+                                : _formatClockMinutes(_workStartMinutes!),
+                            icon: Icons.schedule,
+                            onTap: () async {
+                              final picked = await showTimePicker(
+                                context: dialogContext,
+                                initialTime: TimeOfDay.now(),
+                              );
+                              if (picked == null) return;
+                              setDialogState(
+                                () => _workStartMinutes = _minutesFromTimeOfDay(picked),
+                              );
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _InlineButton(
+                            label: _workEndMinutes == null
+                                ? 'Einduur'
+                                : _formatClockMinutes(_workEndMinutes!),
+                            icon: Icons.schedule,
+                            onTap: () async {
+                              final picked = await showTimePicker(
+                                context: dialogContext,
+                                initialTime: TimeOfDay.now(),
+                              );
+                              if (picked == null) return;
+                              setDialogState(
+                                () => _workEndMinutes = _minutesFromTimeOfDay(picked),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: _workBreakController,
+                      keyboardType: TextInputType.number,
+                      decoration: InputDecoration(
+                        labelText: 'Pauze (minuten)',
+                        filled: true,
+                        fillColor: const Color(0xFFF4F1EA),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: workers.map((name) {
+                        final selected = _selectedWorkers.contains(name);
+                        return FilterChip(
+                          label: Text(name),
+                          selected: selected,
+                          onSelected: (value) {
+                            setDialogState(() {
+                              if (value) {
+                                _selectedWorkers.add(name);
+                              } else {
+                                _selectedWorkers.remove(name);
+                              }
+                            });
+                          },
+                        );
+                      }).toList(),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Annuleren'),
+                ),
+                TextButton(
+                  onPressed: () {
+                    final saved = _saveWorkLogFromDialog();
+                    if (saved && mounted) {
+                      Navigator.of(dialogContext).pop();
+                    }
+                  },
+                  child: const Text('Opslaan'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
   void _submitEstimatedDaysChange() {
@@ -16152,6 +18697,8 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
   @override
   Widget build(BuildContext context) {
     final isExternal = _isExternalRole(CurrentUserStore.role);
+    final hasCurrentBackorder =
+        ProjectStore.isBackorder[widget.customerName] == true;
     final canEditStatus =
         !isExternal && _editableStatusStages.contains(_currentStatus);
     final canEditInfo = !isExternal;
@@ -16280,6 +18827,13 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                 ],
                               ),
                             const SizedBox(height: 16),
+                            if (hasCurrentBackorder) ...[
+                              _BackorderDetailsSection(
+                                projectName: widget.customerName,
+                                title: 'Nabestelling (uitvoering)',
+                              ),
+                              const SizedBox(height: 16),
+                            ],
                             _ProjectInfoCard(
                               customerName: widget.customerName,
                               creator:
@@ -16325,7 +18879,8 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                 );
                               },
                             ),
-                            if (canRequestDaysChange && !_isBackorder) ...[
+                            if (canRequestDaysChange &&
+                                !hasCurrentBackorder) ...[
                               const SizedBox(height: 16),
                               if (pendingDaysRequest != null)
                                 _InfoTextBlock(
@@ -16499,7 +19054,7 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                                     ),
                                                     const SizedBox(width: 6),
                                                     SizedBox(
-                                                      width: 44,
+                                                      width: 56,
                                                       child: TextField(
                                                         controller:
                                                             _controllerForOffer(
@@ -16777,6 +19332,96 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                               ),
                             ],
                             const SizedBox(height: 16),
+                            _InputCard(
+                              title: 'Urenregistratie',
+                              children: [
+                                if (canEditSite && _canRegisterHoursInProjectDetail())
+                                  Align(
+                                    alignment: Alignment.centerRight,
+                                    child: IconButton(
+                                      icon: const Icon(Icons.add_circle_outline),
+                                      tooltip: 'Uren toevoegen',
+                                      onPressed: _openProjectWorkLogDialog,
+                                    ),
+                                  ),
+                                if ((ProjectStore
+                                            .workLogs[widget.customerName] ??
+                                        const <WorkDayEntry>[])
+                                    .isEmpty)
+                                  Text(
+                                    'Nog geen uren geregistreerd.',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(
+                                          color: const Color(0xFF6A7C78),
+                                        ),
+                                  )
+                                else
+                                  ...((ProjectStore
+                                              .workLogs[widget.customerName] ??
+                                          const <WorkDayEntry>[])
+                                      .map((item) {
+                                        final range =
+                                            '${_formatDate(item.date)} · ${_formatClockMinutes(item.startMinutes)} - ${_formatClockMinutes(item.endMinutes)}';
+                                        final breakText = item.breakMinutes > 0
+                                            ? ' · pauze ${item.breakMinutes} min'
+                                            : '';
+                                        final workersText = item.workers.join(
+                                          ', ',
+                                        );
+                                        final contextText =
+                                            _workLogContextLabel(item);
+                                        return Padding(
+                                          padding: const EdgeInsets.only(
+                                            bottom: 8,
+                                          ),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                '$range$breakText',
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .bodyMedium
+                                                    ?.copyWith(
+                                                      fontWeight:
+                                                          FontWeight.w600,
+                                                    ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                workersText,
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .bodySmall
+                                                    ?.copyWith(
+                                                      color: const Color(
+                                                        0xFF6A7C78,
+                                                      ),
+                                                    ),
+                                              ),
+                                              const SizedBox(height: 2),
+                                              Text(
+                                                contextText,
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .bodySmall
+                                                    ?.copyWith(
+                                                      color: const Color(
+                                                        0xFF6A7C78,
+                                                      ),
+                                                    ),
+                                              ),
+                                            ],
+                                          ),
+                                        );
+                                      })
+                                      .toList()),
+                              ],
+                            ),
+                            const SizedBox(height: 16),
                             _ExtraWorkSection(
                               canEdit: canEditSite,
                               isEditingExtraWork:
@@ -16784,6 +19429,8 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                               extraWorks: _extraWorks,
                               extraWorkController: _extraWorkController,
                               extraHoursController: _extraHoursController,
+                              extraMaterialController:
+                                  _extraMaterialController,
                               extraWorkChargeType: _extraWorkChargeType,
                               onChargeTypeChanged: (value) => setState(() {
                                 _extraWorkChargeType =
@@ -16804,12 +19451,11 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                               showExtraWorkSection:
                                   _extraWorks.isNotEmpty || canEditSite,
                             ),
-                            if (_isBackorder ||
-                                ProjectStore
-                                        .backorderItems[widget.customerName]
-                                        ?.isNotEmpty ==
-                                    true ||
-                                canEditCompletion) ...[
+                            const SizedBox(height: 16),
+                            _BackorderHistorySection(
+                              projectName: widget.customerName,
+                            ),
+                            if (canEditCompletion) ...[
                               const SizedBox(height: 16),
                               _InputCard(
                                 title: 'Afronding',
@@ -16830,6 +19476,32 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                         maxLines: 3,
                                         decoration: InputDecoration(
                                           hintText: 'Beschrijving nabestelling',
+                                          filled: true,
+                                          fillColor: const Color(0xFFF4F1EA),
+                                          enabledBorder: OutlineInputBorder(
+                                            borderRadius: BorderRadius.circular(
+                                              14,
+                                            ),
+                                            borderSide: const BorderSide(
+                                              color: Color(0xFFE1DAD0),
+                                            ),
+                                          ),
+                                          focusedBorder: OutlineInputBorder(
+                                            borderRadius: BorderRadius.circular(
+                                              14,
+                                            ),
+                                            borderSide: const BorderSide(
+                                              color: Color(0xFF0B2E2B),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 12),
+                                      TextField(
+                                        controller: _backorderEstimateController,
+                                        keyboardType: TextInputType.number,
+                                        decoration: InputDecoration(
+                                          hintText: 'Schatting totale uren',
                                           filled: true,
                                           fillColor: const Color(0xFFF4F1EA),
                                           enabledBorder: OutlineInputBorder(
@@ -16884,6 +19556,33 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                           ),
                                         ),
                                       const SizedBox(height: 8),
+                                      _FileUploadRow(
+                                        label: 'Foto’s nabestelling',
+                                        buttonLabel: 'Kies foto’s',
+                                        files: _backorderFiles,
+                                        onAdd: _pickBackorderPhotos,
+                                        showFiles: false,
+                                      ),
+                                      if (_backorderFiles.isNotEmpty) ...[
+                                        const SizedBox(height: 8),
+                                        _CollapsiblePhotoWrap(
+                                          photos: _backorderFiles,
+                                          onOpen: (index) => _openPhotoViewer(
+                                            context,
+                                            _backorderFiles,
+                                            index,
+                                          ),
+                                          onRemove: (index) => setState(() {
+                                            if (index < 0 ||
+                                                index >=
+                                                    _backorderFiles.length) {
+                                              return;
+                                            }
+                                            _backorderFiles.removeAt(index);
+                                          }),
+                                        ),
+                                      ],
+                                      const SizedBox(height: 8),
                                       _PrimaryButton(
                                         label: 'Verzenden',
                                         onTap: () {
@@ -16894,6 +19593,50 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                               const SnackBar(
                                                 content: Text(
                                                   'Voeg eerst materialen toe.',
+                                                ),
+                                              ),
+                                            );
+                                            return;
+                                          }
+                                          if (_backorderNoteController.text
+                                              .trim()
+                                              .isEmpty) {
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Beschrijving nabestelling is verplicht.',
+                                                ),
+                                              ),
+                                            );
+                                            return;
+                                          }
+                                          final estimatedHours = double.tryParse(
+                                                _backorderEstimateController
+                                                    .text
+                                                    .trim(),
+                                              ) ??
+                                              0;
+                                          if (estimatedHours <= 0) {
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Vul een schatting van de uren in.',
+                                                ),
+                                              ),
+                                            );
+                                            return;
+                                          }
+                                          if (_backorderFiles.isEmpty) {
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Voeg minstens 1 foto toe bij nabestelling.',
                                                 ),
                                               ),
                                             );
@@ -16916,6 +19659,14 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                             backorder: true,
                                             items: _backorderItems,
                                           );
+                                          ProjectStore.backorderHours[widget
+                                                  .customerName] =
+                                              estimatedHours;
+                                          ProjectStore.backorderPhotos[widget
+                                                  .customerName] =
+                                              List<PlatformFile>.from(
+                                                _backorderFiles,
+                                              );
                                           final note = _backorderNoteController
                                               .text
                                               .trim();
@@ -16945,13 +19696,25 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                               );
                                             }
                                           }
-                                          final team =
-                                              _completionTeamForProject();
+                                          ProjectStore.logBackorderSubmission(
+                                            widget.customerName,
+                                            items: _backorderItems,
+                                            note: note,
+                                          );
+                                          final team = _teamForProject().trim();
                                           if (team.isNotEmpty) {
                                             ProjectStore.completionTeams[widget
                                                     .customerName] =
                                                 team;
+                                            ProjectStore.registerTeamCompletionSubmission(
+                                              widget.customerName,
+                                              team,
+                                              backorder: true,
+                                            );
                                           }
+                                          ScheduleStore.archiveProjectAssignments(
+                                            widget.customerName,
+                                          );
                                           ProjectStore.moveToGroupStatus(
                                             name: widget.customerName,
                                             group: 'Nabestellingen',
@@ -16960,6 +19723,9 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                           ProjectLogStore.add(
                                             widget.customerName,
                                             'Nabestelling verzonden',
+                                          );
+                                          ProjectStore.clearTeamCompletionSubmissions(
+                                            widget.customerName,
                                           );
                                           ScaffoldMessenger.of(
                                             context,
@@ -16998,86 +19764,109 @@ class _ProjectDetailScreenState extends State<ProjectDetailScreen> {
                                           ProjectStore.backorderNotes.remove(
                                             widget.customerName,
                                           );
-                                          final team =
-                                              _completionTeamForProject();
+                                          final team = _teamForProject().trim();
                                           if (team.isNotEmpty) {
                                             ProjectStore.completionTeams[widget
                                                     .customerName] =
                                                 team;
+                                            ProjectStore.registerTeamCompletionSubmission(
+                                              widget.customerName,
+                                              team,
+                                              backorder: false,
+                                            );
                                           }
-                                          ScheduleStore.scheduled.removeWhere(
-                                            (assignment) =>
-                                                assignment.project ==
-                                                widget.customerName,
-                                          );
-                                          final targetGroup =
-                                              ProjectStore.findGroupForProject(
-                                                widget.customerName,
-                                              ) ??
-                                              widget.group;
-                                          ProjectStore.moveToGroupStatus(
-                                            name: widget.customerName,
-                                            group: targetGroup,
-                                            status: 'Afgewerkt',
-                                          );
-                                          ProjectLogStore.add(
+                                          ScheduleStore.archiveProjectAssignments(
                                             widget.customerName,
-                                            'Project afgerond',
+                                            team: team.isEmpty ? null : team,
                                           );
-                                          ScaffoldMessenger.of(
-                                            context,
-                                          ).showSnackBar(
-                                            const SnackBar(
-                                              content: Text('Project afgerond'),
-                                            ),
-                                          );
+                                          final remainingTeams = ScheduleStore
+                                              .scheduled
+                                              .where(
+                                                (assignment) =>
+                                                    assignment.project ==
+                                                    widget.customerName,
+                                              )
+                                              .map((assignment) => assignment.team)
+                                              .toSet();
+                                          if (remainingTeams.isNotEmpty) {
+                                            final pending = remainingTeams
+                                                .toList()
+                                              ..sort();
+                                            ProjectLogStore.add(
+                                              widget.customerName,
+                                              'Team ${team.isEmpty ? 'onbekend' : team} heeft verzonden als klaar. Wacht op: ${pending.join(', ')}',
+                                            );
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              SnackBar(
+                                                content: Text(
+                                                  'Nog niet afgerond. Wachten op: ${pending.join(', ')}',
+                                                ),
+                                              ),
+                                            );
+                                          } else if (ProjectStore
+                                              .hasBackorderCompletionSubmission(
+                                                widget.customerName,
+                                              )) {
+                                            ProjectStore.moveToGroupStatus(
+                                              name: widget.customerName,
+                                              group: 'Nabestellingen',
+                                              status: 'In opmaak',
+                                            );
+                                            ProjectLogStore.add(
+                                              widget.customerName,
+                                              'Nabestelling verzonden',
+                                            );
+                                            ProjectStore.clearTeamCompletionSubmissions(
+                                              widget.customerName,
+                                            );
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Nabestelling verzonden',
+                                                ),
+                                              ),
+                                            );
+                                          } else {
+                                            final targetGroup =
+                                                ProjectStore.findGroupForProject(
+                                                  widget.customerName,
+                                                ) ??
+                                                widget.group;
+                                            ProjectStore.moveToGroupStatus(
+                                              name: widget.customerName,
+                                              group: targetGroup,
+                                              status: 'Afgewerkt',
+                                            );
+                                            ProjectLogStore.add(
+                                              widget.customerName,
+                                              'Project afgerond',
+                                            );
+                                            ProjectStore.clearTeamCompletionSubmissions(
+                                              widget.customerName,
+                                            );
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text('Project afgerond'),
+                                              ),
+                                            );
+                                          }
                                           Navigator.of(context).pop(true);
                                         },
                                       ),
                                     ],
                                   ] else ...[
-                                    if (_isBackorder) ...[
+                                    if (hasCurrentBackorder) ...[
                                       const SizedBox(height: 12),
-                                      if ((_backorderNoteController.text.trim())
-                                          .isNotEmpty)
-                                        Padding(
-                                          padding: const EdgeInsets.only(
-                                            bottom: 8,
-                                          ),
-                                          child: Text(
-                                            _backorderNoteController.text
-                                                .trim(),
-                                            style: Theme.of(context)
-                                                .textTheme
-                                                .bodyMedium
-                                                ?.copyWith(
-                                                  color: const Color(
-                                                    0xFF6A7C78,
-                                                  ),
-                                                ),
-                                          ),
-                                        ),
-                                      if (_backorderItems.isEmpty)
-                                        Text(
-                                          'Nog geen materialen',
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .bodyMedium
-                                              ?.copyWith(
-                                                color: const Color(0xFF6A7C78),
-                                              ),
-                                        )
-                                      else
-                                        ..._backorderItems.map(
-                                          (item) => Padding(
-                                            padding: const EdgeInsets.only(
-                                              bottom: 8,
-                                            ),
-                                            child: _BackorderItemRow(
-                                              label: item,
-                                            ),
-                                          ),
-                                        ),
+                                      _BackorderDetailsSection(
+                                        projectName: widget.customerName,
+                                        title: 'Nabestelling (uitvoering)',
+                                      ),
                                     ],
                                   ],
                                 ],
@@ -17538,6 +20327,12 @@ String _formatDate(DateTime date) {
   return formatted;
 }
 
+String _formatClockMinutes(int minutes) {
+  final hours = minutes ~/ 60;
+  final mins = minutes % 60;
+  return '${hours.toString().padLeft(2, '0')}:${mins.toString().padLeft(2, '0')}';
+}
+
 String _formatDateTime(DateTime date) {
   final dateLabel = _formatDate(date);
   final h = date.hour.toString().padLeft(2, '0');
@@ -17611,6 +20406,10 @@ bool _canApproveEstimatedDaysChanges(String role) {
       role == 'Boekhouding' ||
       role == 'Projectleider' ||
       role == 'Beheerder';
+}
+
+bool _canHandlePlanningAdjustmentRequests(String role) {
+  return role == 'Planner' || role == 'Beheerder';
 }
 
 DateTime _normalizeDateOnly(DateTime date) =>
@@ -17859,11 +20658,43 @@ class InvoiceRecord {
   double extraHoursBilled;
 }
 
+class InvoiceHistoryEntry {
+  InvoiceHistoryEntry({
+    required this.project,
+    required this.group,
+    required this.status,
+    required this.team,
+    required this.isBackorder,
+    required this.offerHoursBilled,
+    required this.extraHoursBilled,
+    required this.materialNotes,
+    required this.approvedBy,
+    required this.approvedAt,
+  });
+
+  final String project;
+  final String group;
+  final String status;
+  final String team;
+  final bool isBackorder;
+  final double offerHoursBilled;
+  final double extraHoursBilled;
+  final List<String> materialNotes;
+  final String approvedBy;
+  final DateTime approvedAt;
+}
+
 class InvoiceStore {
   static final Map<String, InvoiceRecord> records = {};
+  static final List<InvoiceHistoryEntry> history = [];
 
   static InvoiceRecord recordFor(String project) {
     return records.putIfAbsent(project, () => InvoiceRecord());
+  }
+
+  static void addHistory(InvoiceHistoryEntry entry) {
+    history.insert(0, entry);
+    AppDataStore.scheduleSave();
   }
 }
 
@@ -18121,162 +20952,6 @@ class _PlanningAssignCardState extends State<_PlanningAssignCard> {
   }
 }
 
-class _ExternalPlanningProjectCard extends StatelessWidget {
-  const _ExternalPlanningProjectCard({
-    required this.assignment,
-    required this.details,
-    required this.onOpen,
-  });
-
-  final TeamAssignment assignment;
-  final ProjectDetails? details;
-  final VoidCallback onOpen;
-
-  @override
-  Widget build(BuildContext context) {
-    final canSeeHours = _canSeeOfferHours(CurrentUserStore.role);
-    final isBackorder =
-        assignment.isBackorder || assignment.group == 'Nabestellingen';
-    final backorderHours = isBackorder
-        ? (ProjectStore.backorderHours[assignment.project] ?? 0).toDouble()
-        : 0.0;
-    double totalHours = 0;
-    if (canSeeHours) {
-      final lines =
-          ProjectStore.offers[assignment.project] ?? const <OfferLine>[];
-      for (final line in lines) {
-        final item = OfferCatalogStore.findItem(line.category, line.item);
-        final hours = item?.hours;
-        if (hours != null) {
-          totalHours += hours * line.quantity;
-        }
-      }
-    }
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFE1DAD0)),
-      ),
-      child: Theme(
-        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
-        child: ExpansionTile(
-          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          title: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                assignment.project,
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                  color: const Color(0xFF243B3A),
-                ),
-              ),
-              if (isBackorder) ...[
-                const SizedBox(height: 4),
-                Text(
-                  backorderHours > 0
-                      ? 'Nabestelling · ${_formatHours(backorderHours)}'
-                      : 'Nabestelling',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: const Color(0xFF6A7C78),
-                  ),
-                ),
-              ],
-              const SizedBox(height: 4),
-              Text(
-                '${assignment.team} · ${_formatDate(assignment.startDate)} - '
-                '${_formatDate(assignment.endDate)}',
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: const Color(0xFF6A7C78),
-                ),
-              ),
-              if (canSeeHours && totalHours > 0) ...[
-                const SizedBox(height: 4),
-                Text(
-                  'Totaal uren: ${_formatPrice(totalHours)}',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: const Color(0xFF6A7C78),
-                  ),
-                ),
-              ],
-            ],
-          ),
-          children: [
-            if (details != null) ...[
-              _InfoLine(
-                label: 'Adres',
-                value: details!.address,
-                icon: Icons.location_on_outlined,
-              ),
-              const SizedBox(height: 6),
-              _InfoLine(
-                label: 'Levering',
-                value: details!.delivery,
-                icon: Icons.local_shipping_outlined,
-              ),
-              const SizedBox(height: 6),
-              _InfoLine(
-                label: 'Afwerking',
-                value: details!.finish,
-                icon: Icons.layers_outlined,
-              ),
-              const SizedBox(height: 6),
-              _InfoLine(
-                label: 'Geschatte dagen',
-                value: _formatDays(isBackorder ? 1 : details!.estimatedDays),
-                icon: Icons.schedule_outlined,
-              ),
-            ],
-            const SizedBox(height: 10),
-            Align(
-              alignment: Alignment.centerRight,
-              child: _InlineButton(label: 'Openen', onTap: onOpen),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _InfoLine extends StatelessWidget {
-  const _InfoLine({
-    required this.label,
-    required this.value,
-    required this.icon,
-  });
-
-  final String label;
-  final String value;
-  final IconData icon;
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Icon(icon, size: 16, color: const Color(0xFF6A7C78)),
-        const SizedBox(width: 6),
-        Text(
-          '$label: ',
-          style: Theme.of(
-            context,
-          ).textTheme.bodySmall?.copyWith(color: const Color(0xFF6A7C78)),
-        ),
-        Expanded(
-          child: Text(
-            value,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-        ),
-      ],
-    );
-  }
-}
-
 class _InfoTextBlock extends StatelessWidget {
   const _InfoTextBlock({required this.title, required this.lines});
 
@@ -18368,6 +21043,36 @@ class _PlanningOverviewScreen extends StatefulWidget {
 }
 
 class _PlanningOverviewScreenState extends State<_PlanningOverviewScreen> {
+  late List<TeamAssignment> _overviewAssignments;
+
+  void _refreshOverviewAssignmentsFromStore() {
+    _overviewAssignments = <TeamAssignment>[
+      ...ScheduleStore.scheduled,
+      ...ScheduleStore.completedHistory,
+    ];
+  }
+
+  bool _isSameAssignment(TeamAssignment a, TeamAssignment b) {
+    return a.project == b.project &&
+        a.team == b.team &&
+        a.startDate == b.startDate &&
+        a.endDate == b.endDate &&
+        a.group == b.group &&
+        a.joinedSourceTeam == b.joinedSourceTeam;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _overviewAssignments = List<TeamAssignment>.from(widget.assignments);
+  }
+
+  @override
+  void didUpdateWidget(covariant _PlanningOverviewScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _overviewAssignments = List<TeamAssignment>.from(widget.assignments);
+  }
+
   Future<void> _confirmCancel(TeamAssignment assignment) async {
     if (!widget.canEditPlanning) return;
     final confirmed = await showDialog<bool>(
@@ -18390,8 +21095,21 @@ class _PlanningOverviewScreenState extends State<_PlanningOverviewScreen> {
       ),
     );
     if (confirmed == true) {
+      setState(() {
+        if (assignment.joinedSourceTeam != null) {
+          _overviewAssignments.removeWhere(
+            (item) => _isSameAssignment(item, assignment),
+          );
+        } else {
+          _overviewAssignments.removeWhere(
+            (item) =>
+                _isSameAssignment(item, assignment) ||
+                (item.project == assignment.project &&
+                    item.joinedSourceTeam == assignment.team),
+          );
+        }
+      });
       widget.onCancel(assignment);
-      setState(() {});
     }
   }
 
@@ -18409,10 +21127,61 @@ class _PlanningOverviewScreenState extends State<_PlanningOverviewScreen> {
     );
   }
 
+  DateTime _normalize(DateTime value) => DateTime(value.year, value.month, value.day);
+
+  void _joinTeamForDay({
+    required String sourceTeam,
+    required String targetTeam,
+    required DateTime day,
+  }) {
+    final normalizedDay = _normalize(day);
+    final sourceAssignments = _overviewAssignments.where((assignment) {
+      if (assignment.team != sourceTeam) return false;
+      final start = _normalize(assignment.startDate);
+      final end = _normalize(assignment.endDate);
+      return !normalizedDay.isBefore(start) && !normalizedDay.isAfter(end);
+    }).toList();
+    if (sourceAssignments.isEmpty) return;
+
+    var created = 0;
+    for (final source in sourceAssignments) {
+      final exists = _overviewAssignments.any((assignment) {
+        if (assignment.project != source.project) return false;
+        if (assignment.team != targetTeam) return false;
+        final start = _normalize(assignment.startDate);
+        final end = _normalize(assignment.endDate);
+        return !normalizedDay.isBefore(start) && !normalizedDay.isAfter(end);
+      });
+      if (exists) continue;
+
+      final copy = TeamAssignment(
+        project: source.project,
+        team: targetTeam,
+        startDate: normalizedDay,
+        endDate: normalizedDay,
+        estimatedDays: 1,
+        isBackorder: source.isBackorder || source.group == 'Nabestellingen',
+        group: source.group,
+        joinedSourceTeam: sourceTeam,
+      );
+      _overviewAssignments.add(copy);
+      ScheduleStore.scheduled.add(copy);
+      ProjectLogStore.add(
+        source.project,
+        'Team $targetTeam sluit aan bij $sourceTeam op ${_formatDate(normalizedDay)}',
+      );
+      created += 1;
+    }
+    if (created > 0) {
+      setState(() {});
+      AppDataStore.scheduleSave();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final grouped = <String, List<TeamAssignment>>{};
-    for (final item in widget.assignments) {
+    for (final item in _overviewAssignments) {
       grouped.putIfAbsent(item.team, () => []).add(item);
     }
     final teams = grouped.keys.toList()..sort();
@@ -18444,7 +21213,7 @@ class _PlanningOverviewScreenState extends State<_PlanningOverviewScreen> {
                   child: ListView(
                     padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
                     children: [
-                      if (widget.assignments.isEmpty)
+                      if (_overviewAssignments.isEmpty)
                         const _EmptyStateCard(
                           title: 'Geen planning',
                           subtitle: 'Er zijn nog geen teams ingepland.',
@@ -18456,19 +21225,59 @@ class _PlanningOverviewScreenState extends State<_PlanningOverviewScreen> {
                             child: _TeamMonthlyScheduleCard(
                               team: team,
                               assignments: grouped[team] ?? const [],
+                              allAssignments: _overviewAssignments,
                               onOpen: _openProject,
                               onCancel: _confirmCancel,
                               canEditPlanning: widget.canEditPlanning,
                               showHeader: true,
                               initiallyExpanded: false,
                               onReschedule: (assignment, newStart) {
+                                final isBackorder =
+                                    assignment.isBackorder ||
+                                    assignment.group == 'Nabestellingen';
+                                final days = isBackorder
+                                    ? 1
+                                    : assignment.estimatedDays;
+                                final endDate = widget.calculateEndDate(
+                                  assignment.team,
+                                  newStart,
+                                  days,
+                                  isBackorder,
+                                );
+                                if (endDate != null) {
+                                  final updated = TeamAssignment(
+                                    project: assignment.project,
+                                    team: assignment.team,
+                                    startDate: DateTime(
+                                      newStart.year,
+                                      newStart.month,
+                                      newStart.day,
+                                    ),
+                                    endDate: endDate,
+                                    estimatedDays: assignment.estimatedDays,
+                                    isBackorder: assignment.isBackorder,
+                                    group: assignment.group,
+                                    joinedSourceTeam:
+                                        assignment.joinedSourceTeam,
+                                  );
+                                  final index = _overviewAssignments.indexWhere(
+                                    (item) =>
+                                        _isSameAssignment(item, assignment),
+                                  );
+                                  if (index != -1) {
+                                    _overviewAssignments[index] = updated;
+                                  }
+                                }
                                 widget.onReschedule(assignment, newStart);
                                 if (mounted) {
-                                  setState(() {});
+                                  setState(() {
+                                    _refreshOverviewAssignmentsFromStore();
+                                  });
                                 }
                               },
                               availableStarts: widget.availableStarts,
                               calculateEndDate: widget.calculateEndDate,
+                              onJoinTeamForDay: _joinTeamForDay,
                             ),
                           ),
                         ),
@@ -18488,6 +21297,7 @@ class _TeamMonthlyScheduleCard extends StatefulWidget {
   const _TeamMonthlyScheduleCard({
     required this.team,
     required this.assignments,
+    required this.allAssignments,
     required this.onOpen,
     required this.onCancel,
     required this.canEditPlanning,
@@ -18501,10 +21311,12 @@ class _TeamMonthlyScheduleCard extends StatefulWidget {
     this.previewEnd,
     this.previewOldStart,
     this.previewOldEnd,
+    this.onJoinTeamForDay,
   });
 
   final String team;
   final List<TeamAssignment> assignments;
+  final List<TeamAssignment> allAssignments;
   final void Function(TeamAssignment assignment) onOpen;
   final Future<void> Function(TeamAssignment assignment) onCancel;
   final bool canEditPlanning;
@@ -18526,6 +21338,12 @@ class _TeamMonthlyScheduleCard extends StatefulWidget {
   final DateTime? previewEnd;
   final DateTime? previewOldStart;
   final DateTime? previewOldEnd;
+  final void Function({
+    required String sourceTeam,
+    required String targetTeam,
+    required DateTime day,
+  })?
+  onJoinTeamForDay;
 
   @override
   State<_TeamMonthlyScheduleCard> createState() =>
@@ -18535,6 +21353,7 @@ class _TeamMonthlyScheduleCard extends StatefulWidget {
 class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
   late DateTime _focusedDay;
   DateTime? _selectedDay;
+  String? _joinSourceTeam;
   static const int _maxLaneShown = 3;
   static const Color _backorderDotColor = Color(0xFFD04A4A);
 
@@ -18619,6 +21438,63 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
           },
         );
       },
+    );
+  }
+
+  bool _canRequestPlanningAdjustment(TeamAssignment assignment) {
+    final role = CurrentUserStore.role;
+    if (!_isSubcontractorAdminRole(role)) return false;
+    if (widget.canEditPlanning) return false;
+    if (!_canViewAssignmentDetails(assignment)) return false;
+    return true;
+  }
+
+  Future<void> _requestPlanningAdjustment(
+    BuildContext context,
+    TeamAssignment assignment,
+  ) async {
+    final controller = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Opmerking voor planner'),
+          content: TextField(
+            controller: controller,
+            maxLines: 4,
+            decoration: const InputDecoration(
+              labelText: 'Opmerking (verplaatsen/verwijderen)',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Annuleren'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Verzenden'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true) return;
+    final ownerKey = ProjectStore.ownerKeyForProject(assignment.project);
+    PlanningAdjustmentRequestStore.add(
+      PlanningAdjustmentRequest(
+        project: assignment.project,
+        team: assignment.team,
+        requester: CurrentUserStore.name,
+        requesterRole: CurrentUserStore.role,
+        createdAt: DateTime.now(),
+        targetOwnerKey: ownerKey,
+        note: controller.text.trim(),
+      ),
+    );
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Opmerking verzonden naar planner.')),
     );
   }
 
@@ -18742,11 +21618,32 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
     int? previewLane,
   ) {
     final selectedDay = _selectedDay ?? _focusedDay;
+    final today = _normalizeDate(DateTime.now());
+    final isPastSelectedDay = _normalizeDate(selectedDay).isBefore(today);
     final workingDays = _RoleManagementStore.workingDaysForTeam(widget.team);
     final isWeekendOff = !workingDays.contains(selectedDay.weekday);
     final isNonWorkingDay = !_isWorkingDayForTeam(selectedDay, widget.team);
     final isHoliday = _isHoliday(selectedDay);
     final isVacation = _isVacation(selectedDay);
+    final hiddenAssignmentsOnSelectedDay = _assignmentsForDay(selectedDay)
+        .where((assignment) => _isWorkingDayForTeam(selectedDay, assignment.team))
+        .where((assignment) => !_canViewAssignmentDetails(assignment))
+        .length;
+    final sourceTeamOptions = widget.allAssignments
+        .where((assignment) {
+          if (assignment.team == widget.team) return false;
+          final start = _normalizeDate(assignment.startDate);
+          final end = _normalizeDate(assignment.endDate);
+          return !selectedDay.isBefore(start) && !selectedDay.isAfter(end);
+        })
+        .map((assignment) => assignment.team)
+        .toSet()
+        .toList()
+      ..sort();
+    if (_joinSourceTeam != null &&
+        !sourceTeamOptions.contains(_joinSourceTeam)) {
+      _joinSourceTeam = null;
+    }
     return Column(
       children: [
         TableCalendar(
@@ -18870,12 +21767,14 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                 )
               else if (dayAssignments.isEmpty)
                 Text(
-                  'Geen klanten ingepland.',
+                  hiddenAssignmentsOnSelectedDay > 0
+                      ? 'Bezet door extern ingeplande projecten.'
+                      : 'Geen klanten ingepland.',
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                     color: const Color(0xFF6A7C78),
                   ),
                 )
-              else if (widget.canEditPlanning)
+              else if (widget.canEditPlanning && !isPastSelectedDay)
                 ReorderableListView(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
@@ -18903,23 +21802,29 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                               vertical: 0,
                             ),
                             decoration: BoxDecoration(
-                              color: const Color(0xFFF4F1EA),
+                              color: isPastSelectedDay
+                                  ? const Color(0xFFE7E7E7)
+                                  : const Color(0xFFF4F1EA),
                               borderRadius: BorderRadius.circular(12),
                               border: Border.all(
-                                color: const Color(0xFFE1DAD0),
+                                color: isPastSelectedDay
+                                    ? const Color(0xFFD3D3D3)
+                                    : const Color(0xFFE1DAD0),
                               ),
                             ),
                             child: Row(
                               children: [
                                 _LegendDot(
-                                  color:
-                                      _isBackorderAssignment(
-                                        dayAssignments[index],
-                                      )
-                                      ? _backorderDotColor
-                                      : _dotColorForLane(
-                                          laneMap[dayAssignments[index]] ?? 0,
-                                        ),
+                                  color: isPastSelectedDay
+                                      ? const Color(0xFFA3A3A3)
+                                      : (_isBackorderAssignment(
+                                              dayAssignments[index],
+                                            )
+                                            ? _backorderDotColor
+                                            : _dotColorForLane(
+                                                laneMap[dayAssignments[index]] ??
+                                                    0,
+                                              )),
                                 ),
                                 const SizedBox(width: 8),
                                 Expanded(
@@ -18933,7 +21838,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                                             .textTheme
                                             .bodyMedium
                                             ?.copyWith(
-                                              color: const Color(0xFF5A6F6C),
+                                              color: isPastSelectedDay
+                                                  ? const Color(0xFF7C7C7C)
+                                                  : const Color(0xFF5A6F6C),
                                             ),
                                       ),
                                       if (CurrentUserStore.role ==
@@ -19006,16 +21913,26 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                           vertical: 0,
                         ),
                         decoration: BoxDecoration(
-                          color: const Color(0xFFF4F1EA),
+                          color: isPastSelectedDay
+                              ? const Color(0xFFE7E7E7)
+                              : const Color(0xFFF4F1EA),
                           borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: const Color(0xFFE1DAD0)),
+                          border: Border.all(
+                            color: isPastSelectedDay
+                                ? const Color(0xFFD3D3D3)
+                                : const Color(0xFFE1DAD0),
+                          ),
                         ),
                         child: Row(
                           children: [
                             _LegendDot(
-                              color: _isBackorderAssignment(assignment)
-                                  ? _backorderDotColor
-                                  : _dotColorForLane(laneMap[assignment] ?? 0),
+                              color: isPastSelectedDay
+                                  ? const Color(0xFFA3A3A3)
+                                  : (_isBackorderAssignment(assignment)
+                                        ? _backorderDotColor
+                                        : _dotColorForLane(
+                                            laneMap[assignment] ?? 0,
+                                          )),
                             ),
                             const SizedBox(width: 8),
                             Expanded(
@@ -19028,7 +21945,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                                         .textTheme
                                         .bodyMedium
                                         ?.copyWith(
-                                          color: const Color(0xFF5A6F6C),
+                                          color: isPastSelectedDay
+                                              ? const Color(0xFF7C7C7C)
+                                              : const Color(0xFF5A6F6C),
                                         ),
                                   ),
                                   if (CurrentUserStore.role == 'Onderaannemer')
@@ -19047,12 +21966,71 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                                 ],
                               ),
                             ),
+                            if (_canRequestPlanningAdjustment(assignment))
+                              IconButton(
+                                icon: const Icon(Icons.sticky_note_2_outlined),
+                                color: const Color(0xFF6A7C78),
+                                tooltip: 'Opmerking voor planner',
+                                visualDensity: VisualDensity.compact,
+                                constraints: const BoxConstraints(minWidth: 32),
+                                onPressed: () =>
+                                    _requestPlanningAdjustment(context, assignment),
+                              ),
                           ],
                         ),
                       ),
                     ),
                   ),
                 ),
+              if (widget.canEditPlanning &&
+                  !isPastSelectedDay &&
+                  widget.onJoinTeamForDay != null) ...[
+                const SizedBox(height: 8),
+                const Divider(height: 1, color: Color(0xFFE1DAD0)),
+                const SizedBox(height: 8),
+                Text(
+                  'Team laten aansluiten',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                if (sourceTeamOptions.isEmpty)
+                  Text(
+                    'Geen teams beschikbaar op deze dag.',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: const Color(0xFF6A7C78),
+                    ),
+                  )
+                else
+                  _DropdownField(
+                    label: 'Aansluiten bij team',
+                    value: _joinSourceTeam ?? sourceTeamOptions.first,
+                    items: sourceTeamOptions,
+                    onChanged: (value) => setState(() => _joinSourceTeam = value),
+                  ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: _PrimaryButton(
+                    label: 'Team toevoegen',
+                    onTap: (sourceTeamOptions.isEmpty)
+                        ? null
+                        : () {
+                            final sourceTeam =
+                                _joinSourceTeam ?? sourceTeamOptions.first;
+                            widget.onJoinTeamForDay!(
+                              sourceTeam: sourceTeam,
+                              targetTeam: widget.team,
+                              day: selectedDay,
+                            );
+                            setState(() {
+                              _joinSourceTeam = null;
+                            });
+                          },
+                  ),
+                ),
+              ],
             ],
           )
         else
@@ -19083,12 +22061,22 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
     }).toList();
   }
 
+  bool _canViewAssignmentDetails(TeamAssignment assignment) {
+    if (_isSubcontractorAdminRole(CurrentUserStore.role)) return true;
+    if (CurrentUserStore.role == 'Werknemer') return true;
+    final myOwner = _currentProjectOwnerKey();
+    final assignmentOwner = ProjectStore.ownerKeyForProject(assignment.project);
+    if (myOwner.isEmpty || assignmentOwner.isEmpty) return true;
+    return myOwner == assignmentOwner;
+  }
+
   List<TeamAssignment> _orderedAssignmentsForDay(
     DateTime day,
     Map<TeamAssignment, int> laneMap,
   ) {
     final base =
         _assignmentsForDay(day)
+            .where(_canViewAssignmentDetails)
             .where((assignment) => _isWorkingDayForTeam(day, assignment.team))
             .toList()
           ..sort((a, b) {
@@ -19172,14 +22160,25 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
         final laneB = laneMap[b] ?? 0;
         return laneA.compareTo(laneB);
       });
+    final today = _normalizeDate(DateTime.now());
+    final isPastDay = _normalizeDate(day).isBefore(today);
     final isHoliday = _isHoliday(day);
     final isVacation = _isVacation(day);
-    final displayAssignments = assignments
+    final allDisplayAssignments = assignments
         .where((assignment) => _isWorkingDayForTeam(day, assignment.team))
+        .toList();
+    final displayAssignments = allDisplayAssignments
+        .where(_canViewAssignmentDetails)
         .toList();
     final dotAssignments = displayAssignments
         .where((assignment) => _isBackorderAssignment(assignment))
         .toList();
+    final currentOwnerKey = _currentProjectOwnerKey();
+    final hasOtherOwnerPlanning = allDisplayAssignments.any((assignment) {
+      if (_canViewAssignmentDetails(assignment)) return false;
+      final ownerKey = ProjectStore.ownerKeyForProject(assignment.project);
+      return ownerKey.isNotEmpty && ownerKey != currentOwnerKey;
+    });
     final lineAssignmentsAll = displayAssignments
         .where((assignment) => !dotAssignments.contains(assignment))
         .toList();
@@ -19244,6 +22243,19 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                   ),
                 ),
               ),
+            if (!isHoliday && !isVacation && hasOtherOwnerPlanning)
+              Positioned.fill(
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: CustomPaint(
+                    painter: _HatchPainter(
+                      color: const Color(0xFFC9CCD2).withValues(alpha: 0.55),
+                      strokeWidth: 0.8,
+                      spacing: 8,
+                    ),
+                  ),
+                ),
+              ),
             if (isSelected)
               Positioned.fill(
                 child: Container(
@@ -19268,7 +22280,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                   '${day.day}',
                   textAlign: TextAlign.center,
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: const Color(0xFF243B3A),
+                    color: isPastDay
+                        ? const Color(0xFF8B8B8B)
+                        : const Color(0xFF243B3A),
                     fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
                     height: 1.0,
                   ),
@@ -19277,7 +22291,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
             ),
             ...lineAssignments.map((assignment) {
               final lane = laneMap[assignment] ?? 0;
-              final color = _dotColorForLane(lane);
+              final color = isPastDay
+                  ? const Color(0xFFA3A3A3)
+                  : _dotColorForLane(lane);
               final start = _normalizeDate(assignment.startDate);
               final end = _normalizeDate(assignment.endDate);
               final singleDay = start.isAtSameMomentAs(end);
@@ -19409,8 +22425,12 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                               assignment.isBackorder ||
                               assignment.group == 'Nabestellingen';
                           final dotColor = isBackorder
-                              ? _backorderDotColor
-                              : const Color(0xFF0B2E2B);
+                              ? (isPastDay
+                                    ? const Color(0xFFA3A3A3)
+                                    : _backorderDotColor)
+                              : (isPastDay
+                                    ? const Color(0xFFA3A3A3)
+                                    : const Color(0xFF0B2E2B));
                           return Padding(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 1.5,
@@ -19440,7 +22460,9 @@ class _TeamMonthlyScheduleCardState extends State<_TeamMonthlyScheduleCard> {
                     vertical: 2,
                   ),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0B2E2B),
+                    color: isPastDay
+                        ? const Color(0xFF9C9C9C)
+                        : const Color(0xFF0B2E2B),
                     borderRadius: BorderRadius.circular(10),
                   ),
                   child: Text(
@@ -19647,7 +22669,11 @@ class _ProjectInfoCard extends StatelessWidget {
         : (details?.phone ?? '');
     final canCall =
         (CurrentUserStore.role == 'Planner' ||
-            CurrentUserStore.role == 'Beheerder') &&
+            CurrentUserStore.role == 'Beheerder' ||
+            CurrentUserStore.role == 'Projectleider' ||
+            CurrentUserStore.role == 'Boekhouding' ||
+            CurrentUserStore.role == 'Administratie' ||
+            CurrentUserStore.role == 'Verkoper') &&
         phoneValue.trim().isNotEmpty;
     return _InputCard(
       title: 'Huidige informatie',
@@ -20182,6 +23208,7 @@ class _ExtraWorkSection extends StatelessWidget {
     required this.extraWorks,
     required this.extraWorkController,
     required this.extraHoursController,
+    required this.extraMaterialController,
     required this.extraWorkChargeType,
     required this.onChargeTypeChanged,
     required this.extraWorkFiles,
@@ -20198,6 +23225,7 @@ class _ExtraWorkSection extends StatelessWidget {
   final List<ExtraWorkEntry> extraWorks;
   final TextEditingController extraWorkController;
   final TextEditingController extraHoursController;
+  final TextEditingController extraMaterialController;
   final String extraWorkChargeType;
   final void Function(String?) onChargeTypeChanged;
   final List<PlatformFile> extraWorkFiles;
@@ -20271,6 +23299,13 @@ class _ExtraWorkSection extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
+                      'Extra materiaal: ${entryPair.value.materialNote.isEmpty ? '—' : entryPair.value.materialNote}',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF6A7C78),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
                       'Type: ${entryPair.value.chargeType}',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
                         color: const Color(0xFF6A7C78),
@@ -20329,6 +23364,23 @@ class _ExtraWorkSection extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 8),
+          TextField(
+            controller: extraMaterialController,
+            decoration: InputDecoration(
+              hintText: 'Extra materiaal (beschrijving)',
+              filled: true,
+              fillColor: const Color(0xFFF4F1EA),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: const BorderSide(color: Color(0xFFE1DAD0)),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: const BorderSide(color: Color(0xFF0B2E2B)),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
           DropdownButtonFormField<String>(
             key: ValueKey(extraWorkChargeType),
             initialValue: extraWorkChargeType,
@@ -20373,6 +23425,139 @@ class _ExtraWorkSection extends StatelessWidget {
                 ? 'Extra werk bijwerken'
                 : 'Extra werk opslaan',
             onTap: onAddExtraWork,
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _BackorderHistorySection extends StatelessWidget {
+  const _BackorderHistorySection({required this.projectName});
+
+  final String projectName;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = ProjectStore.findStatusForProject(projectName) ?? '';
+    final history = _backorderHistoryForProject(
+      projectName,
+      hideCurrent:
+          ProjectStore.isBackorder[projectName] == true && status != 'Afgewerkt',
+    );
+    if (history.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return _InputCard(
+      title: 'Nabestellingen',
+      children: [
+        ...history.map(
+          (item) => Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF4F1EA),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFFE1DAD0)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Nabestelling ${item.index}',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    item.materials.isEmpty ? '—' : item.materials,
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                  if (item.note.trim().isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      'Opmerking: ${item.note}',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF6A7C78),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 4),
+                  Text(
+                    _formatDateTime(item.timestamp),
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: const Color(0xFF6A7C78),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _BackorderDetailsSection extends StatelessWidget {
+  const _BackorderDetailsSection({
+    required this.projectName,
+    this.title = 'Nabestelling details',
+  });
+
+  final String projectName;
+  final String title;
+
+  @override
+  Widget build(BuildContext context) {
+    final note = (ProjectStore.backorderNotes[projectName] ?? '').trim();
+    final estimate = ProjectStore.backorderHours[projectName] ?? 0;
+    final photos = ProjectStore.backorderPhotos[projectName] ?? const <PlatformFile>[];
+    final items = ProjectStore.backorderItems[projectName] ?? const <String>[];
+    if (note.isEmpty && estimate <= 0 && photos.isEmpty && items.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return _InputCard(
+      title: title,
+      children: [
+        const _PlainInfoLine(label: 'Type', value: 'Nabestelling'),
+        const SizedBox(height: 6),
+        if (estimate > 0)
+          _PlainInfoLine(label: 'Geschatte uren', value: _formatHours(estimate)),
+        if (note.isNotEmpty) ...[
+          if (estimate > 0) const SizedBox(height: 6),
+          _PlainInfoLine(label: 'Beschrijving', value: note),
+        ],
+        if (items.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Materialen',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: const Color(0xFF243B3A),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 4),
+          ...items.asMap().entries.map(
+            (entry) => Padding(
+              padding: const EdgeInsets.only(bottom: 2),
+              child: Text(
+                '${entry.key + 1}. ${entry.value}',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFF243B3A),
+                ),
+              ),
+            ),
+          ),
+        ],
+        if (photos.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          _CollapsiblePhotoWrap(
+            photos: photos,
+            onOpen: (index) => _openPhotoViewer(context, photos, index),
           ),
         ],
       ],
@@ -20483,38 +23668,6 @@ class _AddItemRow extends StatelessWidget {
         const SizedBox(width: 10),
         _InlineButton(label: 'Toevoegen', onTap: onAdd),
       ],
-    );
-  }
-}
-
-class _BackorderItemRow extends StatelessWidget {
-  const _BackorderItemRow({required this.label});
-
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFFE1DAD0)),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.build_outlined, color: Color(0xFF6A7C78)),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              label,
-              style: Theme.of(
-                context,
-              ).textTheme.bodyMedium?.copyWith(color: const Color(0xFF243B3A)),
-            ),
-          ),
-        ],
-      ),
     );
   }
 }

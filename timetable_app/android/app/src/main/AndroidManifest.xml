@@ -1,6 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application
-        android:label="timetable_app"
+        android:label="TimeTabl.eu"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
@@ -28,7 +28,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="timetableapp" android:host="login" />
+                <data android:scheme="timetabl.eu" android:host="login" />
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.

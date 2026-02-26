@@ -69,12 +69,12 @@ exports.handler = async (event) => {
       const company = String(input.company || '').trim();
       await sendResendEmail({
         to,
-        subject: 'Je TimeTable account is aangemaakt',
+        subject: 'Je TimeTabl.eu account is aangemaakt',
         html: `
           <p>Hallo ${name || 'gebruiker'},</p>
-          <p>Je account voor <strong>${company || 'TimeTable'}</strong> is succesvol aangemaakt.</p>
+          <p>Je account voor <strong>${company || 'TimeTabl.eu'}</strong> is succesvol aangemaakt.</p>
           <p>Je kan nu inloggen in de app.</p>
-          <p>Groeten,<br/>TimeTable</p>
+          <p>Groeten,<br/>TimeTabl.eu</p>
         `,
       });
       return json(200, { ok: true, message: 'Welkomstmail verzonden.' });
@@ -86,14 +86,14 @@ exports.handler = async (event) => {
       const company = String(input.company || '').trim();
       await sendResendEmail({
         to,
-        subject: 'Je bent uitgenodigd voor TimeTable',
+        subject: 'Je bent uitgenodigd voor TimeTabl.eu',
         html: `
           <p>Hallo ${name || 'gebruiker'},</p>
-          <p>Je bent uitgenodigd voor <strong>${company || 'TimeTable'}</strong>.</p>
+          <p>Je bent uitgenodigd voor <strong>${company || 'TimeTabl.eu'}</strong>.</p>
           <p>Rol: <strong>${role || 'Werknemer'}</strong></p>
           <p>Uitgenodigd door: <strong>${invitedBy || 'beheerder'}</strong></p>
           <p>Gebruik je e-mailadres om in te loggen of je account te activeren.</p>
-          <p>Groeten,<br/>TimeTable</p>
+          <p>Groeten,<br/>TimeTabl.eu</p>
         `,
       });
       return json(200, { ok: true, message: 'Uitnodigingsmail verzonden.' });
@@ -109,10 +109,10 @@ exports.handler = async (event) => {
       const team = String(input.team || '').trim();
       await sendResendEmail({
         to,
-        subject: 'TimeTable uitnodiging - registratiecode',
+        subject: 'TimeTabl.eu uitnodiging - registratiecode',
         html: `
           <p>Hallo ${name || 'gebruiker'},</p>
-          <p>Je bent uitgenodigd voor <strong>${company || 'TimeTable'}</strong>.</p>
+          <p>Je bent uitgenodigd voor <strong>${company || 'TimeTabl.eu'}</strong>.</p>
           <p>Rol: <strong>${role || 'Werknemer'}</strong></p>
           ${contractor ? `<p>Onderaannemer: <strong>${contractor}</strong></p>` : ''}
           ${team ? `<p>Team: <strong>${team}</strong></p>` : ''}
@@ -122,7 +122,7 @@ exports.handler = async (event) => {
           <p>Geldig tot: <strong>${expiresAt || '24 uur'}</strong></p>
           <p>Opgelet: na registratie kan activatie maximaal <strong>5 minuten</strong> duren.</p>
           <p>Na registratie moet je nog je account verifiëren via e-mail.</p>
-          <p>Groeten,<br/>TimeTable</p>
+          <p>Groeten,<br/>TimeTabl.eu</p>
         `,
       });
       return json(200, { ok: true, message: 'Uitnodigingscode verzonden.' });
@@ -132,14 +132,14 @@ exports.handler = async (event) => {
       const company = String(input.company || '').trim();
       await sendResendEmail({
         to,
-        subject: 'Verificatie geslaagd - Welkom bij TimeTable',
+        subject: 'Verificatie geslaagd - Welkom bij TimeTabl.eu',
         html: `
           <p>Hallo ${name || 'gebruiker'},</p>
-          <p>Je account voor <strong>${company || 'TimeTable'}</strong> is succesvol geverifieerd.</p>
-          <p>Welkom bij <strong>TimeTable</strong>.</p>
-          <p>Met TimeTable beheer je projecten, planning, rollen, documenten en werfopvolging op een overzichtelijke manier voor je volledige team.</p>
+          <p>Je account voor <strong>${company || 'TimeTabl.eu'}</strong> is succesvol geverifieerd.</p>
+          <p>Welkom bij <strong>TimeTabl.eu</strong>.</p>
+          <p>Met TimeTabl.eu beheer je projecten, planning, rollen, documenten en werfopvolging op een overzichtelijke manier voor je volledige team.</p>
           <p>Je kan nu inloggen in de app en meteen starten.</p>
-          <p>Groeten,<br/>TimeTable</p>
+          <p>Groeten,<br/>TimeTabl.eu</p>
         `,
       });
       return json(200, { ok: true, message: 'Verificatiemail verzonden.' });
